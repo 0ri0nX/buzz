@@ -1,5 +1,22 @@
 # buzz-acp
 
+## Trusted turn context extension
+
+`buzz-acp` offers the private, versioned ACP capability
+`clientCapabilities._meta.buzz.trustedTurnContext.versions` with
+`buzz.trusted-turn-context/v1`. When an adapter exactly accepts that version at
+`agentCapabilities._meta.buzz.trustedTurnContext.version`, Buzz attaches a
+closed host-attested envelope at `_meta.buzz.trustedTurnContext` to each input
+prompt and native steer request. Without exact acceptance no envelope is sent,
+so ordinary ACP adapters retain their existing wire behavior.
+
+The envelope contains only process/session/turn, channel/scope and newly
+admitted signed-event attribution already known to this harness. It carries no
+credentials, authorization decision, memory identifier or downstream policy.
+Bootstrap, heartbeat and cancelled-only resume prompts deliberately expose no
+current event. This extension does not alter relay, desktop, mobile, account,
+pairing or signed-event protocols.
+
 ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
 
 ```

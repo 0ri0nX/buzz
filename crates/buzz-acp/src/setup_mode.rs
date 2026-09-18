@@ -360,7 +360,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
 
     // Resolve owner for author-gate (same priority as normal mode).
     let startup_owner = crate::resolve_agent_owner(&config);
-    let owner_cache = crate::OwnerCache::new(startup_owner);
+    let owner_cache = crate::OwnerCache::new(startup_owner.map(|owner| owner.pubkey));
 
     // Discover channels and subscribe (using a "mentions" rule so we get
     // notified when someone @-mentions the agent).

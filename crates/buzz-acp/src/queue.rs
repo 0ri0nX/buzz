@@ -108,6 +108,8 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Security-relevant event attribution frozen at admission.
+    pub trusted_facts: Option<crate::trusted_turn_context::EventFacts>,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -116,6 +118,8 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    /// Security-relevant event attribution frozen at admission.
+    pub trusted_facts: Option<crate::trusted_turn_context::EventFacts>,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -457,6 +461,7 @@ impl EventQueue {
                 event: qe.event,
                 prompt_tag: qe.prompt_tag,
                 received_at: qe.received_at,
+                trusted_facts: qe.trusted_facts,
             })
             .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
@@ -598,6 +603,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                trusted_facts: be.trusted_facts,
             });
         }
         // Enforce per-scope cap: trim oldest (back) events if requeue pushed
@@ -662,6 +668,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                trusted_facts: be.trusted_facts,
             });
         }
         // Enforce per-scope cap: trim newest (back) events if over limit.
@@ -2239,8 +2246,21 @@ mod tests {
             scope: conv(channel_id),
             event: make_event(content),
             received_at: Instant::now(),
+            trusted_facts: None,
             prompt_tag: "test".into(),
         }
+    }
+
+    fn make_trusted_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
+        let mut queued = make_queued(channel_id, content);
+        queued.trusted_facts = Some(crate::trusted_turn_context::EventFacts {
+            event_id: "a".repeat(64),
+            author_pubkey: "b".repeat(64),
+            actor_pubkey: "c".repeat(64),
+            channel_type: crate::trusted_turn_context::ChannelType::Stream,
+            thread_root_event_id: Some("d".repeat(64)),
+        });
+        queued
     }
 
     /// Build a QueuedEvent with a specific `received_at` offset from now.
@@ -2250,6 +2270,7 @@ mod tests {
             scope: conv(channel_id),
             event: make_event(content),
             received_at: Instant::now() - age,
+            trusted_facts: None,
             prompt_tag: "test".into(),
         }
     }
@@ -2271,6 +2292,7 @@ mod tests {
             scope: conv(channel_id),
             event,
             received_at: Instant::now(),
+            trusted_facts: None,
             prompt_tag: "test".into(),
         }
     }
@@ -2298,6 +2320,7 @@ mod tests {
             scope,
             event: make_event(content),
             received_at: Instant::now(),
+            trusted_facts: None,
             prompt_tag: "test".into(),
         }
     }
@@ -2608,6 +2631,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2639,11 +2663,13 @@ mod tests {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![BatchEvent {
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancel_reason: reason,
         }
@@ -2778,17 +2804,20 @@ mod tests {
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
                 BatchEvent {
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
             ],
             cancelled_events: vec![BatchEvent {
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -2835,11 +2864,13 @@ mod tests {
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![BatchEvent {
                 event: original,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -3008,16 +3039,19 @@ mod tests {
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
                 BatchEvent {
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
                 BatchEvent {
                     event: e3,
                     prompt_tag: "tag-c".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
             ],
             cancelled_events: vec![],
@@ -3048,6 +3082,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3072,6 +3107,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3105,6 +3141,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3136,6 +3173,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3164,6 +3202,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3189,6 +3228,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3251,6 +3291,7 @@ mod tests {
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3305,6 +3346,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3344,6 +3386,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3573,6 +3616,7 @@ mod tests {
             scope: conv(ch),
             event: make_event("old-msg"),
             received_at: old_time,
+            trusted_facts: None,
             prompt_tag: "test".into(),
         });
 
@@ -3604,11 +3648,13 @@ mod tests {
                 event: make_event("the follow-up"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![BatchEvent {
                 event: make_event("the original request"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancel_reason: Some(CancelReason::Interrupt),
         };
@@ -3933,6 +3979,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3967,6 +4014,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4015,6 +4063,7 @@ mod tests {
                             event: event.clone(),
                             prompt_tag: "@mention".into(),
                             received_at: Instant::now(),
+                            trusted_facts: None,
                         }],
                         cancelled_events: vec![],
                         cancel_reason: None,
@@ -4097,6 +4146,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4124,6 +4174,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4237,6 +4288,7 @@ mod tests {
             ),
             prompt_tag: "@mention".into(),
             received_at: Instant::now(),
+            trusted_facts: None,
         };
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
@@ -4310,6 +4362,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4367,6 +4420,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4577,6 +4631,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4648,6 +4703,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4682,6 +4738,7 @@ mod tests {
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4733,6 +4790,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4776,6 +4834,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4801,6 +4860,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4825,6 +4885,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4859,6 +4920,7 @@ mod tests {
                 event: direct_event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             },
             None,
         );
@@ -4886,6 +4948,7 @@ mod tests {
                 event: nested_event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             },
             None,
         );
@@ -5159,6 +5222,33 @@ mod tests {
     }
 
     #[test]
+    fn trusted_admission_facts_survive_retry_and_cancelled_resume_recovery() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let scope = conv(ch);
+
+        q.push(make_trusted_queued(ch, "admitted"));
+        let first = q.flush_next().expect("initial trusted batch");
+        let expected = first.events[0]
+            .trusted_facts
+            .clone()
+            .expect("admission facts");
+
+        assert!(q.requeue(first).is_none());
+        q.mark_complete(scope.clone());
+        q.retry_after.remove(&scope);
+        let retried = q.flush_next().expect("retried trusted batch");
+        assert_eq!(retried.events[0].trusted_facts.as_ref(), Some(&expected));
+
+        q.requeue_as_cancelled(retried, CancelReason::Interrupt);
+        q.mark_complete(scope);
+        let resumed = q.flush_next().expect("cancelled-only resume batch");
+        assert!(resumed.cancelled_events.is_empty());
+        assert_eq!(resumed.cancel_reason, Some(CancelReason::Interrupt));
+        assert_eq!(resumed.events[0].trusted_facts.as_ref(), Some(&expected));
+    }
+
+    #[test]
     fn test_has_flushable_work_with_cancelled_only() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
@@ -5253,6 +5343,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5296,6 +5387,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5333,6 +5425,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5363,6 +5456,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5408,6 +5502,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5445,6 +5540,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5482,11 +5578,13 @@ mod tests {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
                 BatchEvent {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
             ],
             cancelled_events: vec![],
@@ -5520,11 +5618,13 @@ mod tests {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
                 BatchEvent {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    trusted_facts: None,
                 },
             ],
             cancelled_events: vec![],
@@ -5554,6 +5654,7 @@ mod tests {
                 event: make_event(content),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5631,6 +5732,7 @@ mod tests {
             event: make_event("another message"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            trusted_facts: None,
         });
         assert_eq!(slash_command_for_batch(&multi, &[]), None);
 
@@ -5640,6 +5742,7 @@ mod tests {
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            trusted_facts: None,
         });
         assert_eq!(slash_command_for_batch(&cancelled, &[]), None);
 
@@ -5855,6 +5958,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5885,6 +5989,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5914,6 +6019,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6376,6 +6482,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,

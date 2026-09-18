@@ -203,6 +203,18 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter exactly accepted Buzz's private v1 context offer.
+    trusted_turn_context_accepted: bool,
+    /// Immutable host facts for the active Buzz turn.
+    trusted_turn: Option<crate::trusted_turn_context::TurnFacts>,
+    /// Last context generation written for the active Buzz turn.
+    trusted_turn_generation: u32,
+    /// Context consumed by the next ordinary `session/prompt` write.
+    trusted_next_prompt: Option<(
+        crate::trusted_turn_context::Source,
+        Vec<crate::trusted_turn_context::EventFacts>,
+        usize,
+    )>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -411,7 +423,12 @@ fn build_client_capabilities() -> serde_json::Value {
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
-            "terminal-auth": true
+            "terminal-auth": true,
+            "buzz": {
+                "trustedTurnContext": {
+                    "versions": [crate::trusted_turn_context::VERSION]
+                }
+            }
         }
     })
 }
@@ -571,6 +588,10 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            trusted_turn_context_accepted: false,
+            trusted_turn: None,
+            trusted_turn_generation: 0,
+            trusted_next_prompt: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -629,8 +650,98 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.trusted_turn_context_accepted = crate::trusted_turn_context::accepts_v1(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Bind immutable host facts for one Buzz turn.
+    pub(crate) fn begin_trusted_turn(
+        &mut self,
+        turn: Option<crate::trusted_turn_context::TurnFacts>,
+    ) {
+        self.trusted_turn = turn;
+        self.trusted_turn_generation = 0;
+        self.trusted_next_prompt = None;
+    }
+
+    /// Stage context for the next ordinary prompt. It is consumed exactly once.
+    pub(crate) fn stage_trusted_prompt(
+        &mut self,
+        source: crate::trusted_turn_context::Source,
+        events: Vec<crate::trusted_turn_context::EventFacts>,
+        expected_event_count: usize,
+    ) {
+        self.trusted_next_prompt = Some((source, events, expected_event_count));
+    }
+
+    fn attach_trusted_context(
+        &mut self,
+        params: &mut serde_json::Value,
+        session_id: &str,
+        staged: Option<(
+            crate::trusted_turn_context::Source,
+            Vec<crate::trusted_turn_context::EventFacts>,
+            usize,
+        )>,
+    ) -> Result<Option<u32>, AcpError> {
+        if !self.trusted_turn_context_accepted {
+            return Ok(None);
+        }
+        let (source, events, expected_event_count) = staged.ok_or_else(|| {
+            AcpError::Protocol("trusted turn context missing for negotiated prompt".into())
+        })?;
+        if events.len() != expected_event_count {
+            return Err(AcpError::Protocol(
+                "trusted turn context is incomplete for authoritative events".into(),
+            ));
+        }
+        let turn = self.trusted_turn.as_ref().ok_or_else(|| {
+            AcpError::Protocol("trusted turn facts missing for negotiated prompt".into())
+        })?;
+        let generation = self
+            .trusted_turn_generation
+            .checked_add(1)
+            .ok_or_else(|| AcpError::Protocol("trusted turn generation overflow".into()))?;
+        let envelope = crate::trusted_turn_context::build_envelope(
+            turn, session_id, source, generation, &events,
+        )
+        .map_err(|error| AcpError::Protocol(error.to_string()))?;
+        let meta = params
+            .as_object_mut()
+            .ok_or_else(|| AcpError::Protocol("prompt params must be an object".into()))?
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        let meta = meta.as_object_mut().ok_or_else(|| {
+            AcpError::Protocol("prompt _meta collision for trusted turn context".into())
+        })?;
+        if meta.contains_key("buzz") {
+            return Err(AcpError::Protocol(
+                "prompt _meta.buzz collision for trusted turn context".into(),
+            ));
+        }
+        meta.insert(
+            "buzz".into(),
+            serde_json::json!({"trustedTurnContext": envelope}),
+        );
+        Ok(Some(generation))
+    }
+
+    fn commit_trusted_generation(&mut self, candidate: Option<u32>) -> Result<(), AcpError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let expected = self
+            .trusted_turn_generation
+            .checked_add(1)
+            .ok_or_else(|| AcpError::Protocol("trusted turn generation overflow".into()))?;
+        if candidate != expected {
+            return Err(AcpError::Protocol(
+                "trusted turn generation commit was not contiguous".into(),
+            ));
+        }
+        self.trusted_turn_generation = candidate;
+        Ok(())
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -798,7 +909,9 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let mut params = build_prompt_params(session_id, prompt_blocks);
+        let staged = self.trusted_next_prompt.take();
+        let trusted_generation = self.attach_trusted_context(&mut params, session_id, staged)?;
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -825,6 +938,7 @@ impl AcpClient {
             self.current_hard_deadline = None;
             return Err(e);
         }
+        self.commit_trusted_generation(trusted_generation)?;
 
         let result = self
             .read_until_response_with_idle_timeout(
@@ -1467,7 +1581,24 @@ impl AcpClient {
                                 crate::pool::SteerError::ExpectedRunIdMissing,
                             ));
                         }
-                        Some((transport, method, params)) => {
+                        Some((transport, method, mut params)) => {
+                            let trusted_generation = match self.attach_trusted_context(
+                                &mut params,
+                                session_id,
+                                Some((
+                                    crate::trusted_turn_context::Source::Steer,
+                                    req.trusted_event.clone().into_iter().collect(),
+                                    1,
+                                )),
+                            ) {
+                                Ok(generation) => generation,
+                                Err(error) => {
+                                    let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
+                                        crate::pool::SteerError::Transport(error.to_string()),
+                                    ));
+                                    continue;
+                                }
+                            };
                             let id = self.next_id;
                             self.next_id += 1;
                             let msg = serde_json::json!({
@@ -1483,6 +1614,14 @@ impl AcpClient {
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
+                                    if let Err(error) =
+                                        self.commit_trusted_generation(trusted_generation)
+                                    {
+                                        let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
+                                            crate::pool::SteerError::Transport(error.to_string()),
+                                        ));
+                                        continue;
+                                    }
                                     pending_steer = Some((id, transport, req.ack_tx));
                                 }
                                 Err(e) => {
@@ -2371,6 +2510,16 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 mod tests {
     use super::*;
 
+    fn test_trusted_event() -> crate::trusted_turn_context::EventFacts {
+        crate::trusted_turn_context::EventFacts {
+            event_id: "a".repeat(64),
+            author_pubkey: "b".repeat(64),
+            actor_pubkey: "b".repeat(64),
+            channel_type: crate::trusted_turn_context::ChannelType::Stream,
+            thread_root_event_id: Some("c".repeat(64)),
+        }
+    }
+
     #[test]
     fn stop_reason_parses_all_known_values() {
         assert_eq!(StopReason::from_str("end_turn"), Some(StopReason::EndTurn));
@@ -2537,6 +2686,11 @@ mod tests {
             msg["params"]["clientCapabilities"]["_meta"]["goose"]["customNotifications"].as_bool(),
             Some(true),
             "goose customNotifications capability must be advertised"
+        );
+        assert_eq!(
+            msg["params"]["clientCapabilities"]["_meta"]["buzz"]["trustedTurnContext"],
+            serde_json::json!({"versions":[crate::trusted_turn_context::VERSION]}),
+            "the private offer must use the exact frozen bilateral negotiation shape"
         );
     }
 
@@ -3046,6 +3200,322 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    fn trusted_turn() -> crate::trusted_turn_context::TurnFacts {
+        crate::trusted_turn_context::TurnFacts {
+            process: crate::trusted_turn_context::ProcessFacts {
+                relay_origin: "wss://relay.example".into(),
+                agent_pubkey: "a".repeat(64),
+                process_instance_id: uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                    .unwrap(),
+                owner: None,
+            },
+            channel_id: Some(
+                uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            ),
+            channel_type: Some(crate::trusted_turn_context::ChannelType::Stream),
+            execution_scope: Some(crate::trusted_turn_context::ExecutionScope::Conversation),
+            turn_id: uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+        }
+    }
+
+    async fn trusted_acceptance_after_initialize(result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; sleep 5"
+        );
+        let mut client = spawn_script(&script).await;
+        client.initialize().await.expect("initialize response");
+        let accepted = client.trusted_turn_context_accepted;
+        client.shutdown().await;
+        accepted
+    }
+
+    #[tokio::test]
+    async fn trusted_context_initialize_requires_exact_acceptance() {
+        let exact = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}"}}}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(trusted_acceptance_after_initialize(&exact).await);
+        assert!(!trusted_acceptance_after_initialize(r#"{"agentCapabilities":{}}"#).await);
+        let extra = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}","extra":true}}}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(!trusted_acceptance_after_initialize(&extra).await);
+        let sibling = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}"}},"unknown":true}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(!trusted_acceptance_after_initialize(&sibling).await);
+        assert!(
+            !trusted_acceptance_after_initialize(
+                r#"{"agentCapabilities":{"_meta":{"buzz":"collision"}}}"#
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_context_is_absent_without_exact_acceptance() {
+        let mut client = spawn_script("sleep 10").await;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut params = build_prompt_params("session", &["unchanged"]);
+        let before = params.clone();
+        client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .unwrap();
+        assert_eq!(params, before);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_context_attaches_to_prompt_and_both_steer_builders() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let cases = [
+            build_prompt_params("session", &["ordinary"]),
+            build_goose_steer_params("session", "run", &["goose"]),
+            build_acp_steer_params("session", &["acp"]),
+        ];
+        for (index, mut params) in cases.into_iter().enumerate() {
+            let candidate = client
+                .attach_trusted_context(
+                    &mut params,
+                    "session",
+                    Some((
+                        if index == 0 {
+                            crate::trusted_turn_context::Source::Message
+                        } else {
+                            crate::trusted_turn_context::Source::Steer
+                        },
+                        vec![test_trusted_event()],
+                        1,
+                    )),
+                )
+                .unwrap();
+            let envelope = &params["_meta"]["buzz"]["trustedTurnContext"];
+            assert_eq!(envelope["generation"], (index + 1) as u64);
+            assert_eq!(envelope["sessionId"], "session");
+            assert_eq!(envelope["currentEventId"], "a".repeat(64));
+            client.commit_trusted_generation(candidate).unwrap();
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_context_collision_and_overflow_fail_before_write_state() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut collision = serde_json::json!({
+            "sessionId":"session", "prompt":[], "_meta":{"buzz":{"other":true}}
+        });
+        assert!(client
+            .attach_trusted_context(
+                &mut collision,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .is_err());
+        assert_eq!(client.trusted_turn_generation, 0);
+        client.trusted_turn_generation = u32::MAX;
+        let mut params = build_prompt_params("session", &["ordinary"]);
+        assert!(client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .is_err());
+        assert!(params.get("_meta").is_none());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_generation_rolls_back_when_prompt_write_fails() {
+        let mut client = spawn_script("exit 0").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let _ = client.child.wait().await;
+        client.stage_trusted_prompt(
+            crate::trusted_turn_context::Source::Message,
+            vec![test_trusted_event()],
+            1,
+        );
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "will not be written",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(client.trusted_turn_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn trusted_generation_rolls_back_when_native_steer_write_fails() {
+        let mut client = spawn_script("exit 0").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let _ = client.child.wait().await;
+        let mut params = build_acp_steer_params("session", &["steer"]);
+        let candidate = client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Steer,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .unwrap();
+        let msg = serde_json::json!({
+            "jsonrpc":"2.0", "id":0, "method":ACP_STEER_METHOD, "params":params
+        });
+        assert!(client.write_ndjson(&msg).await.is_err());
+        assert_eq!(candidate, Some(1));
+        assert_eq!(client.trusted_turn_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn trusted_context_rejects_partially_attested_batch_before_write() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut params = build_prompt_params("session", &["two-event batch"]);
+        let result = client.attach_trusted_context(
+            &mut params,
+            "session",
+            Some((
+                crate::trusted_turn_context::Source::Message,
+                vec![test_trusted_event()],
+                2,
+            )),
+        );
+        assert!(result.is_err());
+        assert!(params.get("_meta").is_none());
+        assert_eq!(client.trusted_turn_generation, 0);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_bootstrap_then_message_commit_contiguous_generations_on_wire() {
+        let script = r#"
+IFS= read -r first
+case "$first" in
+  *'"source":"bootstrap"'*) ;;
+  *) exit 31 ;;
+esac
+case "$first" in *'"generation":1'*) ;; *) exit 34 ;; esac
+case "$first" in *'currentEventId'*) exit 32 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+IFS= read -r second
+case "$second" in
+  *'"source":"message"'*) ;;
+  *) exit 33 ;;
+esac
+case "$second" in *'"generation":2'*) ;; *) exit 35 ;; esac
+case "$second" in *'"currentEventId"'*) ;; *) exit 36 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Bootstrap, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "bootstrap",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        client.stage_trusted_prompt(
+            crate::trusted_turn_context::Source::Message,
+            vec![test_trusted_event()],
+            1,
+        );
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "message",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.trusted_turn_generation, 2);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_resume_and_heartbeat_have_no_current_authority_on_wire() {
+        let script = r#"
+IFS= read -r resume
+case "$resume" in *'"source":"resume"'*) ;; *) exit 41 ;; esac
+case "$resume" in *'"channelId"'*) ;; *) exit 42 ;; esac
+case "$resume" in *'"events"'*|*'"currentEventId"'*) exit 43 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+IFS= read -r heartbeat
+case "$heartbeat" in *'"source":"heartbeat"'*) ;; *) exit 44 ;; esac
+case "$heartbeat" in *'"channelId"'*|*'"events"'*|*'"currentEventId"'*) exit 45 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        client.trusted_turn_context_accepted = true;
+
+        client.begin_trusted_turn(Some(trusted_turn()));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Resume, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "resume",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let mut heartbeat_turn = trusted_turn();
+        heartbeat_turn.channel_id = None;
+        heartbeat_turn.channel_type = None;
+        heartbeat_turn.execution_scope = None;
+        client.begin_trusted_turn(Some(heartbeat_turn));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Heartbeat, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "heartbeat-session",
+                "heartbeat",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.trusted_turn_generation, 1);
+        client.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -3756,6 +4226,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3825,6 +4296,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3897,6 +4369,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3971,6 +4444,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -4154,8 +4628,22 @@ mod tests {
         )
         .await;
         set_steering_supported(&mut client);
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
 
-        let (_written, ack) = run_one_steer(&mut client, &capture).await;
+        let (written, ack) = run_one_steer(&mut client, &capture).await;
+
+        let written: serde_json::Value = serde_json::from_str(
+            written
+                .as_deref()
+                .expect("rejected steer was still written for admission"),
+        )
+        .expect("steer wire JSON");
+        assert_eq!(
+            written["params"]["_meta"]["buzz"]["trustedTurnContext"]["source"],
+            "steer"
+        );
+        assert_eq!(client.trusted_turn_generation, 1);
 
         match ack {
             crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
@@ -4221,6 +4709,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -4274,6 +4763,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await

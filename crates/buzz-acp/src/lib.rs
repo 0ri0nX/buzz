@@ -13,6 +13,7 @@ mod queue;
 mod relay;
 mod scope;
 mod setup_mode;
+mod trusted_turn_context;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -139,7 +140,7 @@ fn emit_runtime_lifecycle(
 /// 1. `BUZZ_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
 ///    Verified against the agent's own pubkey to extract the owner pubkey.
 /// 2. `--agent-owner` CLI flag / `BUZZ_ACP_AGENT_OWNER` env var.
-fn resolve_agent_owner(config: &Config) -> Option<String> {
+fn resolve_agent_owner(config: &Config) -> Option<trusted_turn_context::Owner> {
     // Try BUZZ_AUTH_TAG first (NIP-OA attestation).
     if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
         if !auth_tag.is_empty() {
@@ -148,7 +149,10 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
                 Ok(owner_pk) => {
                     let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
                     tracing::info!("owner resolved from BUZZ_AUTH_TAG: {owner_hex}");
-                    return Some(owner_hex);
+                    return Some(trusted_turn_context::Owner {
+                        pubkey: owner_hex,
+                        provenance: trusted_turn_context::OwnerProvenance::NipOa,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("BUZZ_AUTH_TAG verification failed: {e} — falling back");
@@ -158,7 +162,13 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
     }
 
     // Fall back to --agent-owner config.
-    config.agent_owner.clone()
+    config
+        .agent_owner
+        .clone()
+        .map(|pubkey| trusted_turn_context::Owner {
+            pubkey,
+            provenance: trusted_turn_context::OwnerProvenance::Configured,
+        })
 }
 
 /// Cache for the agent's owner pubkey.
@@ -619,6 +629,7 @@ struct QueuedNormalListenerEvent {
     event_id_hex: String,
     event_for_steer: nostr::Event,
     prompt_tag_for_steer: String,
+    trusted_facts_for_steer: Option<trusted_turn_context::EventFacts>,
 }
 
 impl QueuedNormalListenerEvent {
@@ -654,6 +665,7 @@ impl QueuedNormalListenerEvent {
                 self.scope.clone(),
                 self.event_for_steer,
                 self.prompt_tag_for_steer,
+                self.trusted_facts_for_steer,
                 steer_ack_tx,
             );
         if !native_attempted {
@@ -667,6 +679,7 @@ impl NormalListenerIngress {
         self,
         queue: &mut EventQueue,
         session_scope: scope::SessionScope,
+        channel_type: Option<trusted_turn_context::ChannelType>,
     ) -> QueuedNormalListenerEvent {
         let Self {
             buzz_event,
@@ -677,12 +690,31 @@ impl NormalListenerIngress {
         let event_for_steer = buzz_event.event.clone();
         let prompt_tag_for_steer = prompt_tag.clone();
         let channel_id = buzz_event.channel_id;
+        let thread_root_event_id = match channel_type {
+            Some(trusted_turn_context::ChannelType::Stream) => scope::SessionScope::derive(
+                scope::SessionPolicy::Thread,
+                channel_id,
+                false,
+                &buzz_event.event,
+            )
+            .root_event_id()
+            .map(str::to_owned),
+            Some(trusted_turn_context::ChannelType::Dm) | None => None,
+        };
+        let trusted_facts = channel_type.map(|channel_type| trusted_turn_context::EventFacts {
+            event_id: event_id_hex.clone(),
+            author_pubkey: buzz_event.event.pubkey.to_hex(),
+            actor_pubkey: effective_author.clone(),
+            channel_type,
+            thread_root_event_id,
+        });
         let accepted = queue.push(QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
             event: buzz_event.event,
             received_at: std::time::Instant::now(),
             prompt_tag,
+            trusted_facts: trusted_facts.clone(),
         });
         QueuedNormalListenerEvent {
             accepted,
@@ -691,7 +723,100 @@ impl NormalListenerIngress {
             event_id_hex,
             event_for_steer,
             prompt_tag_for_steer,
+            trusted_facts_for_steer: trusted_facts,
         }
+    }
+}
+
+#[cfg(test)]
+mod trusted_ingress_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn ingress(channel_id: Uuid, root: Option<&str>) -> (NormalListenerIngress, String, String) {
+        let keys = Keys::generate();
+        let tags = root
+            .map(|root| vec![Tag::parse(["e", root, "", "root"]).expect("root tag")])
+            .unwrap_or_default();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "message")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let event_id = event.id.to_hex();
+        let author = event.pubkey.to_hex();
+        (
+            NormalListenerIngress {
+                buzz_event: relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                effective_author: "c".repeat(64),
+                prompt_tag: "test".into(),
+            },
+            event_id,
+            author,
+        )
+    }
+
+    #[test]
+    fn admission_freezes_stream_author_actor_and_canonical_root() {
+        let channel_id = Uuid::new_v4();
+        let root = "d".repeat(64);
+        let (ingress, event_id, author) = ingress(channel_id, Some(&root));
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let queued = ingress.push(
+            &mut queue,
+            scope::SessionScope::Conversation { channel_id },
+            Some(trusted_turn_context::ChannelType::Stream),
+        );
+        let facts = queued.trusted_facts_for_steer.expect("stream facts");
+        assert_eq!(facts.event_id, event_id);
+        assert_eq!(facts.author_pubkey, author);
+        assert_eq!(facts.actor_pubkey, "c".repeat(64));
+        assert_eq!(
+            facts.channel_type,
+            trusted_turn_context::ChannelType::Stream
+        );
+        assert_eq!(
+            facts.thread_root_event_id.as_deref(),
+            Some(event_id.as_str()),
+            "admission must freeze the canonical root from SessionScope::derive"
+        );
+        assert_eq!(
+            queue.flush_next().unwrap().events[0].trusted_facts,
+            Some(facts)
+        );
+    }
+
+    #[test]
+    fn admission_freezes_dm_without_root_and_unknown_class_stays_unattested() {
+        let channel_id = Uuid::new_v4();
+        let (dm, _, _) = ingress(channel_id, Some(&"d".repeat(64)));
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let queued = dm.push(
+            &mut queue,
+            scope::SessionScope::Conversation { channel_id },
+            Some(trusted_turn_context::ChannelType::Dm),
+        );
+        let dm_facts = queued.trusted_facts_for_steer.expect("dm facts");
+        assert_eq!(dm_facts.channel_type, trusted_turn_context::ChannelType::Dm);
+        assert!(dm_facts.thread_root_event_id.is_none());
+
+        let unknown_channel = Uuid::new_v4();
+        let (unknown, _, _) = ingress(unknown_channel, None);
+        let mut unknown_queue = EventQueue::new(DedupMode::Queue);
+        let queued = unknown.push(
+            &mut unknown_queue,
+            scope::SessionScope::Conversation {
+                channel_id: unknown_channel,
+            },
+            None,
+        );
+        assert!(queued.trusted_facts_for_steer.is_none());
+        assert!(unknown_queue.flush_next().unwrap().events[0]
+            .trusted_facts
+            .is_none());
     }
 }
 
@@ -2597,7 +2722,8 @@ async fn tokio_main() -> Result<()> {
     let presence_keys = config.keys.clone();
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
-    let startup_owner: Option<String> = resolve_agent_owner(&config);
+    let resolved_owner = resolve_agent_owner(&config);
+    let startup_owner: Option<String> = resolved_owner.as_ref().map(|owner| owner.pubkey.clone());
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
     } else {
@@ -2760,7 +2886,16 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
+    let trusted_process = trusted_turn_context::canonical_relay_origin(&config.relay_url)
+        .ok()
+        .map(|relay_origin| trusted_turn_context::ProcessFacts {
+            relay_origin,
+            agent_pubkey: pubkey_hex.clone(),
+            process_instance_id: Uuid::new_v4(),
+            owner: resolved_owner,
+        });
     let ctx = Arc::new(PromptContext {
+        trusted_process,
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -3517,14 +3652,31 @@ async fn tokio_main() -> Result<()> {
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
-                            let session_scope = scope::SessionScope::derive(
-                                config.session_policy,
-                                ingress.buzz_event.channel_id,
-                                is_dm_channel(
+                            let admitted_channel_info = ctx
+                                .channel_info
+                                .resolve_channel_metadata(ingress.buzz_event.channel_id)
+                                .await;
+                            let trusted_channel_type = admitted_channel_info
+                                .as_ref()
+                                .and_then(|info| {
+                                    trusted_turn_context::ChannelType::from_raw(
+                                        &info.channel_type,
+                                    )
+                                    .ok()
+                                });
+                            let is_dm = match trusted_channel_type {
+                                Some(trusted_turn_context::ChannelType::Dm) => true,
+                                Some(trusted_turn_context::ChannelType::Stream) => false,
+                                None => is_dm_channel(
                                     ingress.buzz_event.channel_id,
                                     &ctx.channel_info,
                                 )
                                 .await,
+                            };
+                            let session_scope = scope::SessionScope::derive(
+                                config.session_policy,
+                                ingress.buzz_event.channel_id,
+                                is_dm,
                                 &ingress.buzz_event.event,
                             );
                             tracing::debug!(
@@ -3535,7 +3687,11 @@ async fn tokio_main() -> Result<()> {
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
+                            let queued = ingress.push(
+                                &mut queue,
+                                session_scope,
+                                trusted_channel_type,
+                            );
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -4291,6 +4447,7 @@ fn try_native_steer(
     scope: scope::SessionScope,
     event: nostr::Event,
     prompt_tag: String,
+    trusted_event: Option<trusted_turn_context::EventFacts>,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
     let channel_id = scope.channel_id();
@@ -4313,6 +4470,7 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        trusted_facts: trusted_event.clone(),
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let new_message = prompt_framing::semantic_section(tag, "");
@@ -4326,6 +4484,7 @@ fn try_native_steer(
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
         prompt_blocks: vec![body],
+        trusted_event,
         ack_tx,
     };
 
@@ -6342,6 +6501,7 @@ mod owner_control_command_tests {
             scope: held_scope.clone(),
             event: make_event(KIND_STREAM_MESSAGE, "held", None),
             received_at: oldest,
+            trusted_facts: None,
             prompt_tag: "test".into(),
         });
         for i in 0..500 {
@@ -6350,6 +6510,7 @@ mod owner_control_command_tests {
                 scope: surviving_scope.clone(),
                 event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
                 prompt_tag: "test".into(),
             });
         }
@@ -9906,6 +10067,7 @@ mod error_outcome_emission_tests {
             scope: scope.clone(),
             event,
             received_at: std::time::Instant::now(),
+            trusted_facts: None,
             prompt_tag: "t".into(),
         });
         let batch = queue.flush_next().expect("flush thread batch");
@@ -10102,6 +10264,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    trusted_facts: None,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -10211,6 +10374,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    trusted_facts: None,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -10334,6 +10498,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -10430,6 +10595,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -10509,6 +10675,7 @@ mod error_outcome_emission_tests {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: Some(CancelReason::Steer),
@@ -10540,6 +10707,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
+            trusted_facts: None,
             prompt_tag: "test".into(),
         });
         let config = test_config();
@@ -10780,6 +10948,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -10934,6 +11103,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -11035,6 +11205,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -11204,6 +11375,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,

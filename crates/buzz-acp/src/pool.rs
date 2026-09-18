@@ -535,6 +535,8 @@ pub struct SteerRequest {
     /// `queue::native_steer_framing()` + `queue::format_event_block` so
     /// the wording cannot drift from the cancel+merge fallback path.
     pub prompt_blocks: Vec<String>,
+    /// Trusted facts for the one newly admitted steer event.
+    pub trusted_event: Option<crate::trusted_turn_context::EventFacts>,
     /// Oneshot for the read loop to report the outcome.
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
 }
@@ -809,6 +811,8 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Process-lifetime attested identity and canonical relay origin.
+    pub trusted_process: Option<crate::trusted_turn_context::ProcessFacts>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -2643,6 +2647,42 @@ pub async fn run_prompt_task(
             "isNewSession": is_new_session,
         }),
     );
+    let trusted_events: Option<Vec<crate::trusted_turn_context::EventFacts>> = batch
+        .as_ref()
+        .map(|batch| {
+            batch
+                .events
+                .iter()
+                .map(|event| event.trusted_facts.clone())
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_else(|| Some(vec![]));
+    let trusted_channel_type = trusted_events
+        .as_ref()
+        .and_then(|events| events.first())
+        .map(|event| event.channel_type);
+    let trusted_execution_scope = source.scope().map(|scope| match scope {
+        SessionScope::Conversation { .. } => {
+            crate::trusted_turn_context::ExecutionScope::Conversation
+        }
+        SessionScope::Thread { root_event_id, .. } => {
+            crate::trusted_turn_context::ExecutionScope::Thread {
+                root_event_id: root_event_id.clone(),
+            }
+        }
+    });
+    let trusted_turn_id = uuid::Uuid::parse_str(&turn_id).ok();
+    agent
+        .acp
+        .begin_trusted_turn(ctx.trusted_process.clone().zip(trusted_turn_id).map(
+            |(process, turn_id)| crate::trusted_turn_context::TurnFacts {
+                process,
+                channel_id: source.channel_id(),
+                channel_type: trusted_channel_type,
+                execution_scope: trusted_execution_scope,
+                turn_id,
+            },
+        ));
 
     // Standing context is fixed for the life of a session. Agents with
     // systemPrompt support already hold it from session/new; legacy agents
@@ -2688,6 +2728,11 @@ pub async fn run_prompt_task(
                 },
                 &standing,
                 initial_msg,
+            );
+            agent.acp.stage_trusted_prompt(
+                crate::trusted_turn_context::Source::Bootstrap,
+                vec![],
+                0,
             );
             let init_result = agent
                 .acp
@@ -3040,6 +3085,17 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    let (trusted_source, trusted_expected_event_count) =
+        trusted_prompt_source(&source, batch.as_ref());
+    let trusted_prompt_events = match trusted_source {
+        crate::trusted_turn_context::Source::Message => trusted_events.unwrap_or_default(),
+        _ => vec![],
+    };
+    agent.acp.stage_trusted_prompt(
+        trusted_source,
+        trusted_prompt_events,
+        trusted_expected_event_count,
+    );
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -4817,6 +4873,26 @@ fn prompt_label(source: &PromptSource) -> String {
             scope.telemetry_label()
         ),
         PromptSource::Heartbeat => "heartbeat".to_string(),
+    }
+}
+
+fn trusted_prompt_source(
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+) -> (crate::trusted_turn_context::Source, usize) {
+    match source {
+        PromptSource::Heartbeat => (crate::trusted_turn_context::Source::Heartbeat, 0),
+        PromptSource::Channel(_)
+            if batch.is_some_and(|batch| {
+                batch.cancel_reason.is_some() && batch.cancelled_events.is_empty()
+            }) =>
+        {
+            (crate::trusted_turn_context::Source::Resume, 0)
+        }
+        PromptSource::Channel(_) => (
+            crate::trusted_turn_context::Source::Message,
+            batch.map_or(0, |batch| batch.events.len()),
+        ),
     }
 }
 
@@ -6794,6 +6870,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7046,6 +7123,7 @@ done"#
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    trusted_facts: None,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -7245,6 +7323,7 @@ done"#
                 event: root,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7256,6 +7335,7 @@ done"#
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7346,11 +7426,13 @@ done"#
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancel_reason: Some(crate::queue::CancelReason::Steer),
         };
@@ -7361,6 +7443,7 @@ done"#
                 event: next_event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7517,6 +7600,7 @@ done"#
                 event: trigger,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7799,6 +7883,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7852,6 +7937,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8092,6 +8178,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8174,6 +8261,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             event: cancelled,
             prompt_tag: "cancelled".into(),
             received_at: std::time::Instant::now(),
+            trusted_facts: None,
         });
         let target = resolve_context_target(&batch, false);
         let context = ConversationContext::Thread {
@@ -8251,6 +8339,29 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert_eq!(channel.scope(), Some(&scope));
         assert_eq!(channel.channel_id(), Some(ch));
         assert_eq!(PromptSource::Heartbeat.scope(), None);
+    }
+
+    #[test]
+    fn trusted_prompt_source_distinguishes_message_resume_and_heartbeat() {
+        let ch = Uuid::new_v4();
+        let source = PromptSource::Channel(conv(ch));
+        let mut batch = batch_with_scope(conv(ch), signed_event_with_tags(vec![]));
+        assert_eq!(
+            trusted_prompt_source(&source, Some(&batch)),
+            (crate::trusted_turn_context::Source::Message, 1)
+        );
+
+        batch.cancel_reason = Some(CancelReason::Interrupt);
+        assert!(batch.cancelled_events.is_empty());
+        assert_eq!(
+            trusted_prompt_source(&source, Some(&batch)),
+            (crate::trusted_turn_context::Source::Resume, 0)
+        );
+
+        assert_eq!(
+            trusted_prompt_source(&PromptSource::Heartbeat, None),
+            (crate::trusted_turn_context::Source::Heartbeat, 0)
+        );
     }
 
     #[tokio::test]
@@ -8856,6 +8967,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -9926,6 +10038,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            trusted_process: Some(crate::trusted_turn_context::ProcessFacts {
+                relay_origin: "ws://127.0.0.1:3000".into(),
+                agent_pubkey: agent_keys.public_key().to_hex(),
+                process_instance_id: uuid::Uuid::new_v4(),
+                owner: owner_pubkey
+                    .as_ref()
+                    .map(|owner| crate::trusted_turn_context::Owner {
+                        pubkey: owner.to_hex(),
+                        provenance: crate::trusted_turn_context::OwnerProvenance::Configured,
+                    }),
+            }),
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
@@ -10604,6 +10727,7 @@ done"#
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                trusted_facts: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
