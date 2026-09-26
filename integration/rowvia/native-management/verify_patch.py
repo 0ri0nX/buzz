@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the pinned Rowvia native-management commit in a disposable checkout."""
+"""Verify a pinned Rowvia Buzz patch in a disposable checkout."""
 
 from __future__ import annotations
 
@@ -15,6 +15,26 @@ import tempfile
 
 CUSTODY = Path(__file__).resolve().parent
 REPO = CUSTODY.parents[2]
+ARTIFACTS = {
+    "management": (CUSTODY, "buzz.rowvia-native-management/v1"),
+    "enrollment": (
+        CUSTODY / "external-agent-enrollment",
+        "buzz.rowvia-external-agent-enrollment/v1",
+    ),
+}
+ENROLLMENT_PATHS = {
+    "desktop/src-tauri/src/app_state.rs",
+    "desktop/src-tauri/src/commands/external_agent_enrollment.rs",
+    "desktop/src-tauri/src/commands/external_agent_enrollment_tests.rs",
+    "desktop/src-tauri/src/commands/mod.rs",
+    "desktop/src-tauri/src/lib.rs",
+    "desktop/src-tauri/src/managed_agents/persona_events.rs",
+    "desktop/src-tauri/src/managed_agents/persona_events/tests.rs",
+    "desktop/src/features/agents/ui/AgentsView.tsx",
+    "desktop/src/features/agents/ui/ExternalAgentEnrollmentDialog.tsx",
+    "desktop/src/shared/api/tauri.ts",
+    "integration/rowvia/native-management/EXTERNAL-AGENT-ENROLLMENT.md",
+}
 MANIFEST_KEYS = {
     "contract_version",
     "patch_commit",
@@ -41,13 +61,14 @@ def git(*args: str, cwd: Path, env: dict[str, str] | None = None) -> bytes:
     ).stdout
 
 
-def verify(candidates: list[str]) -> None:
+def verify(artifact: str, candidates: list[str]) -> None:
     """Check artifact bytes, source identity, and replayed commit identity."""
 
-    manifest = json.loads((CUSTODY / "manifest.json").read_text(encoding="utf-8"))
+    directory, contract = ARTIFACTS[artifact]
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(manifest, dict) or set(manifest) != MANIFEST_KEYS:
         raise ValueError("unexpected manifest fields")
-    if manifest["contract_version"] != "buzz.rowvia-native-management/v1":
+    if manifest["contract_version"] != contract:
         raise ValueError("unexpected custody contract")
     for field in ("patch_commit", "result_tree", "upstream_base"):
         if not isinstance(manifest[field], str) or not HEX40.fullmatch(manifest[field]):
@@ -59,7 +80,7 @@ def verify(candidates: list[str]) -> None:
     filename = manifest["patch_filename"]
     if not isinstance(filename, str) or Path(filename).name != filename or not filename.endswith(".patch"):
         raise ValueError("invalid patch_filename")
-    patch = CUSTODY / filename
+    patch = directory / filename
     patch_bytes = patch.read_bytes()
     if hashlib.sha256(patch_bytes).hexdigest() != manifest["patch_sha256"]:
         raise ValueError("patch SHA-256 mismatch")
@@ -71,6 +92,14 @@ def verify(candidates: list[str]) -> None:
         "result_tree"
     ]:
         raise ValueError("source commit has a different tree")
+    if artifact == "enrollment":
+        paths = set(
+            git("diff-tree", "--no-commit-id", "--name-only", "-r", commit, cwd=REPO)
+            .decode()
+            .splitlines()
+        )
+        if paths != ENROLLMENT_PATHS:
+            raise ValueError("enrollment commit touches unexpected paths")
     expected = git("format-patch", "--no-signature", "--stdout", "-1", commit, cwd=REPO)
     if patch_bytes != expected:
         raise ValueError("patch differs from the source commit's format-patch")
@@ -95,7 +124,7 @@ def verify(candidates: list[str]) -> None:
             "result_tree"
         ]:
             raise ValueError("replayed tree mismatch")
-    print(f"verified {commit} from {base} (SHA-256 and exact replay)")
+    print(f"verified {artifact} {commit} from {base} (SHA-256 and exact replay)")
 
     failed = False
     for candidate in candidates:
@@ -128,6 +157,7 @@ def verify(candidates: list[str]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact", choices=ARTIFACTS, default="management")
     parser.add_argument("--candidate", action="append", default=[], help="local tag or commit to check")
     arguments = parser.parse_args()
-    verify(arguments.candidate)
+    verify(arguments.artifact, arguments.candidate)
