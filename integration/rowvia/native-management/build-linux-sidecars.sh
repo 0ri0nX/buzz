@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Rowvia Buzz CLI and ACP sidecars from the Desktop's exact source commit.
 set -euo pipefail
+umask 077
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(cd -- "$script_dir/../../.." && pwd -P)

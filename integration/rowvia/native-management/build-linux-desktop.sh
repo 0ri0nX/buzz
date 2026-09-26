@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the pinned Rowvia Buzz Desktop from an isolated Git archive.
 set -euo pipefail
+umask 077
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(cd -- "$script_dir/../../.." && pwd -P)
