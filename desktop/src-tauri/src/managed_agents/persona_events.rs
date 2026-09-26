@@ -413,6 +413,27 @@ pub(crate) async fn flush_pending_events_at(
             // and `mark_synced` below still compares against the retained row's
             // original `created_at`/`content`, which are untouched.
             resign_with_fresh_timestamp(&event, state)?
+        } else if crate::commands::verified_external_announcement(
+            &current,
+            &event,
+            &owner_pubkey,
+            relay_url,
+        )
+        .is_some()
+            && current
+                .created_at
+                .abs_diff(nostr::Timestamp::now().as_secs() as i64)
+                > 600
+        {
+            // An offline external enrollment has no managed-agent record for
+            // boot reconcile to re-sign. Refresh only this verified owner
+            // announcement at send time; the retained row stays byte-stable
+            // for mark_synced's compare-and-clear and outage retries.
+            EventBuilder::new(event.kind, event.content.clone())
+                .tags(event.tags.iter().cloned())
+                .custom_created_at(nostr::Timestamp::now())
+                .sign_with_keys(owner_keys)
+                .map_err(|e| format!("failed to refresh external agent announcement: {e}"))?
         } else {
             event
         };

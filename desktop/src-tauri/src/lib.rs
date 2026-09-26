@@ -705,6 +705,8 @@ pub fn run() {
             reconcile_managed_agent_runtimes,
             put_managed_agent_runtime_lifecycle,
             create_managed_agent,
+            prepare_external_agent_enrollment,
+            complete_external_agent_enrollment,
             start_managed_agent,
             stop_managed_agent,
             set_agent_managed_profiles,

@@ -948,6 +948,131 @@ mod flush_barrier {
         .expect("retain test event");
     }
 
+    #[tokio::test]
+    async fn external_announcement_is_refreshed_after_outage_and_restart() {
+        use sha2::Digest;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let route_calls = calls.clone();
+        let route_seen = seen.clone();
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let calls = route_calls.clone();
+                let seen = route_seen.clone();
+                async move {
+                    let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    seen.lock().unwrap().push(event.clone());
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    let created_at = event["created_at"].as_i64().unwrap();
+                    let now = nostr::Timestamp::now().as_secs() as i64;
+                    if created_at.abs_diff(now) > 900 {
+                        return (StatusCode::BAD_REQUEST, String::new());
+                    }
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "event_id": event["id"],
+                            "accepted": true,
+                            "message": ""
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let content = serde_json::json!({
+            "name": "Remote",
+            "parallelism": 1,
+            "respond_to": "owner-only",
+            "external_enrollment": {
+                "version": 1,
+                "challenge_hash": "a".repeat(64),
+                "proof_event_id": "b".repeat(64),
+                "issued_at": 1,
+                "relay_url_hash": hex::encode(sha2::Sha256::digest(relay_url.as_bytes()))
+            }
+        })
+        .to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        {
+            let conn = open_retention_db(&db_path).unwrap();
+            let event = EventBuilder::new(Kind::Custom(30177), content)
+                .tags([Tag::parse(["d", agent.as_str()]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1))
+                .sign_with_keys(&keys)
+                .unwrap();
+            retain_event(
+                &conn,
+                &RetainedEvent {
+                    kind: 30177,
+                    pubkey: owner.clone(),
+                    d_tag: agent.clone(),
+                    content: event.content.clone(),
+                    created_at: 1,
+                    raw_event: event.as_json(),
+                    pending_sync: true,
+                },
+            )
+            .unwrap();
+        }
+
+        let first_state = build_app_state();
+        *first_state.keys.lock().unwrap() = keys.clone();
+        *first_state.relay_url_override.lock().unwrap() = Some(relay_url.clone());
+        assert_eq!(
+            flush_pending_events(&db_path, &first_state).await.unwrap(),
+            0
+        );
+        assert!(
+            get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
+                .unwrap()
+                .unwrap()
+                .pending_sync
+        );
+
+        // A new AppState has no memory of the enrollment challenge. The
+        // retained, owner-signed marker is enough to re-sign for relay TTL.
+        let restarted_state = build_app_state();
+        *restarted_state.keys.lock().unwrap() = keys;
+        *restarted_state.relay_url_override.lock().unwrap() = Some(relay_url);
+        assert_eq!(
+            flush_pending_events(&db_path, &restarted_state)
+                .await
+                .unwrap(),
+            1
+        );
+        let row = get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
+            .unwrap()
+            .unwrap();
+        assert!(!row.pending_sync);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["content"], seen[1]["content"]);
+        assert_eq!(seen[0]["tags"], seen[1]["tags"]);
+        assert_eq!(seen[1]["pubkey"], owner);
+        assert!(seen[1]["created_at"].as_i64().unwrap() > 1);
+    }
+
     #[test]
     fn archive_request_resign_refreshes_timestamp_and_preserves_payload() {
         use nostr::JsonUtil;

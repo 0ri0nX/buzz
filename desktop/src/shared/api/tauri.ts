@@ -764,6 +764,41 @@ export async function listManagedAgents(): Promise<ManagedAgent[]> {
     fromRawManagedAgent,
   );
 }
+
+export type ExternalAgentChallenge = {
+  challenge: string;
+  ownerPubkey: string;
+  relayUrl: string;
+  expiresAt: number;
+};
+
+export type ExternalAgentAuthorization = {
+  agentPubkey: string;
+  ownerPubkey: string;
+  relayUrl: string;
+  authTag: string;
+};
+
+export function prepareExternalAgentEnrollment(agentPubkey: string) {
+  return invokeTauri<ExternalAgentChallenge>(
+    "prepare_external_agent_enrollment",
+    {
+      agentPubkey,
+    },
+  );
+}
+
+export function completeExternalAgentEnrollment(input: {
+  name: string;
+  challenge: string;
+  proofEventJson: string;
+}) {
+  return invokeTauri<ExternalAgentAuthorization>(
+    "complete_external_agent_enrollment",
+    { input },
+  );
+}
+
 export async function createManagedAgent(input: CreateManagedAgentInput) {
   const response = await invokeTauri<RawCreateManagedAgentResponse>(
     "create_managed_agent",

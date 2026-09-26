@@ -7,6 +7,7 @@ import {
 import { AddAgentToChannelDialog } from "./AddAgentToChannelDialog";
 import { AddTeamToChannelDialog } from "./AddTeamToChannelDialog";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
+import { ExternalAgentEnrollmentDialog } from "./ExternalAgentEnrollmentDialog";
 import { AgentDialog } from "./AgentDialog";
 import { CommunityCatalogDialog } from "./CommunityCatalogDialog";
 import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
@@ -49,6 +50,8 @@ export function AgentsView() {
   const fullAiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const compactActionsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
+  const [isExternalEnrollmentOpen, setIsExternalEnrollmentOpen] =
+    React.useState(false);
 
   function openAiDefaults(trigger: HTMLButtonElement | null) {
     aiDefaultsTriggerRef.current = trigger;
@@ -148,6 +151,14 @@ export function AgentsView() {
               <>
                 <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
                   <Button
+                    onClick={() => setIsExternalEnrollmentOpen(true)}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    Authorize external agent
+                  </Button>
+                  <Button
                     data-testid="agent-defaults-button"
                     ref={fullAiDefaultsTriggerRef}
                     onClick={(event) => openAiDefaults(event.currentTarget)}
@@ -189,6 +200,11 @@ export function AgentsView() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onSelect={() => setIsExternalEnrollmentOpen(true)}
+                    >
+                      Authorize external agent
+                    </DropdownMenuItem>
                     <DropdownMenuItem
                       onSelect={() => {
                         openAiDefaults(compactActionsTriggerRef.current);
@@ -311,6 +327,10 @@ export function AgentsView() {
         onOpenChange={setAiDefaultsDialogOpen}
         open={isAiDefaultsOpen}
         returnFocusRef={aiDefaultsTriggerRef}
+      />
+      <ExternalAgentEnrollmentDialog
+        open={isExternalEnrollmentOpen}
+        onOpenChange={setIsExternalEnrollmentOpen}
       />
 
       {agents.agentToAddToChannel ? (
