@@ -34,9 +34,99 @@ export type AgentManagementUpdateRequest = {
   };
 };
 
+export type ConnectorDraftRequest = {
+  type: typeof AGENT_MANAGEMENT_REQUEST;
+  version: 1;
+  action: "connector.grant" | "connector.revoke";
+  requestId: string;
+  request: {
+    channelId: string;
+    targetName: string;
+    gmailLabels?: string[];
+  };
+};
+
 export type AgentManagementRequest =
   | AgentManagementCreateRequest
   | AgentManagementUpdateRequest;
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isSelectionHint(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.trim() !== value ||
+    value.length === 0 ||
+    [...value].length > 120
+  )
+    return false;
+  return (
+    !/\p{Cc}/u.test(value) &&
+    !value.includes("://") &&
+    !value.startsWith("www.") &&
+    !value.includes("@") &&
+    !UUID_PATTERN.test(value) &&
+    !(value.length === 64 && /^[0-9a-f]+$/i.test(value))
+  );
+}
+
+/** Parse only the versioned connector proposal. Values remain hints, never authority. */
+export function parseConnectorDraftRequest(
+  value: unknown,
+): ConnectorDraftRequest | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
+  const payload = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(payload, [
+      "type",
+      "version",
+      "action",
+      "requestId",
+      "request",
+    ]) ||
+    Object.keys(payload).length !== 5 ||
+    payload.type !== AGENT_MANAGEMENT_REQUEST ||
+    payload.version !== 1 ||
+    (payload.action !== "connector.grant" &&
+      payload.action !== "connector.revoke") ||
+    typeof payload.requestId !== "string" ||
+    !UUID_V4_PATTERN.test(payload.requestId) ||
+    typeof payload.request !== "object" ||
+    payload.request === null ||
+    Array.isArray(payload.request)
+  )
+    return null;
+  const request = payload.request as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(request, ["channelId", "targetName", "gmailLabels"]) ||
+    typeof request.channelId !== "string" ||
+    !UUID_PATTERN.test(request.channelId) ||
+    !isSelectionHint(request.targetName) ||
+    (request.gmailLabels !== undefined &&
+      (!Array.isArray(request.gmailLabels) ||
+        request.gmailLabels.length < 1 ||
+        request.gmailLabels.length > 4 ||
+        !request.gmailLabels.every(isSelectionHint)))
+  )
+    return null;
+  return {
+    type: AGENT_MANAGEMENT_REQUEST,
+    version: 1,
+    action: payload.action,
+    requestId: payload.requestId,
+    request: {
+      channelId: request.channelId,
+      targetName: request.targetName,
+      ...(request.gmailLabels === undefined
+        ? {}
+        : { gmailLabels: request.gmailLabels }),
+    },
+  };
+}
 
 function isText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;

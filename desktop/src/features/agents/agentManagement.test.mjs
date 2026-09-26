@@ -6,6 +6,7 @@ import {
   createInputFromRequest,
   requestTargetsEditablePersona,
   parseAgentManagementRequest,
+  parseConnectorDraftRequest,
   updateInputFromRequest,
 } from "./agentManagement.ts";
 import {
@@ -34,6 +35,104 @@ test("parses the narrow no-secret create request", () => {
     parseAgentManagementRequest(createPayload()),
     createPayload(),
   );
+});
+
+const CONNECTOR_ID = "550e8400-e29b-41d4-a716-446655440000";
+function connectorPayload(overrides = {}) {
+  return {
+    type: AGENT_MANAGEMENT_REQUEST,
+    version: 1,
+    action: "connector.grant",
+    requestId: CONNECTOR_ID,
+    request: {
+      channelId: CHANNEL_ID,
+      targetName: "Mail helper",
+      gmailLabels: ["Work"],
+    },
+    ...overrides,
+  };
+}
+
+test("parses only bounded version-one connector draft hints", () => {
+  assert.deepEqual(
+    parseConnectorDraftRequest(connectorPayload()),
+    connectorPayload(),
+  );
+  const withoutLabels = connectorPayload({
+    request: { channelId: CHANNEL_ID, targetName: "Mail helper" },
+  });
+  assert.deepEqual(parseConnectorDraftRequest(withoutLabels), withoutLabels);
+  assert.deepEqual(
+    parseConnectorDraftRequest(
+      connectorPayload({ action: "connector.revoke" }),
+    ),
+    connectorPayload({ action: "connector.revoke" }),
+  );
+});
+
+test("rejects authority, identity, binding, operation, and secret fields", () => {
+  for (const field of [
+    "ownerPubkey",
+    "targetAgentPubkey",
+    "bindingId",
+    "operations",
+    "apiKey",
+    "approval",
+    "envelope",
+    "sourceEventId",
+  ]) {
+    assert.equal(
+      parseConnectorDraftRequest(
+        connectorPayload({
+          request: { ...connectorPayload().request, [field]: "attacker" },
+        }),
+      ),
+      null,
+    );
+    assert.equal(
+      parseConnectorDraftRequest(connectorPayload({ [field]: "attacker" })),
+      null,
+    );
+  }
+});
+
+test("rejects malformed connector IDs, versions, actions, and hints", () => {
+  for (const payload of [
+    connectorPayload({ version: 2 }),
+    connectorPayload({ requestId: "request-1" }),
+    connectorPayload({ action: "connector.approve" }),
+    connectorPayload({
+      request: { ...connectorPayload().request, channelId: "channel" },
+    }),
+    connectorPayload({
+      request: { ...connectorPayload().request, targetName: "x".repeat(121) },
+    }),
+    connectorPayload({
+      request: {
+        ...connectorPayload().request,
+        targetName: "https://evil.test",
+      },
+    }),
+    connectorPayload({
+      request: { ...connectorPayload().request, targetName: "a".repeat(64) },
+    }),
+    connectorPayload({
+      request: { ...connectorPayload().request, gmailLabels: [] },
+    }),
+    connectorPayload({
+      request: {
+        ...connectorPayload().request,
+        gmailLabels: ["x".repeat(121)],
+      },
+    }),
+    connectorPayload({
+      request: {
+        ...connectorPayload().request,
+        gmailLabels: ["a", "b", "c", "d", "e"],
+      },
+    }),
+  ])
+    assert.equal(parseConnectorDraftRequest(payload), null);
 });
 
 test("rejects an agent-management request with extra secret-shaped fields", () => {

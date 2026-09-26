@@ -335,6 +335,24 @@ pub enum AgentsCmd {
         #[arg(long, value_enum)]
         respond_to: Option<RespondToArg>,
     },
+    /// Propose fixed Gmail read/search access for an existing agent; owner review is required
+    DraftConnector {
+        /// Current conversation channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Grant or revoke the fixed Gmail read/search permission pair
+        #[arg(long, value_enum)]
+        action: agent_management::ConnectorDraftAction,
+        /// Existing target agent's display name (selection hint only)
+        #[arg(long)]
+        target_name: String,
+        /// Optional Gmail label hint; repeat up to four times
+        #[arg(long)]
+        gmail_label: Vec<String>,
+        /// Observer draft UUIDv4 to reuse for an exact trusted retry; generated if omitted
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Submit a NIP-IA archive request for an identity (kind 9035)
     #[command(
         after_help = "Auth flow: when target != signer, the CLI fetches the target's kind:0 and \
@@ -2246,6 +2264,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connector_draft_cli_accepts_only_closed_arguments() {
+        let base = [
+            "buzz",
+            "agents",
+            "draft-connector",
+            "--channel",
+            "7c07e659-3610-42f4-9a5e-1e9973c09da9",
+            "--action",
+            "grant",
+            "--target-name",
+            "Research helper",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for extra in [
+            "--operations",
+            "--binding-id",
+            "--owner",
+            "--url",
+            "--credentials",
+            "--approval",
+            "--envelope",
+        ] {
+            let mut args = base.to_vec();
+            args.extend([extra, "arbitrary"]);
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "unexpectedly accepted {extra}"
+            );
+        }
+        let mut wrong_action = base.to_vec();
+        wrong_action[6] = "approve";
+        assert!(Cli::try_parse_from(wrong_action).is_err());
+        let mut retry = base.to_vec();
+        retry.extend(["--request-id", "550e8400-e29b-41d4-a716-446655440000"]);
+        assert!(Cli::try_parse_from(retry).is_ok());
+    }
+
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
     fn cli_definition_is_valid() {
@@ -2389,6 +2445,7 @@ mod tests {
             vec![
                 "archive",
                 "archived",
+                "draft-connector",
                 "draft-create",
                 "draft-update",
                 "unarchive"
@@ -2531,7 +2588,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
