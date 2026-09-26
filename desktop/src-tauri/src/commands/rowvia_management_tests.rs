@@ -11,6 +11,130 @@ use nostr::{EventBuilder, JsonUtil, Kind};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
+// Opt-in cross-repository gate. The Rowvia runner owns the disposable database
+// and real HTTP handler; ordinary Buzz unit tests never connect to it.
+#[tokio::test]
+async fn native_rowvia_management_wire() {
+    let Ok(origin) = std::env::var("ROWVIA_NATIVE_WIRE_ORIGIN") else {
+        return;
+    };
+    let keys = Keys::new(nostr::SecretKey::from_hex(&format!("{:064x}", 1)).unwrap());
+    let other = Keys::generate();
+    let client = ManagementClient::new(&origin, true, Duration::from_secs(10)).unwrap();
+    let candidates = client.candidates(&keys).await.unwrap();
+    assert!(!candidates.truncated);
+    assert_eq!(candidates.candidates.len(), 1);
+    let candidate = &candidates.candidates[0];
+    assert_eq!(candidate.agent_name, "native-wire-agent");
+    assert_eq!(candidate.binding_status, "active");
+    assert_eq!(
+        client.candidates(&other).await.err().as_deref(),
+        Some("Rowvia management HTTP 403")
+    );
+
+    let candidates_url = client.endpoint(&["candidates"]).unwrap();
+    let replay_header =
+        build_nip98_auth_header_for_keys(&keys, &Method::GET, candidates_url.as_str(), &[])
+            .unwrap();
+    for want in [200, 403] {
+        let status = client
+            .http
+            .get(candidates_url.clone())
+            .header(reqwest::header::AUTHORIZATION, &replay_header)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, want, "NIP-98 replay status");
+    }
+
+    let proposal = |action| ManagementProposalRequest {
+        request_id: uuid::Uuid::now_v7().to_string(),
+        action,
+        target_agent_pubkey: candidate.target_pubkey.clone(),
+        binding_id: candidate.binding_id.clone(),
+        operations: OPERATIONS.map(str::to_string).to_vec(),
+    };
+    let grant = client
+        .create_proposal(&keys, &proposal(ManagementAction::ConnectorGrant))
+        .await
+        .unwrap();
+    let status = client.operation(&keys, &grant.operation_id).await.unwrap();
+    assert_eq!(status["state"], "proposed");
+    assert_eq!(status["policy_applied"], false);
+
+    let approval = |receipt: &ManagementProposalResponse| ManagementApprovalRequest {
+        proposal_id: receipt.proposal_id.clone(),
+        operation_id: receipt.operation_id.clone(),
+        proposal_digest: receipt.proposal_digest.clone(),
+        proposal_bytes_b64: receipt.proposal_bytes_b64.clone(),
+        expires_at: verify_canonical_proposal(
+            &receipt.proposal_bytes_b64,
+            &receipt.proposal_digest,
+            &receipt.proposal_id,
+            &receipt.operation_id,
+        )
+        .unwrap(),
+    };
+    let granted = client.approve(&keys, &approval(&grant)).await.unwrap();
+    assert_eq!(granted["state"], "succeeded");
+    assert_eq!(granted["policy_applied"], true);
+    assert_eq!(
+        client.operation(&keys, &grant.operation_id).await.unwrap()["state"],
+        "succeeded"
+    );
+    let policy_url = format!("{origin}/_native_wire/policy");
+    let granted_policy = client
+        .http
+        .get(&policy_url)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(granted_policy["active"], true);
+
+    let stale = client
+        .create_proposal(&keys, &proposal(ManagementAction::ConnectorGrant))
+        .await
+        .unwrap();
+    let revoke = client
+        .create_proposal(&keys, &proposal(ManagementAction::ConnectorRevoke))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.operation(&keys, &revoke.operation_id).await.unwrap()["state"],
+        "proposed"
+    );
+    assert_eq!(
+        client.approve(&keys, &approval(&revoke)).await.unwrap()["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        client.operation(&keys, &revoke.operation_id).await.unwrap()["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        client.approve(&keys, &approval(&stale)).await.unwrap_err(),
+        "Rowvia management HTTP 409"
+    );
+
+    // The fixture's read-only assertion queries the same database as the
+    // handler, so a succeeded revoke cannot mask an active policy.
+    let policy = client
+        .http
+        .get(&policy_url)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(policy["active"], false);
+}
+
 #[test]
 fn forged_roster_signed_by_other_key_is_rejected() {
     let relay = Keys::generate();
