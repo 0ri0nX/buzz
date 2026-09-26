@@ -1,0 +1,8 @@
+{
+  "contract_version": "buzz.rowvia-native-management/v1",
+  "patch_commit": "c3672558820f8fbaf33e8cd7497b34e415ae68e6",
+  "patch_filename": "0001-Add-owner-signed-Rowvia-management-flow.patch",
+  "patch_sha256": "4bbca02ad670e5700283f81107b9290e980d657aa33ddd7b0a519392b678a58a",
+  "result_tree": "7fbb6708fcf5dc54c53d6b9c3c959ef43766ac8e",
+  "upstream_base": "0dd1323d70ca6eaa0c93502753668381ebcd9985"
+}
