@@ -84,7 +84,10 @@ cleanup() {
     wait "$container_pid" 2>/dev/null || true
   fi
   if [[ -n $staged_output ]] && ! rm -rf -- "$staged_output"; then result=1; fi
-  if ! rm -rf -- "$scratch"; then
+  # Hermit installs read-only package directories; restore owner traversal before
+  # deleting this exact disposable build tree. `find` does not follow symlinks.
+  if ! find "$scratch" -type d -exec chmod u+rwx -- {} + ||
+     ! find "$scratch" -depth -delete; then
     echo "error: could not remove isolated build scratch: $scratch" >&2
     result=1
   fi
