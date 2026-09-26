@@ -14,9 +14,10 @@ identity_file=$default_identity_file
 revision=$(git -C "$repo" rev-parse HEAD)
 output=
 dry_run=0
+build_mode=compile-check
 
 usage() {
-  echo "Usage: $0 --output ABSENT_DIRECTORY [--revision FULL_COMMIT] [--identity-file FILE] [--dry-run]"
+  echo "Usage: $0 --output ABSENT_DIRECTORY [--live] [--revision FULL_COMMIT] [--identity-file FILE] [--dry-run]"
 }
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -31,6 +32,10 @@ while (($#)); do
       esac
       shift 2 ;;
     --dry-run) dry_run=1; shift ;;
+    --live)
+      [[ $build_mode = compile-check ]] || die "--live was specified more than once"
+      build_mode=live
+      shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -85,9 +90,21 @@ version=$(git -C "$repo" show "$revision:desktop/src-tauri/Cargo.toml" | sed -n 
 tauri_version=$(git -C "$repo" show "$revision:desktop/src-tauri/tauri.conf.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 package_version=$(git -C "$repo" show "$revision:desktop/package.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 [[ $version = "$tauri_version" && $version = "$package_version" ]] || die "desktop version manifests disagree"
+if [[ $build_mode = live ]]; then
+  app_identifier=$(git -C "$repo" show "$revision:desktop/src-tauri/tauri.conf.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["identifier"])')
+  product_name=$(git -C "$repo" show "$revision:desktop/src-tauri/tauri.conf.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["productName"])')
+  [[ $app_identifier = xyz.block.buzz.app && $product_name = Buzz ]] || die "live build requires the canonical Buzz identifier and product name"
+else
+  app_identifier=ai.rowvia.buzz.compile-check
+  product_name='Rowvia Buzz Compile Check'
+fi
 
 echo "Source: $revision (desktop $version)"
 echo "Image: $image_id"
+echo "Mode: $build_mode ($app_identifier; $product_name)"
+if [[ $build_mode = compile-check ]]; then
+  echo "Compile-check only: artifact is non-executable and has no runtime state isolation"
+fi
 echo "Output: $output"
 echo "Identity fields: owner and Cerberus public keys validated"
 echo "Limits: 4 GiB RAM, 5 GiB RAM+swap, 2 CPUs, 1 build job, 512 PIDs, 25 GiB scratch"
@@ -102,6 +119,14 @@ staged_output=
 monitor_pid=
 container_pid=
 watchdog_failure=$scratch/watchdog.failed
+measure_scratch_kib() {
+  local usage_line usage_kib
+  usage_line=$(du -sk "$scratch") || return 1
+  [[ $usage_line = *$'\t'* ]] || return 1
+  usage_kib=${usage_line%%$'\t'*}
+  [[ $usage_kib =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$usage_kib"
+}
 cleanup() {
   result=$?
   trap - EXIT
@@ -127,7 +152,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir -- "$scratch/source"
 git -C "$repo" archive --format=tar "$revision" | tar -xf - -C "$scratch/source"
-[[ $(du -sk "$scratch" | cut -f1) -le $max_kib ]] || die "source archive exceeds scratch limit"
+initial_kib=$(measure_scratch_kib) || die "cannot measure source archive size"
+((initial_kib <= max_kib)) || die "source archive exceeds scratch limit"
 mkdir -- "$scratch/source/.home"
 
 # The only accepted build inputs are the fixed values and two public identities.
@@ -148,6 +174,7 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
   --env BUZZ_BUILD_ROWVIA_SOURCE_INSTANCE \
   --env BUZZ_BUILD_ROWVIA_OWNER_PUBKEY \
   --env BUZZ_BUILD_CERBERUS_PUBKEY \
+  --env ROWVIA_BUILD_MODE="$build_mode" \
   --env CARGO_BUILD_JOBS=1 --env CARGO_INCREMENTAL=0 \
   --env HOME=/work/source/.home \
   --env CARGO_HOME=/work/source/.cargo-home \
@@ -165,14 +192,21 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
     for name in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
       : > "desktop/src-tauri/binaries/$name-$target"
     done
-    pnpm -C desktop tauri build --no-bundle --config "{\"identifier\":\"ai.rowvia.buzz.native-management-test\",\"productName\":\"Rowvia Buzz Test\"}"
+    if [[ $ROWVIA_BUILD_MODE = live ]]; then
+      pnpm -C desktop tauri build --no-bundle
+    elif [[ $ROWVIA_BUILD_MODE = compile-check ]]; then
+      pnpm -C desktop tauri build --no-bundle --config "{\"identifier\":\"ai.rowvia.buzz.compile-check\",\"productName\":\"Rowvia Buzz Compile Check\"}"
+    else
+      echo "invalid Rowvia build mode" >&2
+      exit 1
+    fi
     test -s desktop/src-tauri/target/release/buzz-desktop
   ' &
 container_pid=$!
 
 (
   while sleep 30; do
-    if ! used_kib=$(du -sk "$scratch" | cut -f1); then
+    if ! used_kib=$(measure_scratch_kib); then
       reason="cannot measure scratch usage"
     elif ((used_kib > max_kib)); then
       reason="scratch exceeded 25 GiB"
@@ -199,7 +233,7 @@ else
 fi
 monitor_pid=
 [[ ! -e $watchdog_failure ]] || die "build watchdog stopped the container"
-final_kib=$(du -sk "$scratch" | cut -f1) || die "cannot measure final scratch usage"
+final_kib=$(measure_scratch_kib) || die "cannot measure final scratch usage"
 ((final_kib <= max_kib)) || die "final scratch exceeds 25 GiB"
 
 binary=$scratch/source/desktop/src-tauri/target/release/buzz-desktop
@@ -209,6 +243,7 @@ for embedded in "$management_origin" "$source_instance" "$BUZZ_BUILD_ROWVIA_OWNE
   strings -a "$binary" | grep -F -- "$embedded" >/dev/null || die "required build configuration is missing from binary"
 done
 strings -a "$binary" | grep -F -- "$version" >/dev/null || die "desktop version is missing from binary"
+strings -a "$binary" | grep -F -- "$app_identifier" >/dev/null || die "Tauri identifier is missing from binary"
 unset BUZZ_BUILD_ROWVIA_OWNER_PUBKEY BUZZ_BUILD_CERBERUS_PUBKEY
 ldd_report=$(ldd -r "$binary" 2>&1) || { echo "$ldd_report" >&2; die "host loader cannot resolve desktop binary"; }
 if [[ $ldd_report = *'not found'* || $ldd_report = *'undefined symbol'* ]]; then
@@ -217,13 +252,20 @@ if [[ $ldd_report = *'not found'* || $ldd_report = *'undefined symbol'* ]]; then
 fi
 
 staged_output=$(mktemp -d "$output_parent/.rowvia-buzz-output.XXXXXXXX")
-install -m 755 "$binary" "$staged_output/buzz-desktop"
-binary_sha=$(sha256sum "$staged_output/buzz-desktop" | cut -d' ' -f1)
-python3 - "$staged_output/provenance.json" "$revision" "$version" "$image_id" "$binary_sha" <<'PY'
+if [[ $build_mode = live ]]; then
+  artifact_name=buzz-desktop
+  artifact_mode=755
+else
+  artifact_name=buzz-desktop.compile-check
+  artifact_mode=644
+fi
+install -m "$artifact_mode" "$binary" "$staged_output/$artifact_name"
+binary_sha=$(sha256sum "$staged_output/$artifact_name" | cut -d' ' -f1)
+python3 - "$staged_output/provenance.json" "$revision" "$version" "$image_id" "$binary_sha" "$build_mode" "$app_identifier" "$product_name" "$artifact_name" <<'PY'
 import json
 import sys
 
-path, revision, version, image_id, binary_sha = sys.argv[1:]
+path, revision, version, image_id, binary_sha, build_mode, identifier, product_name, artifact_name = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as output_file:
     json.dump(
         {
@@ -231,6 +273,11 @@ with open(path, "w", encoding="utf-8") as output_file:
             "desktop_version": version,
             "image_id": image_id,
             "binary_sha256": binary_sha,
+            "build_mode": build_mode,
+            "deployable": build_mode == "live",
+            "artifact_filename": artifact_name,
+            "tauri_identifier": identifier,
+            "product_name": product_name,
             "source_instance": "orionx-hive-buzz-desktop",
             "management_origin": "https://buzz.rowvia.ai:8443",
             "host_ldd_r": "pass",
@@ -245,6 +292,6 @@ PY
 [[ ! -e $output && ! -L $output ]] || die "output path appeared during build"
 mv -- "$staged_output" "$output"
 staged_output=
-echo "Verified binary: $output/buzz-desktop"
+echo "Verified artifact: $output/$artifact_name"
 echo "SHA-256: $binary_sha"
 echo "Host ldd -r: pass"

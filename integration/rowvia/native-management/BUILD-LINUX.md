@@ -9,11 +9,32 @@ resolves to the pinned local image ID before any source export.
 
 ```bash
 integration/rowvia/native-management/build-linux-desktop.sh \
-  --dry-run --output /home/orionx/rowvia-buzz-mvp
+  --dry-run --output /home/orionx/rowvia-buzz-compile-check
 
 integration/rowvia/native-management/build-linux-desktop.sh \
-  --output /home/orionx/rowvia-buzz-mvp
+  --output /home/orionx/rowvia-buzz-compile-check
+
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --dry-run --output /home/orionx/rowvia-buzz-live
+
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --output /home/orionx/rowvia-buzz-live
 ```
+
+The default `compile-check` mode verifies compilation and host ABI only. It
+produces a non-executable `buzz-desktop.compile-check` file. Its custom Tauri
+identifier, `ai.rowvia.buzz.compile-check`, does **not** isolate runtime state:
+Buzz still uses the production `buzz-desktop` keyring and `~/.buzz` nest. Never
+launch or install this artifact.
+
+The explicit `--live` mode is the only deployable build. It uses the source Tauri config's canonical
+`xyz.block.buzz.app` identifier and `Buzz` product name; it fails if either
+source value differs. Tauri derives its app data directory from that
+identifier, so the live binary addresses the existing Buzz state when run.
+Both modes still write only to the chosen absent output directory during the
+build. Neither mode launches, installs, or replaces Desktop. `provenance.json`
+records deployability, artifact filename, selected mode, identifier, and
+product name alongside the source, image, binary hash, and host loader check.
 
 The output directory must be absent and outside the Buzz source repository.
 For a later upstream integration, pass a full commit SHA with `--revision` after
@@ -52,8 +73,8 @@ required because the build image has WebKitGTK 2.50.6 while the host has
 2.50.3; version numbers alone cannot establish ABI compatibility. A passing
 `ldd -r` establishes loader and symbol resolution, not a successful GUI launch.
 The build neither launches the Desktop nor changes live Buzz configuration or
-state. Run the resulting binary only with deliberately isolated runtime XDG
-directories and the intended test relay after reviewing its provenance.
+state. Keep the live binary stopped until coordinating a deliberate switch
+from the installed Buzz Desktop; it shares the canonical app data directory.
 
 Run the narrow script checks before a full build:
 
