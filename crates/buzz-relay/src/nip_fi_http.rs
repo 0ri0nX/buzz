@@ -26,8 +26,8 @@
 //! ## Carrier / precedence
 //!
 //! Per NIP-FI.md §Client-attached transport:
-//! - Assertion: `Nostr-Federated-Identity: Bearer <compact-JWS>` (this
-//!   module's responsibility).
+//! - Assertion: `Nostr-Federated-Identity: Bearer <compact-JWS>` (extracted
+//!   and verified by [`crate::nip_fi_core`]).
 //! - Nostr proof: `Authorization: Nostr <base64-event>` (NIP-98, owned by
 //!   the NIP-98 closure passed to `admit_nip_fi_http`).
 //! - `Authorization` is RESERVED for NIP-98; the assertion MUST NOT appear
@@ -54,14 +54,16 @@
 
 use axum::{
     body::Body,
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, Response},
 };
-use buzz_auth::{
-    DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion, CLIENT_ATTACHED_HEADER,
-};
+use buzz_auth::{DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion};
 use chrono::{DateTime, Utc};
 use nostr::PublicKey;
 use std::fmt;
+
+use crate::nip_fi_core::{
+    asserted_key_matches, evaluate_attached_assertion, http_denial, AssertionRejection,
+};
 
 // ── Deny-map seam ─────────────────────────────────────────────────────────────
 
@@ -343,37 +345,29 @@ where
 
     // Steps 4–8 — Enforce mode.
 
-    // Step 4: extract the assertion token.
-    let token = extract_bearer_token(headers).map_err(http_denial)?;
-
-    // Step 5: cryptographic verification (signature, issuer, expiry, claims).
-    let verifier = verifier.ok_or_else(|| {
-        // Verifier not yet constructed (startup race); fail closed.
-        http_denial(DenialClass::AuthorizationUnavailable)
-    })?;
-    let assertion = verifier.verify_assertion(token).map_err(|e| {
-        tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
-        http_denial(e.denial_class())
+    // Steps 4–5: extract and verify the assertion.
+    let assertion = evaluate_attached_assertion(headers, verifier).map_err(|rejection| {
+        if let AssertionRejection::Verifier(e) = rejection {
+            tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
+        }
+        http_denial(rejection.denial_class())
     })?;
 
     // Step 6: key pairing — assertion.asserted_key MUST equal proven NIP-98 key.
     // A claimless assertion (no nostr_pubkey) is also a denial.  [FI-INV-05]
-    match assertion.asserted_key() {
-        Some(k) if k == proven_pubkey => {}
-        _ => {
-            metrics::counter!(
-                "buzz_auth_failures_total",
-                "reason" => "nip_fi_http_key_mismatch"
-            )
-            .increment(1);
-            tracing::debug!(
-                proven = %proven_pubkey.to_hex(),
-                "NIP-FI HTTP key pairing mismatch"
-            );
-            // Key mismatch is a private-state denial: authorization_denied (403).
-            // [FI-TRACE-DENIAL-ORACLE]
-            return Err(http_denial(DenialClass::AuthorizationDenied));
-        }
+    if !asserted_key_matches(&assertion, proven_pubkey) {
+        metrics::counter!(
+            "buzz_auth_failures_total",
+            "reason" => "nip_fi_http_key_mismatch"
+        )
+        .increment(1);
+        tracing::debug!(
+            proven = %proven_pubkey.to_hex(),
+            "NIP-FI HTTP key pairing mismatch"
+        );
+        // Key mismatch is a private-state denial: authorization_denied (403).
+        // [FI-TRACE-DENIAL-ORACLE]
+        return Err(http_denial(DenialClass::AuthorizationDenied));
     }
 
     // Step 7: deny-map check — (iss, pubkey) must not be in an active deny window.
@@ -395,69 +389,6 @@ where
         assertion: Some(assertion),
         extra,
     })
-}
-
-// ── Transport extraction ──────────────────────────────────────────────────────
-
-/// Extract the single `Bearer <token>` from the `Nostr-Federated-Identity`
-/// header.
-///
-/// Rejects all forms the spec prohibits:
-/// - Absent → `MissingEvidence`
-/// - Repeated (multiple header values) → `EvidenceRejected`
-/// - Comma-combined (`,` in a single value) → `EvidenceRejected`
-/// - Empty after `Bearer ` stripping → `EvidenceRejected`
-/// - Non-`Bearer ` prefix → `EvidenceRejected`
-/// - Whitespace in the token (after scheme) → `EvidenceRejected`
-///
-/// [FI-TRACE-TRANSPORT-CLOSED]
-pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, DenialClass> {
-    let mut values = headers.get_all(CLIENT_ATTACHED_HEADER).iter();
-    let first = match values.next() {
-        Some(v) => v,
-        None => return Err(DenialClass::MissingEvidence),
-    };
-    // Repeated header fields deny. [FI-TRACE-TRANSPORT-CLOSED]
-    if values.next().is_some() {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    let raw = first.to_str().map_err(|_| DenialClass::EvidenceRejected)?;
-    // Comma-combined values deny.
-    if raw.contains(',') {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    let token = raw
-        .strip_prefix("Bearer ")
-        .ok_or(DenialClass::EvidenceRejected)?;
-    // Empty or whitespace-containing token denies.
-    if token.is_empty() || token.contains(ascii_whitespace) {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    Ok(token)
-}
-
-fn ascii_whitespace(c: char) -> bool {
-    c.is_ascii_whitespace()
-}
-
-// ── HTTP denial response ──────────────────────────────────────────────────────
-
-/// Build the exact HTTP denial response for the given class.
-///
-/// The response contract is fixed by NIP-FI.md rejection table:
-/// - Status, Content-Type, WWW-Authenticate (for 401), and body bytes are the
-///   closed contract.  No other fields are added that depend on the private
-///   condition. [FI-TRACE-DENIAL-ORACLE]
-pub(crate) fn http_denial(class: DenialClass) -> Response<Body> {
-    let mut builder = Response::builder()
-        .status(StatusCode::from_u16(class.http_status()).expect("valid status"))
-        .header("Content-Type", class.content_type());
-    if let Some(challenge) = class.www_authenticate() {
-        builder = builder.header("WWW-Authenticate", challenge);
-    }
-    builder
-        .body(Body::from(class.http_body()))
-        .expect("valid denial response")
 }
 
 // ── State-convenience wrapper ─────────────────────────────────────────────────
@@ -500,6 +431,10 @@ mod tests {
     // throughout this module — it IS the HTTP response returned from tests.
     #![allow(clippy::result_large_err)]
     use super::*;
+    use crate::nip_fi_core::extract_bearer_token;
+    use crate::nip_fi_core::tests::ScriptedVerifier;
+    use axum::http::StatusCode;
+    use buzz_auth::CLIENT_ATTACHED_HEADER;
 
     /// Test fixture: a deny map with no entries.
     struct AlwaysAdmitStubDenyMap;
@@ -1270,5 +1205,148 @@ mod tests {
             pubkey,
             "proven_pubkey must be the one returned by the closure"
         );
+    }
+
+    // ── Characterization: assertion evaluation and key equality ──────────────
+    //
+    // These pin the HTTP admission half of the shared evaluator contract, so a
+    // refactor that moves evaluation or pairing elsewhere cannot change a
+    // status, a body, or which step runs first.
+
+    fn bearer_headers(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_ATTACHED_HEADER, HeaderValue::from_static(value));
+        headers
+    }
+
+    fn enforce_outcome(
+        headers: &HeaderMap,
+        proven: PublicKey,
+        verifier: Option<&dyn VerifyAssertion>,
+    ) -> Result<NipFiAdmission<()>, Response<Body>> {
+        admit_nip_fi_http(
+            headers,
+            || Ok(Nip98Proof::new(proven, ())),
+            verifier,
+            NipFiMode::Enforce,
+            &AlwaysAdmitStubDenyMap,
+        )
+    }
+
+    fn denial_parts(outcome: Result<NipFiAdmission<()>, Response<Body>>) -> (StatusCode, Vec<u8>) {
+        match outcome {
+            Err(resp) => (resp.status(), body_bytes(resp)),
+            Ok(_) => panic!("expected a denial"),
+        }
+    }
+
+    // Pins: verifier errors map through `VerifierError::denial_class` —
+    // dependency-unavailable → 503, everything else → 403 evidence rejected.
+    // Mutation: mapping every verifier error to EvidenceRejected fails the
+    // 503 row.
+    #[test]
+    fn characterize_http_verifier_error_classes() {
+        use buzz_auth::VerifierError;
+        let headers = bearer_headers("Bearer a.b.c");
+        let rows = [
+            (
+                VerifierError::KeySourceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::StatusWitnessUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::InvalidSignatureOrClaims,
+                StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+            (
+                VerifierError::Expired,
+                StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+        ];
+        for (err, status, body) in rows {
+            let verifier = ScriptedVerifier::new(Err(err));
+            let (got_status, got_body) =
+                denial_parts(enforce_outcome(&headers, any_pubkey(), Some(&verifier)));
+            assert_eq!(got_status, status, "{err:?}");
+            assert_eq!(got_body, body, "{err:?}");
+        }
+    }
+
+    // Pins: transport extraction runs before the verifier-presence check, so a
+    // malformed header with no verifier is 403, not 503.
+    // Mutation: checking `verifier.is_none()` before `extract_bearer_token`
+    // turns this into 503.
+    #[test]
+    fn characterize_http_transport_precedes_verifier_presence() {
+        let (status, body) =
+            denial_parts(enforce_outcome(&bearer_headers("junk"), any_pubkey(), None));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, b"evidence rejected\n");
+    }
+
+    // Pins: a claimless assertion (no `nostr_pubkey`) is a pairing denial —
+    // 403 authorization denied, byte-identical to a key mismatch. [FI-INV-05]
+    // Mutation: treating `None` as a match admits instead.
+    #[test]
+    fn characterize_http_claimless_assertion_is_authorization_denied() {
+        let verifier = ScriptedVerifier::new(Ok(None));
+        let (status, body) = denial_parts(enforce_outcome(
+            &bearer_headers("Bearer a.b.c"),
+            any_pubkey(),
+            Some(&verifier),
+        ));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, b"authorization denied\n");
+    }
+
+    // Pins: a matching assertion is admitted, verified exactly once, and the
+    // admission carries the proven key and the verified assertion.
+    // Mutation: dropping the assertion from the admission, or verifying twice
+    // in the handler path, fails the assertions.
+    #[test]
+    fn characterize_http_matching_assertion_admits_after_one_verify() {
+        let proven = any_pubkey();
+        let verifier = ScriptedVerifier::new(Ok(Some(proven)));
+        let admission =
+            match enforce_outcome(&bearer_headers("Bearer a.b.c"), proven, Some(&verifier)) {
+                Ok(a) => a,
+                Err(resp) => panic!("matching assertion must admit, got {}", resp.status()),
+            };
+        assert_eq!(verifier.calls(), 1);
+        assert_eq!(*admission.proven_pubkey(), proven);
+        assert_eq!(
+            admission.assertion().and_then(|a| a.asserted_key()),
+            Some(proven)
+        );
+    }
+
+    // Pins: NIP-98 proof runs before assertion extraction. A failed NIP-98
+    // proof with a missing assertion header is 401 from the NIP-98 step and
+    // the verifier never runs. This is the reverse of NIP-FI.md §Admission
+    // procedure. On guarded routes clients still see the spec order, because
+    // the router's assertion guard verifies the assertion before the handler.
+    // Mutation: moving assertion evaluation ahead of the NIP-98 closure makes
+    // the verifier run (call count 1) for a valid-looking header.
+    #[test]
+    fn characterize_http_nip98_precedes_assertion_evaluation() {
+        let verifier = ScriptedVerifier::new(Ok(Some(any_pubkey())));
+        let outcome = admit_nip_fi_http::<_, (), _>(
+            &bearer_headers("Bearer a.b.c"),
+            || Err(http_denial(DenialClass::MissingEvidence)),
+            Some(&verifier as &dyn VerifyAssertion),
+            NipFiMode::Enforce,
+            &AlwaysAdmitStubDenyMap,
+        );
+        let (status, body) = denial_parts(outcome);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, b"authentication required\n");
+        assert_eq!(verifier.calls(), 0, "verifier must not run before NIP-98");
     }
 }

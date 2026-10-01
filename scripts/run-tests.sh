@@ -219,6 +219,9 @@ run_unit_tests() {
   run_test_step "buzz-relay router tests" \
     cargo test -p buzz-relay --lib router::tests:: -- --nocapture
 
+  run_test_step "buzz-relay NIP-FI shared core tests" \
+    cargo test -p buzz-relay --lib nip_fi_core::tests:: -- --nocapture
+
   run_test_step "buzz-relay NIP-FI HTTP ingress tests" \
     cargo test -p buzz-relay --lib nip_fi_http::tests:: -- --nocapture
 
