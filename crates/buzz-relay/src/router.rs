@@ -233,14 +233,24 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
+    // Enforce mode, step 1: the Host must map to a configured community.
+    let community = match crate::nip_fi_core::resolve_community(
+        request.headers(),
+        &state.config.nip_fi.communities,
+    ) {
+        Ok(community) => community,
+        Err(class) => return http_denial(class),
+    };
+
     // Enforce mode: full offline assertion verification (transport, then
-    // signature, issuer, expiry and claims).  A forgotten-gate handler that
+    // signature, issuer, community, expiry and claims).  A forgotten-gate handler that
     // omits `admit_nip_fi_http_on_state` can only be reached with a
     // cryptographically valid assertion.  Key pairing and deny-map are
     // performed by `admit_nip_fi_http_on_state` in the handler, not here.
     // [FI-TRACE-TRANSPORT-CLOSED] [FI-TRACE-AUTHORITY-UNIFORM]
     match crate::nip_fi_core::evaluate_attached_assertion(
         request.headers(),
+        community,
         state.nip_fi_verifier.as_deref(),
     ) {
         Ok(_) => next.run(request).await,
@@ -586,8 +596,8 @@ async fn nip11_or_ws_handler(
     //
     // HTTP/2 extended-CONNECT (latent — workspace Axum does not enable
     // `http2`; the `/` route uses `get()` and Axum requires CONNECT routing
-    // for h2 WebSockets): not currently reachable. The gate inside `Ok(ws)`
-    // below is structural hardening for when `http2` is enabled. [F3-H2-GATE]
+    // for h2 WebSockets): gated by the same pre-bind predicate. The gate inside
+    // `Ok(ws)` below is a backstop for any shape the predicate misses. [F3-H2-GATE]
     //
     // Together these two fire-points ensure that every shape the extractor
     // accepts is also gated — no hand-rolled predicate can diverge from the
@@ -596,9 +606,8 @@ async fn nip11_or_ws_handler(
     // Zero DB cost invariant: the active HTTP/1.1 fire-point runs before
     // `bind_community`, so denied h1 upgrades pay zero DB cost
     // [FI-TRACE-TRANSPORT-CLOSED], and tests that assert 401/503 are not
-    // pre-empted by a 404 from an unseeded DB. The latent h2 fire-point inside
-    // `Ok(ws)` runs after `bind_community`; it is unreachable until `http2`
-    // is enabled.
+    // pre-empted by a 404 from an unseeded DB. The `Ok(ws)` backstop runs after
+    // `bind_community`; it is unreachable until `http2` is enabled.
     //
     // Keying on the header pair (not on `Accept`) means an HTML Accept header
     // on a real WS upgrade is still gated correctly.
@@ -619,19 +628,25 @@ async fn nip11_or_ws_handler(
                         .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
                 })
                 .unwrap_or(false);
-        if is_h1_ws_upgrade {
+        // HTTP/2 extended-CONNECT (RFC 8441), latent until Axum's `http2` is
+        // enabled. Gated here too so an unmapped Host gets 503 before the
+        // tenant lookup's 404, matching h1 and audio. [F3-H2-GATE]
+        let is_h2_ws_connect = req.version() == axum::http::Version::HTTP_2
+            && req.method() == axum::http::Method::CONNECT;
+        if is_h1_ws_upgrade || is_h2_ws_connect {
             use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
             let mode = state.config.nip_fi.mode;
             let verifier = state.nip_fi_verifier.as_deref();
-            match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            let communities = &state.config.nip_fi.communities;
+            match check_nip_fi_at_upgrade(&headers, communities, verifier, mode) {
                 NipFiUpgradeOutcome::NotRequired => None,
                 NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
                 NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
             }
         } else {
-            // Not an HTTP/1.1 WS upgrade — could be an HTTP/2 extended-CONNECT,
-            // a NIP-11 request, or a plain browser GET. Do not gate here; the
-            // `Ok(ws)` arm below gates any extractor-accepted h2 upgrade. [F3-H2-GATE]
+            // Not a WS upgrade shape — a NIP-11 request or a plain browser GET.
+            // The `Ok(ws)` arm below backstops any extractor-accepted shape this
+            // predicate misses. [F3-H2-GATE]
             None
         }
     };
@@ -671,8 +686,8 @@ async fn nip11_or_ws_handler(
     // unmapped host still gets the document (with host-scoped fields like
     // `icon` simply absent), so the doc cannot leak which hosts are mapped.
     //
-    // The active HTTP/1.1 NIP-FI gate runs above (before bind_community) so
-    // denied h1 upgrades pay zero DB cost; the latent h2 gate runs below.
+    // The NIP-FI upgrade gate runs above (before bind_community) so denied
+    // upgrades pay zero DB cost; the `Ok(ws)` backstop runs below.
     let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
         Ok(ctx) => ctx,
         Err(_) => {
@@ -706,7 +721,8 @@ async fn nip11_or_ws_handler(
                 use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
                 let mode = state.config.nip_fi.mode;
                 let verifier = state.nip_fi_verifier.as_deref();
-                match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+                let communities = &state.config.nip_fi.communities;
+                match check_nip_fi_at_upgrade(&headers, communities, verifier, mode) {
                     NipFiUpgradeOutcome::NotRequired => None,
                     NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
                     NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
@@ -2089,6 +2105,7 @@ mod tests {
             jwks_configs: vec![],
             max_connection_lifetime_secs: 3600,
             command_configs: Vec::new(),
+            communities: crate::nip_fi_core::test_support::any_host("https://relay.example"),
         };
 
         // Unreachable database: port 1 refuses every connection, so each
@@ -2601,6 +2618,7 @@ mod tests {
             fn verify_assertion(
                 &self,
                 _token: &str,
+                _community: &buzz_auth::CommunityBinding,
             ) -> Result<buzz_auth::VerifiedAssertion, buzz_auth::VerifierError> {
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n >= 1 {
@@ -2647,6 +2665,8 @@ mod tests {
             let mut state = (*base).clone();
             let mut config = (*state.config).clone();
             config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+            config.nip_fi.communities =
+                crate::nip_fi_core::test_support::any_host("https://relay.example");
             state.config = Arc::new(config);
             state.nip_fi_verifier = Some(verifier.clone());
 
@@ -3083,6 +3103,8 @@ mod tests {
                 web_dir: Some(admin_dir.to_path_buf()),
             });
             config.nip_fi.mode = mode;
+            config.nip_fi.communities =
+                crate::nip_fi_core::test_support::any_host("https://relay.example");
 
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
             let db = buzz_db::Db::from_pool(pool.clone());
@@ -3476,6 +3498,7 @@ mod tests {
             },
             jwks_configs: vec![jwks_config],
             command_configs: vec![],
+            communities: crate::nip_fi_core::test_support::any_host(DENY_TEST_AUD),
             max_connection_lifetime_secs: 3600,
         };
 
@@ -3745,6 +3768,75 @@ mod tests {
                 1,
                 "guard verifies exactly once and the handler never runs: {err:?}"
             );
+        }
+    }
+
+    // Pins ruling: in enforce, an unmapped Host is 503 at the router guard
+    // (protected HTTP) and at the upgrade (root and audio WS) — with or
+    // without an assertion, and before any verification.
+    // Mutation: dropping `resolve_community` at either site lets the
+    // verifier run (or a 401 through).
+    #[tokio::test]
+    async fn nip_fi_enforce_unmapped_host_is_503_before_verification() {
+        let audio = format!("/huddle/{}/audio", uuid::Uuid::new_v4());
+        for path in [GUARD_PROTECTED_PATH, "/", audio.as_str()] {
+            for token in [None, Some("Bearer a.b.c")] {
+                let (state, verifier) = guard_state_with(Ok(None)).await;
+                let mut state = (*state).clone();
+                // The gate helpers send Host `relay.example`; map another one.
+                Arc::make_mut(&mut state.config).nip_fi.communities =
+                    crate::nip_fi_config::NipFiCommunities::for_test(
+                        "https://other.example",
+                        &["https://issuer.test"],
+                    );
+                let resp = nip_fi_gate_response(
+                    Arc::new(state),
+                    path,
+                    token.map(|_| "Nostr-Federated-Identity"),
+                    token,
+                )
+                .await;
+                assert_eq!(
+                    status_and_body(resp).await,
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        b"authorization unavailable\n".to_vec()
+                    ),
+                    "{path} token={token:?}"
+                );
+                assert_eq!(verifier.calls(), 0, "{path} token={token:?}");
+            }
+        }
+    }
+
+    // Pins: Off mode never consults the community map. With the production
+    // Off default (no communities) every NIP-FI site answers exactly as
+    // before: the upgrades reach the tenant lookup's exact 404, header or not.
+    // Mutation: resolving the Host before the Off early-return turns these
+    // into 503.
+    #[tokio::test]
+    async fn nip_fi_off_unmapped_host_is_byte_identical_404() {
+        let audio = format!("/huddle/{}/audio", uuid::Uuid::new_v4());
+        for path in ["/", audio.as_str()] {
+            for token in [None, Some("Bearer a.b.c")] {
+                let mut state = (*nip_fi_off_state().await).clone();
+                Arc::make_mut(&mut state.config).nip_fi.communities = Default::default();
+                let resp = nip_fi_gate_response(
+                    Arc::new(state),
+                    path,
+                    token.map(|_| "Nostr-Federated-Identity"),
+                    token,
+                )
+                .await;
+                assert_eq!(
+                    status_and_body(resp).await,
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        b"relay: no community is configured for this host".to_vec()
+                    ),
+                    "{path} token={token:?}"
+                );
+            }
         }
     }
 
