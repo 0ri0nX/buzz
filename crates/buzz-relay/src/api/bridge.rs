@@ -7856,6 +7856,7 @@ mod postgres_tests {
                 nip_fi_assertion: None,
                 session_deadline: None,
                 nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+                community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
             });
             (conn, send_rx)
         }
