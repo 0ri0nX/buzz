@@ -15,7 +15,7 @@ use axum::{
 use base64::Engine;
 use serde_json::Value;
 
-use buzz_auth::{LimitType, Nip98ReplayGuard, NipFiMode, DEFAULT_REPLAY_TTL_SECS};
+use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
@@ -67,6 +67,17 @@ pub(crate) struct VerifiedBridgeAuth {
     pub(crate) pubkey: nostr::PublicKey,
     pub(crate) event_id_bytes: [u8; 32],
     pub(crate) signed_created_at: Option<u64>,
+}
+
+impl VerifiedBridgeAuth {
+    /// The admission proof; the dev-mode `X-Pubkey` zero event ID is unsigned.
+    pub(crate) fn proof<X>(&self, extra: X) -> Nip98Proof<X> {
+        if self.event_id_bytes == [0; 32] {
+            Nip98Proof::unsigned(self.pubkey, extra)
+        } else {
+            Nip98Proof::new(self.pubkey, extra)
+        }
+    }
 }
 
 type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
@@ -213,7 +224,7 @@ pub(crate) fn make_nip98_closure_for_admission(
             require_auth_token,
             require_payload,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     }
 }
@@ -901,6 +912,7 @@ pub async fn submit_event(
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
         .map_err(|_| {
+            crate::nip_fi_shadow::observe_unbound(&state, &headers);
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -912,15 +924,18 @@ pub async fn submit_event(
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /events carries an authorization-relevant body (the event determines
     // resource, effect, and state change), so a payload tag is required in
     // NIP-FI enforce mode. [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission: NIP-98 extraction runs inside the closure, followed by
     // assertion verify → pair → deny-map in fixed order. The proven pubkey is
     // only available through the returned NipFiAdmission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -930,7 +945,7 @@ pub async fn submit_event(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1228,6 +1243,7 @@ pub async fn query_events(
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
         .map_err(|_| {
+            crate::nip_fi_shadow::observe_unbound(&state, &headers);
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -1238,13 +1254,16 @@ pub async fn query_events(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /query carries an authorization-relevant body (filter selects the
     // resources returned), so a payload tag is required in enforce mode.
     // [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -1254,7 +1273,7 @@ pub async fn query_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1859,6 +1878,7 @@ pub async fn count_events(
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
         .map_err(|_| {
+            crate::nip_fi_shadow::observe_unbound(&state, &headers);
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -1869,13 +1889,16 @@ pub async fn count_events(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /count carries an authorization-relevant body (filter selects what
     // is counted), so a payload tag is required in enforce mode.
     // [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -1885,7 +1908,7 @@ pub async fn count_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -2674,6 +2697,7 @@ async fn authorize_moderation_read(
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
         .map_err(|_| {
+            crate::nip_fi_shadow::observe_unbound(state, headers);
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -2689,9 +2713,12 @@ async fn authorize_moderation_read(
     // In NIP-FI enforce/deny-protected mode a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(state, headers, "bridge", || {
+        verify_bridge_auth(headers, "GET", &url, None, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(state, headers, || {
         verify_bridge_auth(
             headers,
@@ -2700,7 +2727,7 @@ async fn authorize_moderation_read(
             None,
             state.config.require_auth_token || nip_fi_active,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, auth.event_id_bytes))
+        .map(|auth| auth.proof(auth.event_id_bytes))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
