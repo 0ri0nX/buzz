@@ -168,11 +168,17 @@ monitor_pid=
 container_pid=
 watchdog_failure=$scratch/watchdog.failed
 measure_scratch_kib() {
-  local usage_line usage_kib total_kib=0 path
+  local usage_line usage_kib total_kib=0 path attempt measured
   local paths=("$scratch")
   if [[ -n $cache_dir ]]; then paths+=("$cache_dir"); fi
   for path in "${paths[@]}"; do
-    usage_line=$(du -sk "$path") || return 1
+    measured=0
+    # Package managers unlink temporary files while du is traversing the tree.
+    for attempt in 1 2 3; do
+      if usage_line=$(du -sk "$path"); then measured=1; break; fi
+      if ((attempt < 3)); then sleep 1; fi
+    done
+    ((measured)) || return 1
     [[ $usage_line = *$'\t'* ]] || return 1
     usage_kib=${usage_line%%$'\t'*}
     [[ $usage_kib =~ ^[0-9]+$ ]] || return 1
@@ -194,6 +200,15 @@ cleanup() {
     wait "$container_pid" 2>/dev/null || true
   fi
   if [[ -n $staged_output ]] && ! rm -rf -- "$staged_output"; then result=1; fi
+  # Docker may create this nested bind mountpoint as root. Only rmdir the
+  # exact empty source mountpoint after stopping Docker; never the cache.
+  mountpoint=$scratch/source/desktop/src-tauri/target
+  if [[ -n $cache_dir && -d $mountpoint && ! -L $mountpoint && $(stat -c %u "$mountpoint") = 0 ]]; then
+    if ! rmdir -- "$mountpoint"; then
+      echo "error: could not remove empty Docker mountpoint: $mountpoint" >&2
+      result=1
+    fi
+  fi
   # Hermit installs read-only package directories; restore owner traversal before
   # deleting this exact disposable build tree. `find` does not follow symlinks.
   if ! find "$scratch" -type d -exec chmod u+rwx -- {} + ||

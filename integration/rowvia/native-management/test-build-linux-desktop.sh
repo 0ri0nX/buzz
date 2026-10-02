@@ -87,9 +87,14 @@ case $1 in
     scratch_dir=${source_dir%/source}
     printf '%s\n' "$scratch_dir" > "$ROWVIA_TEST_SCRATCH_PATH"
     if [[ -n ${cache_target-} ]]; then
-      ln -s "$cache_target" "$source_dir/desktop/src-tauri/target"
+      if [[ $ROWVIA_TEST_MODE = mount_cleanup ]]; then
+        mkdir -- "$source_dir/desktop/src-tauri/target"
+        exit 42
+      else
+        ln -s "$cache_target" "$source_dir/desktop/src-tauri/target"
+      fi
     fi
-    if [[ $ROWVIA_TEST_MODE = success || $ROWVIA_TEST_MODE = bad_identifier ]]; then
+    if [[ $ROWVIA_TEST_MODE = success || $ROWVIA_TEST_MODE = bad_identifier || $ROWVIA_TEST_MODE = transient_du ]]; then
       binary=$source_dir/desktop/src-tauri/target/release/buzz-desktop
       mkdir -p -- "$(dirname -- "$binary")"
       cp /usr/bin/true "$binary"
@@ -148,6 +153,16 @@ exec /usr/bin/sleep 0.1
 SH
 cat >"$scratch/mockbin/du" <<'SH'
 #!/usr/bin/env bash
+if [[ ${ROWVIA_TEST_MODE-} = transient_du || ${ROWVIA_TEST_MODE-} = permanent_du ]]; then
+  count=0
+  if [[ -f $ROWVIA_TEST_DU_COUNT ]]; then count=$(<"$ROWVIA_TEST_DU_COUNT"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$ROWVIA_TEST_DU_COUNT"
+  if [[ $count = 1 || $ROWVIA_TEST_MODE = permanent_du ]]; then
+    echo 'du: cannot access pnpm-lock.yaml.temporary: No such file or directory' >&2
+    exit 1
+  fi
+fi
 if [[ ${ROWVIA_TEST_MODE-} = cache_overcap && -e ${ROWVIA_TEST_DU_TRIGGER-} ]]; then
   # Both paths are individually below the cap; their sum must stop the build.
   printf '13631488\t%s\n' "${*: -1}"
@@ -157,10 +172,31 @@ else
   exec /usr/bin/du "$@"
 fi
 SH
-chmod +x "$scratch/mockbin/docker" "$scratch/mockbin/sleep" "$scratch/mockbin/du"
+cat >"$scratch/mockbin/stat" <<'SH'
+#!/usr/bin/env bash
+if [[ ${ROWVIA_TEST_MODE-} = mount_cleanup && ${1-} = -c && ${2-} = %u && ${3-} = */source/desktop/src-tauri/target ]]; then
+  echo 0
+else
+  exec /usr/bin/stat "$@"
+fi
+SH
+cat >"$scratch/mockbin/chmod" <<'SH'
+#!/usr/bin/env bash
+if [[ ${ROWVIA_TEST_MODE-} = mount_cleanup ]]; then
+  for path in "$@"; do
+    if [[ $path = */source/desktop/src-tauri/target && -d $path ]]; then
+      echo 'simulated root-owned mountpoint cannot be chmodded' >&2
+      exit 1
+    fi
+  done
+fi
+exec /usr/bin/chmod "$@"
+SH
+chmod +x "$scratch/mockbin/docker" "$scratch/mockbin/sleep" "$scratch/mockbin/du" "$scratch/mockbin/stat" "$scratch/mockbin/chmod"
 export ROWVIA_TEST_SCRATCH_PATH=$scratch/build-scratch-path
 export ROWVIA_TEST_STOP=$scratch/stop
 export ROWVIA_TEST_DU_TRIGGER=$scratch/overcap-trigger
+export ROWVIA_TEST_DU_COUNT=$scratch/du-attempts
 export ROWVIA_TEST_VERSION=0.5.23
 export PATH=$scratch/mockbin:$PATH
 
@@ -266,7 +302,7 @@ if bash "$build" --cache-dir "$scratch/cache" --output "$scratch/output" --ident
 fi
 grep -Fq 'build cache is already in use' "$scratch/stderr"
 flock -u "$test_lock_fd"
-for mode in cleanup cache_overcap; do
+for mode in cleanup cache_overcap mount_cleanup; do
   export ROWVIA_TEST_MODE=$mode ROWVIA_TEST_EXPECTED_BUILD_MODE=compile-check
   if bash "$build" --cache-dir "$scratch/cache" --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout" 2>"$scratch/stderr"; then
     echo "mock cached $mode build unexpectedly succeeded" >&2; exit 1
@@ -278,4 +314,17 @@ for mode in cleanup cache_overcap; do
   rm -f -- "$ROWVIA_TEST_SCRATCH_PATH" "$ROWVIA_TEST_STOP" "$ROWVIA_TEST_DU_TRIGGER"
 done
 
-echo "build mode, opt-in hooks, cache retention/locking, provenance, fail-closed inputs, combined disk cap, watchdog, and cleanup checks passed"
+export ROWVIA_TEST_MODE=transient_du ROWVIA_TEST_EXPECTED_BUILD_MODE=compile-check
+bash "$build" --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout" 2>"$scratch/stderr"
+[[ -s $scratch/output/buzz-desktop.compile-check && $(<"$ROWVIA_TEST_DU_COUNT") -ge 3 ]]
+grep -Fq 'pnpm-lock.yaml.temporary: No such file or directory' "$scratch/stderr"
+rm -r -- "$scratch/output"
+rm -f -- "$ROWVIA_TEST_SCRATCH_PATH" "$ROWVIA_TEST_STOP" "$ROWVIA_TEST_DU_COUNT"
+export ROWVIA_TEST_MODE=permanent_du
+if bash "$build" --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout" 2>"$scratch/stderr"; then
+  echo "permanent du failure unexpectedly accepted" >&2; exit 1
+fi
+[[ $(<"$ROWVIA_TEST_DU_COUNT") = 3 && ! -e $scratch/output && ! -e $ROWVIA_TEST_SCRATCH_PATH ]]
+grep -Fq 'cannot measure source archive size' "$scratch/stderr"
+
+echo "build mode, opt-in hooks, cache retention/locking, provenance, fail-closed inputs, combined disk cap, bounded du retries, watchdog, and mountpoint cleanup checks passed"
