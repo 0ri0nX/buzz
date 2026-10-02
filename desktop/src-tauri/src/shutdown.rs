@@ -40,6 +40,8 @@ pub(crate) fn install_signal_handler(
     use std::sync::atomic::Ordering;
 
     if let Err(error) = ctrlc::set_handler(move || {
+        #[cfg(feature = "rowvia-owner-test-hook")]
+        crate::owner_test_hook::stop(&app);
         app.state::<AppState>()
             .shutdown_started
             .store(true, Ordering::SeqCst);

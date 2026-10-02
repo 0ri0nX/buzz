@@ -5,6 +5,8 @@ import {
   signRelayEvent,
 } from "@/shared/api/tauri";
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
+import { getIdentity } from "@/shared/api/tauriIdentity";
+import { normalizeRelayUrl } from "@/features/communities/relayProbe";
 import {
   KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
@@ -214,8 +216,11 @@ export class RelayClient {
     );
   }
 
-  async fetchEvents(filter: RelaySubscriptionFilter): Promise<RelayEvent[]> {
-    return this.fetchHistory(filter);
+  async fetchEvents(
+    filter: RelaySubscriptionFilter,
+    expectedScope?: { ownerPubkey: string; relayUrl: string },
+  ): Promise<RelayEvent[]> {
+    return this.fetchHistory(filter, expectedScope);
   }
 
   async fetchFirstEvent(
@@ -231,17 +236,42 @@ export class RelayClient {
     );
   }
 
-  private async fetchHistory(filter: RelaySubscriptionFilter) {
+  private async fetchHistory(
+    filter: RelaySubscriptionFilter,
+    expectedScope?: { ownerPubkey: string; relayUrl: string },
+  ) {
+    const ownership = this.sessionEpoch;
     await this.ensureConnected();
-    return this.requestHistory(filter);
+    if (!expectedScope) return this.requestHistory(filter);
+    const generation = this.connectionGeneration;
+    const identity = await getIdentity();
+    const assertScope = () => {
+      if (
+        ownership !== this.sessionEpoch ||
+        generation !== this.connectionGeneration ||
+        normalizeRelayUrl(this.relayUrl ?? "") !== expectedScope.relayUrl ||
+        identity.pubkey !== expectedScope.ownerPubkey ||
+        identity.locked ||
+        identity.lost ||
+        identity.resetFailed
+      ) {
+        throw new Error("History scope changed before requesting events.");
+      }
+    };
+    assertScope();
+    return this.requestHistory(filter, async (payload) => {
+      assertScope();
+      await this.sendRawForGeneration(payload, generation);
+    });
   }
 
   private requestHistory(
     filter: RelaySubscriptionFilter,
+    send?: (payload: unknown[]) => Promise<void>,
   ): Promise<RelayEvent[]> {
     return requestHistoryGated(
       this.subscriptions,
-      (payload) => this.sendRaw(payload),
+      send ?? ((payload) => this.sendRaw(payload)),
       (subId) => this.closeSubscription(subId),
       filter,
       HISTORY_TIMEOUT_MS,
@@ -253,8 +283,34 @@ export class RelayClient {
     content: string,
     mentionPubkeys: string[] = [],
     extraTags: string[][] = [],
+    expectedScope?: { ownerPubkey: string; relayUrl: string },
   ) {
+    const ownership = this.sessionEpoch;
     await this.ensureConnected();
+    const generation = this.connectionGeneration;
+    const assertScope = () => {
+      if (
+        expectedScope &&
+        (ownership !== this.sessionEpoch ||
+          generation !== this.connectionGeneration ||
+          normalizeRelayUrl(this.relayUrl ?? "") !== expectedScope.relayUrl)
+      ) {
+        throw new Error("Message scope changed before publishing.");
+      }
+    };
+    assertScope();
+    if (expectedScope) {
+      const identity = await getIdentity();
+      assertScope();
+      if (
+        identity.pubkey !== expectedScope.ownerPubkey ||
+        identity.locked ||
+        identity.lost ||
+        identity.resetFailed
+      ) {
+        throw new Error("Message signer scope changed before signing.");
+      }
+    }
 
     const tags: string[][] = [["h", channelId]];
     for (const pubkey of mentionPubkeys) {
@@ -269,11 +325,16 @@ export class RelayClient {
       content: content.trim(),
       tags,
     });
+    assertScope();
+    if (expectedScope && event.pubkey !== expectedScope.ownerPubkey) {
+      throw new Error("Message signer scope changed before publishing.");
+    }
 
     return this.publishEvent(
       event,
       "Timed out while sending the message.",
       "Failed to send the message.",
+      expectedScope ? assertScope : undefined,
     );
   }
 
@@ -710,6 +771,7 @@ export class RelayClient {
     event: RelayEvent,
     timeoutMessage: string,
     sendErrorMessage: string,
+    assertScope?: () => void,
   ) {
     return publishSessionEvent(
       {
@@ -727,6 +789,7 @@ export class RelayClient {
       event,
       timeoutMessage,
       sendErrorMessage,
+      assertScope,
     );
   }
 

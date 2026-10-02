@@ -44,6 +44,37 @@ configuration. It verifies that the Cargo, Tauri, and desktop package versions
 agree. The default revision is the current Buzz `HEAD` at invocation time; the
 full SHA is printed and recorded in `provenance.json`.
 
+For an owner-test-hook build, explicitly add `--owner-test-hook`. This passes
+`--features rowvia-owner-test-hook` to Tauri/Cargo and the literal
+`VITE_ROWVIA_OWNER_TEST_HOOK=1` to the build container. The selected committed
+revision must contain both implementations. Inherited host environment flags
+cannot enable the hook. The build still uses the production keyring and the
+canonical live identifier; this option does not import a token or launch the
+hook. `provenance.json` records `owner_test_hook` as a boolean.
+
+An optional `--cache-dir` retains Cargo target artifacts across builds:
+
+```bash
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --owner-test-hook --dry-run \
+  --cache-dir /home/orionx/rowvia-buzz-owner-build-cache \
+  --output /home/orionx/rowvia-buzz-owner-live
+```
+
+Remove `--dry-run` only when ready to build. The cache path must be absolute,
+separate from the source repository and output directory, and either absent
+or a previously created managed cache owned by the caller with mode 700.
+Symlinks, commas, newlines, unmarked directories and unrelated top-level
+contents are rejected. The script creates an absent cache only for an actual
+build and takes a nonblocking exclusive lock. Only `cargo-target` is mounted;
+HOME, Hermit, pnpm, npm and Cargo download caches remain disposable. Source,
+build and retained cache usage share the existing monitored 25 GiB budget.
+An over-budget cache fails the initial measurement; there is no automatic
+eviction. Cleanup retains the cache after success or failure and deletes only
+the exact disposable scratch/output staging directories. Cache reuse is
+explicit and assumes trusted build artifacts, rather than proving a fresh
+build. Omit `--cache-dir` for the original disposable build workflow.
+
 The script reads only `ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY` and
 `ROWVIA_CONTEXT_CERBERUS_PUBKEY` from
 `/home/orionx/.local/state/rowvia-management-pilot-v75/public-identities.env`.
@@ -59,6 +90,7 @@ filesystem and Docker logging disabled. Its writable home and tool caches live
 under the disposable bind mount. It uses one Cargo job, two CPUs, 4 GiB RAM, a
 5 GiB RAM plus swap limit, 512 PIDs, and a 512 MiB `/tmp` tmpfs. A host
 monitor stops it if the disposable source/build tree grows beyond 25 GiB.
+With `--cache-dir`, the monitor sums that tree and the retained cache.
 Hermit, pnpm, Cargo, and
 Node caches are directed into that tree so the monitor includes them. If the
 monitor cannot measure disk usage, it stops the build. The build has a six-hour

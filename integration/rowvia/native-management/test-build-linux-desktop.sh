@@ -23,6 +23,20 @@ grep -Fq 'Mode: live (xyz.block.buzz.app; Buzz)' "$scratch/stdout"
 [[ ! -e $scratch/output ]] || { echo "dry-run created output" >&2; exit 1; }
 expect_failure --live --live
 grep -Fq -- '--live was specified more than once' "$scratch/stderr"
+expect_failure --owner-test-hook --owner-test-hook
+expect_failure --cache-dir relative
+expect_failure --cache-dir "$scratch/cache,invalid"
+expect_failure --cache-dir "$scratch/.."
+expect_failure --cache-dir "$scratch/cache" --cache-dir "$scratch/cache"
+bash "$build" --owner-test-hook --cache-dir "$scratch/cache" --dry-run --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout"
+grep -Fq 'Owner test hook: enabled (--features rowvia-owner-test-hook; VITE_ROWVIA_OWNER_TEST_HOOK=1)' "$scratch/stdout"
+[[ ! -e $scratch/cache ]] || { echo "dry-run created cache" >&2; exit 1; }
+mkdir -m 700 -- "$scratch/unmanaged"
+expect_failure --cache-dir "$scratch/unmanaged"
+ln -s "$scratch/unmanaged" "$scratch/symlink-cache"
+expect_failure --cache-dir "$scratch/symlink-cache"
+expect_failure --cache-dir "$scratch/output"
+expect_failure --cache-dir "$script_dir/build-cache"
 
 printf 'ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY=bad\nROWVIA_CONTEXT_CERBERUS_PUBKEY=%064d\n' 1 >"$scratch/identities.env"
 expect_failure
@@ -30,6 +44,8 @@ expect_failure
 printf 'ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY=%064d\nROWVIA_CONTEXT_CERBERUS_PUBKEY=%064d\n' 1 1 >"$scratch/identities.env"
 expect_failure
 
+# The fixture must contain literal shell syntax to prove it is never executed.
+# shellcheck disable=SC2016
 printf 'ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY=$(id)\nROWVIA_CONTEXT_CERBERUS_PUBKEY=%064d\n' 1 >"$scratch/identities.env"
 expect_failure
 
@@ -52,6 +68,12 @@ case $1 in
     for argument in "$@"; do
       case $argument in
         ROWVIA_BUILD_MODE=*) container_build_mode=${argument#ROWVIA_BUILD_MODE=} ;;
+        ROWVIA_OWNER_TEST_HOOK=1) hook_enabled=1 ;;
+        VITE_ROWVIA_OWNER_TEST_HOOK=1) vite_hook_enabled=1 ;;
+        type=bind,src=*,dst=/work/source/desktop/src-tauri/target)
+          cache_target=${argument#type=bind,src=}
+          cache_target=${cache_target%,dst=/work/source/desktop/src-tauri/target}
+          ;;
         type=bind,src=*,dst=/work/source)
           source_dir=${argument#type=bind,src=}
           source_dir=${source_dir%,dst=/work/source}
@@ -60,8 +82,13 @@ case $1 in
     done
     [[ -n ${source_dir-} ]] || exit 83
     [[ ${container_build_mode-} = "$ROWVIA_TEST_EXPECTED_BUILD_MODE" ]] || exit 85
+    [[ ${hook_enabled:-0} = "${ROWVIA_TEST_EXPECTED_HOOK:-0}" && ${vite_hook_enabled:-0} = "${ROWVIA_TEST_EXPECTED_HOOK:-0}" ]] || exit 86
+    [[ " $* " = *' --cpus=2 --memory=4g --memory-swap=5g '* && " $* " = *' --pids-limit=512 '* && " $* " = *' --env CARGO_BUILD_JOBS=1 '* ]] || exit 87
     scratch_dir=${source_dir%/source}
     printf '%s\n' "$scratch_dir" > "$ROWVIA_TEST_SCRATCH_PATH"
+    if [[ -n ${cache_target-} ]]; then
+      ln -s "$cache_target" "$source_dir/desktop/src-tauri/target"
+    fi
     if [[ $ROWVIA_TEST_MODE = success || $ROWVIA_TEST_MODE = bad_identifier ]]; then
       binary=$source_dir/desktop/src-tauri/target/release/buzz-desktop
       mkdir -p -- "$(dirname -- "$binary")"
@@ -75,6 +102,25 @@ case $1 in
       printf '%s\n' "$BUZZ_BUILD_ROWVIA_MANAGEMENT_ORIGIN" "$BUZZ_BUILD_ROWVIA_SOURCE_INSTANCE" \
         "$BUZZ_BUILD_ROWVIA_OWNER_PUBKEY" "$BUZZ_BUILD_CERBERUS_PUBKEY" \
         "$ROWVIA_TEST_VERSION" "$embedded_identifier" >> "$binary"
+      # Execute the actual Tauri dispatch from the container command with pnpm
+      # mocked; a changed feature/env argument must fail this production seam.
+      pnpm() {
+        [[ $1 = -C && $2 = desktop && $3 = tauri && $4 = build && $5 = --no-bundle ]] || return 88
+        if [[ ${ROWVIA_TEST_EXPECTED_HOOK:-0} = 1 ]]; then
+          [[ ${VITE_ROWVIA_OWNER_TEST_HOOK:-} = 1 && ${*: -2} = '--features rowvia-owner-test-hook' ]] || return 89
+        else
+          [[ ! -v VITE_ROWVIA_OWNER_TEST_HOOK && " $* " != *' --features '* ]] || return 90
+        fi
+      }
+      unset ROWVIA_OWNER_TEST_HOOK VITE_ROWVIA_OWNER_TEST_HOOK
+      if [[ ${hook_enabled:-0} = 1 ]]; then
+        export ROWVIA_OWNER_TEST_HOOK=1 VITE_ROWVIA_OWNER_TEST_HOOK=1
+      fi
+      export ROWVIA_BUILD_MODE=$container_build_mode
+      inner_script=${*: -1}
+      dispatch='feature_args=()'${inner_script#*'    feature_args=()'}
+      cd -- "$source_dir"
+      eval "$dispatch"
       exit 0
     fi
     mkdir -- "$source_dir/nested"
@@ -102,7 +148,10 @@ exec /usr/bin/sleep 0.1
 SH
 cat >"$scratch/mockbin/du" <<'SH'
 #!/usr/bin/env bash
-if [[ ${ROWVIA_TEST_MODE-} = overcap && -e ${ROWVIA_TEST_DU_TRIGGER-} ]]; then
+if [[ ${ROWVIA_TEST_MODE-} = cache_overcap && -e ${ROWVIA_TEST_DU_TRIGGER-} ]]; then
+  # Both paths are individually below the cap; their sum must stop the build.
+  printf '13631488\t%s\n' "${*: -1}"
+elif [[ ${ROWVIA_TEST_MODE-} = overcap && -e ${ROWVIA_TEST_DU_TRIGGER-} ]]; then
   printf '26214401\t%s\n' "${*: -1}"
 else
   exec /usr/bin/du "$@"
@@ -185,4 +234,48 @@ fi
 grep -Fq 'Tauri identifier is missing from binary' "$scratch/stderr"
 [[ ! -e $scratch/output ]]
 
-echo "build script mode, provenance, fail-closed inputs, disk cap, watchdog, and cleanup checks passed"
+export ROWVIA_TEST_EXPECTED_BUILD_MODE=live
+for hook in 0 1; do
+  export ROWVIA_TEST_MODE=success ROWVIA_TEST_EXPECTED_HOOK=$hook
+  hook_flags=()
+  if [[ $hook = 1 ]]; then hook_flags=(--owner-test-hook); fi
+  # Inherited flags must not opt the default build in.
+  ROWVIA_OWNER_TEST_HOOK=1 VITE_ROWVIA_OWNER_TEST_HOOK=1 bash "$build" --live --cache-dir "$scratch/cache" --output "$scratch/output" --identity-file "$scratch/identities.env" "${hook_flags[@]}" >"$scratch/stdout"
+  [[ -s $scratch/cache/cargo-target/release/buzz-desktop && $(stat -c %a "$scratch/cache") = 700 ]]
+  expected_hook=false
+  if [[ $hook = 1 ]]; then expected_hook=true; fi
+  grep -Fq "\"owner_test_hook\": $expected_hook" "$scratch/output/provenance.json"
+  build_scratch=$(<"$ROWVIA_TEST_SCRATCH_PATH")
+  [[ ! -e $build_scratch ]]
+  rm -r -- "$scratch/output"
+  rm -f -- "$ROWVIA_TEST_SCRATCH_PATH" "$ROWVIA_TEST_STOP"
+done
+export ROWVIA_TEST_EXPECTED_HOOK=0
+: > "$scratch/cache/unrelated"
+expect_failure --cache-dir "$scratch/cache"
+grep -Fq 'cache contains unrelated data' "$scratch/stderr"
+rm -- "$scratch/cache/unrelated"
+chmod 755 "$scratch/cache"
+expect_failure --cache-dir "$scratch/cache"
+grep -Fq 'owner-only directory' "$scratch/stderr"
+chmod 700 "$scratch/cache"
+exec {test_lock_fd}>> "$scratch/cache/.lock"
+flock -n "$test_lock_fd"
+if bash "$build" --cache-dir "$scratch/cache" --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout" 2>"$scratch/stderr"; then
+  echo "locked cache unexpectedly accepted" >&2; exit 1
+fi
+grep -Fq 'build cache is already in use' "$scratch/stderr"
+flock -u "$test_lock_fd"
+for mode in cleanup cache_overcap; do
+  export ROWVIA_TEST_MODE=$mode ROWVIA_TEST_EXPECTED_BUILD_MODE=compile-check
+  if bash "$build" --cache-dir "$scratch/cache" --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout" 2>"$scratch/stderr"; then
+    echo "mock cached $mode build unexpectedly succeeded" >&2; exit 1
+  fi
+  [[ -s $scratch/cache/cargo-target/release/buzz-desktop ]]
+  build_scratch=$(<"$ROWVIA_TEST_SCRATCH_PATH")
+  [[ ! -e $build_scratch && ! -e $scratch/output ]]
+  if [[ $mode = cache_overcap ]]; then grep -Fq 'scratch exceeded 25 GiB' "$scratch/stderr"; fi
+  rm -f -- "$ROWVIA_TEST_SCRATCH_PATH" "$ROWVIA_TEST_STOP" "$ROWVIA_TEST_DU_TRIGGER"
+done
+
+echo "build mode, opt-in hooks, cache retention/locking, provenance, fail-closed inputs, combined disk cap, watchdog, and cleanup checks passed"

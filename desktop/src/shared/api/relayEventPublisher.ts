@@ -19,12 +19,14 @@ export async function publishSessionEvent(
   event: RelayEvent,
   timeoutMessage: string,
   sendErrorMessage: string,
+  assertScope?: () => void,
 ): Promise<RelayEvent> {
   const publishOwnership = session.ownership();
   await waitForRateLimit();
   if (publishOwnership !== session.ownership()) {
     throw new Error("Relay disconnected for community switch.");
   }
+  assertScope?.();
   const publishGeneration = session.generation();
 
   return new Promise<RelayEvent>((resolve, reject) => {
@@ -64,6 +66,14 @@ export async function publishSessionEvent(
             throw new Error(
               "Relay publish was superseded by a session change.",
             );
+          }
+          try {
+            assertScope?.();
+          } catch (scopeError) {
+            window.clearTimeout(timeout);
+            session.pendingEvents.delete(event.id);
+            reject(scopeError);
+            return;
           }
           await session.send(["EVENT", event], retryGeneration);
         } catch (retryError) {

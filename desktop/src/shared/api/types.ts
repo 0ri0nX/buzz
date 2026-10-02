@@ -48,6 +48,8 @@ export type CreateChannelInput = {
   visibility: ChannelVisibility;
   description?: string;
   ttlSeconds?: number;
+  expectedRelayUrl?: string;
+  expectedSignerPubkey?: string;
 };
 
 export type UpdateChannelInput = {

@@ -34,6 +34,8 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+mod owner_test_hook;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -236,6 +238,8 @@ pub fn run() {
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::setup(&app_handle)?;
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;
@@ -874,6 +878,8 @@ pub fn run() {
             archive::sync::stop_archive_sync,
             is_auto_update_supported,
             set_window_vibrancy,
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::rowvia_owner_test_reply,
             #[cfg(target_os = "macos")]
             tray_menu::clear_tray_agent_activity,
             #[cfg(target_os = "macos")]
@@ -933,12 +939,16 @@ pub fn run() {
             }
         }
         RunEvent::ExitRequested { code, .. } => {
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::stop(app_handle);
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);
             }
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::stop(app_handle);
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]

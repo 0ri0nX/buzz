@@ -134,6 +134,10 @@ async function bootstrap() {
   await installE2eBridgeIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
   renderApp();
+  if (import.meta.env.VITE_ROWVIA_OWNER_TEST_HOOK === "1") {
+    const { installOwnerTestHook } = await import("@/testing/ownerTestHook");
+    await installOwnerTestHook();
+  }
 }
 
 void bootstrap();

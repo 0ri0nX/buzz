@@ -16,23 +16,32 @@ revision=$(git -C "$repo" rev-parse HEAD)
 output=
 dry_run=0
 build_mode=compile-check
+owner_test_hook=0
+cache_dir=
+cache_marker=rowvia-desktop-cargo-cache-v1
 
 usage() {
-  echo "Usage: $0 --output ABSENT_DIRECTORY [--live] [--revision FULL_COMMIT] [--identity-file FILE] [--dry-run]"
+  echo "Usage: $0 --output ABSENT_DIRECTORY [--live] [--owner-test-hook] [--cache-dir PRIVATE_DIRECTORY] [--revision FULL_COMMIT] [--identity-file FILE] [--dry-run]"
 }
 die() { echo "error: $*" >&2; exit 1; }
 
 while (($#)); do
   case $1 in
-    --output|--revision|--identity-file)
+    --output|--revision|--identity-file|--cache-dir)
       (($# >= 2)) || die "$1 requires a value"
       case $1 in
         --output) output=$2 ;;
         --revision) revision=$2 ;;
         --identity-file) identity_file=$2 ;;
+        --cache-dir)
+          [[ -z $cache_dir && -n $2 ]] || die "--cache-dir requires a nonempty value and may be specified once"
+          cache_dir=$2 ;;
       esac
       shift 2 ;;
     --dry-run) dry_run=1; shift ;;
+    --owner-test-hook)
+      ((owner_test_hook == 0)) || die "--owner-test-hook was specified more than once"
+      owner_test_hook=1; shift ;;
     --live)
       [[ $build_mode = compile-check ]] || die "--live was specified more than once"
       build_mode=live
@@ -48,6 +57,27 @@ output_parent=$(cd -- "$(dirname -- "$output")" && pwd -P) || die "output parent
 [[ -w $output_parent ]] || die "output parent is not writable"
 output=$output_parent/$(basename -- "$output")
 [[ $output != "$repo"/* ]] || die "output must be outside the source repository"
+if [[ -n $cache_dir ]]; then
+  [[ $cache_dir = /* && $cache_dir != *','* && $cache_dir != *$'\n'* ]] || die "cache path must be absolute and contain no commas or newlines"
+  [[ ! -L $cache_dir ]] || die "cache path must not be a symlink"
+  [[ $(basename -- "$cache_dir") != . && $(basename -- "$cache_dir") != .. ]] || die "cache path must name a dedicated directory"
+  cache_parent=$(cd -- "$(dirname -- "$cache_dir")" && pwd -P) || die "cache parent does not exist"
+  cache_dir=$cache_parent/$(basename -- "$cache_dir")
+  [[ $cache_dir != "$repo" && $cache_dir != "$repo"/* && $repo != "$cache_dir"/* ]] || die "cache must be separate from the source repository"
+  [[ $output != "$cache_dir" && $output != "$cache_dir"/* && $cache_dir != "$output"/* ]] || die "cache and output must be separate"
+  [[ -w $cache_parent ]] || die "cache parent is not writable"
+  if [[ -e $cache_dir ]]; then
+    [[ -d $cache_dir && $(stat -c %u "$cache_dir") = "$(id -u)" && $(stat -c %a "$cache_dir") = 700 ]] || die "cache must be an owner-only directory (mode 700)"
+    [[ -f $cache_dir/.rowvia-build-cache && ! -L $cache_dir/.rowvia-build-cache && $(<"$cache_dir/.rowvia-build-cache") = "$cache_marker" ]] || die "cache lacks the managed build-cache marker"
+    while IFS= read -r -d '' entry; do
+      case ${entry##*/} in
+        .rowvia-build-cache|.lock) [[ -f $entry && ! -L $entry ]] || die "invalid cache metadata" ;;
+        cargo-target) [[ -d $entry && ! -L $entry ]] || die "invalid Cargo cache directory" ;;
+        *) die "cache contains unrelated data" ;;
+      esac
+    done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -print0)
+  fi
+fi
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || die "revision must be a full lowercase commit SHA"
 [[ $(git -C "$repo" rev-parse "${revision}^{commit}") = "$revision" ]] || die "revision is not a commit"
 git -C "$repo" cat-file -e "$revision:desktop/src-tauri/src/commands/rowvia_management.rs" || die "revision lacks Rowvia management"
@@ -103,6 +133,12 @@ fi
 echo "Source: $revision (desktop $version)"
 echo "Image: $image_id"
 echo "Mode: $build_mode ($app_identifier; $product_name)"
+if ((owner_test_hook)); then
+  echo "Owner test hook: enabled (--features rowvia-owner-test-hook; VITE_ROWVIA_OWNER_TEST_HOOK=1)"
+fi
+if [[ -n $cache_dir ]]; then
+  echo "Retained Cargo build cache: $cache_dir (shared 25 GiB scratch budget)"
+fi
 if [[ $build_mode = compile-check ]]; then
   echo "Compile-check only: artifact is non-executable and has no runtime state isolation"
 fi
@@ -114,6 +150,17 @@ if ((dry_run)); then
   exit 0
 fi
 
+if [[ -n $cache_dir ]]; then
+  command -v flock >/dev/null || die "missing command: flock"
+  if [[ ! -e $cache_dir ]]; then
+    mkdir -m 700 -- "$cache_dir" || die "cannot create private build cache"
+    printf '%s\n' "$cache_marker" > "$cache_dir/.rowvia-build-cache"
+  fi
+  exec {cache_lock_fd}>> "$cache_dir/.lock"
+  flock -n "$cache_lock_fd" || die "build cache is already in use"
+  mkdir -p -- "$cache_dir/cargo-target"
+fi
+
 scratch=$(mktemp -d /home/orionx/rowvia-buzz-build.XXXXXXXX)
 container=rowvia-buzz-build-$(basename -- "$scratch" | tr -cd 'a-zA-Z0-9')
 staged_output=
@@ -121,12 +168,17 @@ monitor_pid=
 container_pid=
 watchdog_failure=$scratch/watchdog.failed
 measure_scratch_kib() {
-  local usage_line usage_kib
-  usage_line=$(du -sk "$scratch") || return 1
-  [[ $usage_line = *$'\t'* ]] || return 1
-  usage_kib=${usage_line%%$'\t'*}
-  [[ $usage_kib =~ ^[0-9]+$ ]] || return 1
-  printf '%s\n' "$usage_kib"
+  local usage_line usage_kib total_kib=0 path
+  local paths=("$scratch")
+  if [[ -n $cache_dir ]]; then paths+=("$cache_dir"); fi
+  for path in "${paths[@]}"; do
+    usage_line=$(du -sk "$path") || return 1
+    [[ $usage_line = *$'\t'* ]] || return 1
+    usage_kib=${usage_line%%$'\t'*}
+    [[ $usage_kib =~ ^[0-9]+$ ]] || return 1
+    total_kib=$((total_kib + usage_kib))
+  done
+  printf '%s\n' "$total_kib"
 }
 cleanup() {
   result=$?
@@ -167,6 +219,16 @@ export BUZZ_BUILD_ROWVIA_OWNER_PUBKEY=$owner_key
 export BUZZ_BUILD_CERBERUS_PUBKEY=$cerberus_key
 unset owner_key cerberus_key
 
+extra_build_args=()
+if ((owner_test_hook)); then
+  extra_build_args+=(--env ROWVIA_OWNER_TEST_HOOK=1 --env VITE_ROWVIA_OWNER_TEST_HOOK=1)
+fi
+if [[ -n $cache_dir ]]; then
+  extra_build_args+=(--mount "type=bind,src=$cache_dir/cargo-target,dst=/work/source/desktop/src-tauri/target")
+fi
+
+# Expand build variables inside the isolated container, not the host shell.
+# shellcheck disable=SC2016
 timeout --signal=TERM --kill-after=30s 6h docker run --rm \
   --name "$container" --network bridge --cpus=2 --memory=4g --memory-swap=5g \
   --pids-limit=512 --cap-drop=ALL --security-opt=no-new-privileges \
@@ -186,6 +248,7 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
   --env XDG_CACHE_HOME=/work/source/.cache \
   --env XDG_DATA_HOME=/work/source/.local/share \
   --env NPM_CONFIG_CACHE=/work/source/.npm-cache \
+  "${extra_build_args[@]}" \
   "$image_id" bash -euo pipefail -c '
     . ./bin/activate-hermit
     test "$(rustc --version)" = "rustc 1.95.0 (59807616e 2026-04-14)"
@@ -196,10 +259,15 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
     for name in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
       : > "desktop/src-tauri/binaries/$name-$target"
     done
+    feature_args=()
+    if [[ ${ROWVIA_OWNER_TEST_HOOK:-0} = 1 ]]; then
+      test "${VITE_ROWVIA_OWNER_TEST_HOOK:-}" = 1
+      feature_args=(--features rowvia-owner-test-hook)
+    fi
     if [[ $ROWVIA_BUILD_MODE = live ]]; then
-      pnpm -C desktop tauri build --no-bundle
+      pnpm -C desktop tauri build --no-bundle "${feature_args[@]}"
     elif [[ $ROWVIA_BUILD_MODE = compile-check ]]; then
-      pnpm -C desktop tauri build --no-bundle --config "{\"identifier\":\"ai.rowvia.buzz.compile-check\",\"productName\":\"Rowvia Buzz Compile Check\"}"
+      pnpm -C desktop tauri build --no-bundle --config "{\"identifier\":\"ai.rowvia.buzz.compile-check\",\"productName\":\"Rowvia Buzz Compile Check\"}" "${feature_args[@]}"
     else
       echo "invalid Rowvia build mode" >&2
       exit 1
@@ -240,7 +308,8 @@ monitor_pid=
 final_kib=$(measure_scratch_kib) || die "cannot measure final scratch usage"
 ((final_kib <= max_kib)) || die "final scratch exceeds 25 GiB"
 
-binary=$scratch/source/desktop/src-tauri/target/release/buzz-desktop
+binary=${cache_dir:+$cache_dir/cargo-target/release/buzz-desktop}
+binary=${binary:-$scratch/source/desktop/src-tauri/target/release/buzz-desktop}
 [[ -s $binary ]] || die "build did not produce a desktop binary"
 [[ $(readelf -h "$binary" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p') = 'Advanced Micro Devices X86-64' ]] || die "unexpected ELF architecture"
 for embedded in "$management_origin" "$source_instance" "$BUZZ_BUILD_ROWVIA_OWNER_PUBKEY" "$BUZZ_BUILD_CERBERUS_PUBKEY"; do
@@ -266,11 +335,11 @@ else
 fi
 install -m "$artifact_mode" "$binary" "$staged_output/$artifact_name"
 binary_sha=$(sha256sum "$staged_output/$artifact_name" | cut -d' ' -f1)
-python3 - "$staged_output/provenance.json" "$revision" "$version" "$image_id" "$binary_sha" "$build_mode" "$app_identifier" "$product_name" "$artifact_name" <<'PY'
+python3 - "$staged_output/provenance.json" "$revision" "$version" "$image_id" "$binary_sha" "$build_mode" "$app_identifier" "$product_name" "$artifact_name" "$owner_test_hook" <<'PY'
 import json
 import sys
 
-path, revision, version, image_id, binary_sha, build_mode, identifier, product_name, artifact_name = sys.argv[1:]
+path, revision, version, image_id, binary_sha, build_mode, identifier, product_name, artifact_name, owner_test_hook = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as output_file:
     json.dump(
         {
@@ -279,6 +348,7 @@ with open(path, "w", encoding="utf-8") as output_file:
             "image_id": image_id,
             "binary_sha256": binary_sha,
             "build_mode": build_mode,
+            "owner_test_hook": owner_test_hook == "1",
             "deployable": build_mode == "live",
             "artifact_filename": artifact_name,
             "tauri_identifier": identifier,
