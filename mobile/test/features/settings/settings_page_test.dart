@@ -422,7 +422,9 @@ void main() {
     expect(opened, ['status', 'name', 'description']);
   });
 
-  testWidgets('uses the native glass close control on iOS', (tester) async {
+  testWidgets('uses native navigation with Close and no Edit action on iOS', (
+    tester,
+  ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     SharedPreferences.setMockInitialValues({});
@@ -442,21 +444,13 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    final nativeViews = tester.widgetList<UiKitView>(find.byType(UiKitView));
-    final nativeClose = nativeViews.singleWhere(
-      (view) =>
-          (view.creationParams as Map<Object?, Object?>?)?['icon'] == 'close',
-    );
-    expect(nativeClose.viewType, 'buzz/navigation_glass');
-    expect(nativeClose.creationParams, containsPair('icon', 'close'));
-    expect(
-      nativeViews.where(
-        (view) =>
-            (view.creationParams as Map<Object?, Object?>?)?['label'] == 'Edit',
-      ),
-      isEmpty,
-    );
-    expect(find.byTooltip('Close settings'), findsOneWidget);
+    final nativeBar = tester.widget<UiKitView>(find.byType(UiKitView));
+    expect(nativeBar.viewType, 'buzz/ios_navigation_bar');
+    final params = nativeBar.creationParams! as Map<String, Object?>;
+    expect(params['leading'], containsPair('symbol', 'xmark'));
+    expect(params['leading'], containsPair('label', 'Close settings'));
+    expect(params['actions'], isEmpty);
+
     debugDefaultTargetPlatformOverride = null;
   });
 
