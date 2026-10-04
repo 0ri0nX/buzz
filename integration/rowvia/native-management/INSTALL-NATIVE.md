@@ -18,6 +18,12 @@ this host. The installer pins that launcher's SHA-256 and executes an already
 opened file descriptor, so a path replacement after validation cannot change
 which launcher runs. Any deliberate launcher edit requires reviewing and
 updating the pinned digest in the installer.
+Its tracked source is Rowvia Context's `integration/architect-live/buzz-desktop.sh`;
+the workspace copy must stay byte-identical to that reviewed source. The current
+pin includes explicit owner-test-hook configuration and socket readiness checks.
+After this installer's separate stop/start (or a reboot), re-enable the temporary
+test hook with `scripts/buzz-desktop restart --owner-hook` when running pilot tests;
+an ordinary restart preserves it only while the transient unit setting exists.
 
 Create a Desktop output using `build-linux-desktop.sh --live` and a sidecar
 output using `build-linux-sidecars.sh`. Both outputs must come from commit
