@@ -144,7 +144,7 @@ if [[ $build_mode = compile-check ]]; then
 fi
 echo "Output: $output"
 echo "Identity fields: owner and Cerberus public keys validated"
-echo "Limits: 4 GiB RAM, 5 GiB RAM+swap, 2 CPUs, 1 build job, 512 PIDs, 25 GiB scratch"
+echo "Limits: 5 GiB RAM, zero swap, 2 CPUs, 1 build job, 512 PIDs, 25 GiB scratch"
 if ((dry_run)); then
   echo "Dry run: source export and Docker build skipped"
   exit 0
@@ -245,7 +245,7 @@ fi
 # Expand build variables inside the isolated container, not the host shell.
 # shellcheck disable=SC2016
 timeout --signal=TERM --kill-after=30s 6h docker run --rm \
-  --name "$container" --network bridge --cpus=2 --memory=4g --memory-swap=5g \
+  --name "$container" --network bridge --cpus=2 --memory=5g --memory-swap=5g \
   --pids-limit=512 --cap-drop=ALL --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" --read-only --log-driver=none \
   --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \

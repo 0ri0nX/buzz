@@ -18,6 +18,7 @@ printf 'ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY=%064d\nROWVIA_CONTEXT_CERBERUS_PUBKEY=%
 bash "$build" --dry-run --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout"
 grep -Fq 'Mode: compile-check (ai.rowvia.buzz.compile-check; Rowvia Buzz Compile Check)' "$scratch/stdout"
 grep -Fq 'Compile-check only: artifact is non-executable and has no runtime state isolation' "$scratch/stdout"
+grep -Fq 'Limits: 5 GiB RAM, zero swap, 2 CPUs, 1 build job, 512 PIDs, 25 GiB scratch' "$scratch/stdout"
 bash "$build" --live --dry-run --output "$scratch/output" --identity-file "$scratch/identities.env" >"$scratch/stdout"
 grep -Fq 'Mode: live (xyz.block.buzz.app; Buzz)' "$scratch/stdout"
 [[ ! -e $scratch/output ]] || { echo "dry-run created output" >&2; exit 1; }
@@ -83,7 +84,7 @@ case $1 in
     [[ -n ${source_dir-} ]] || exit 83
     [[ ${container_build_mode-} = "$ROWVIA_TEST_EXPECTED_BUILD_MODE" ]] || exit 85
     [[ ${hook_enabled:-0} = "${ROWVIA_TEST_EXPECTED_HOOK:-0}" && ${vite_hook_enabled:-0} = "${ROWVIA_TEST_EXPECTED_HOOK:-0}" ]] || exit 86
-    [[ " $* " = *' --cpus=2 --memory=4g --memory-swap=5g '* && " $* " = *' --pids-limit=512 '* && " $* " = *' --env CARGO_BUILD_JOBS=1 '* ]] || exit 87
+    [[ " $* " = *' --cpus=2 --memory=5g --memory-swap=5g '* && " $* " = *' --pids-limit=512 '* && " $* " = *' --env CARGO_BUILD_JOBS=1 '* ]] || exit 87
     scratch_dir=${source_dir%/source}
     printf '%s\n' "$scratch_dir" > "$ROWVIA_TEST_SCRATCH_PATH"
     if [[ -n ${cache_target-} ]]; then
