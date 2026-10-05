@@ -314,7 +314,10 @@ export async function installOwnerTestHook() {
         throw error;
       }
     },
-  );
+  ).catch((error: unknown) => {
+    handle.dispose();
+    throw error;
+  });
   return () => {
     unlisten();
     handle.dispose();
