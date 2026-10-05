@@ -13,6 +13,9 @@ const calls = [];
 let events = [];
 let onSign = () => {};
 let onConnect = () => {};
+let createdChannelId = channelId;
+let sendCount = 0;
+let onNativeSend = () => {};
 globalThis.window = {
   setTimeout,
   clearTimeout,
@@ -24,13 +27,28 @@ globalThis.window = {
       if (command === "get_relay_ws_url") return relay;
       if (command === "create_channel")
         return {
-          id: channelId,
+          id: createdChannelId,
           name: args.name,
           channel_type: "stream",
           visibility: "private",
           member_count: 1,
         };
       if (command === "add_channel_members") return membersResult;
+      if (command === "send_channel_message") {
+        const result = {
+          event_id: (++sendCount).toString(16).padStart(64, "0"),
+          parent_event_id: args.parentEventId,
+          root_event_id: args.rootEventId,
+          depth: args.parentEventId
+            ? args.parentEventId === args.rootEventId
+              ? 1
+              : 2
+            : 0,
+          created_at: 1,
+        };
+        onNativeSend(result);
+        return result;
+      }
       if (command === "sign_event") {
         onSign();
         return JSON.stringify({
@@ -53,8 +71,8 @@ const { activateRateLimit, resetRateLimitGate } = await import(
 const { createOwnerTestHandler } = await import("./ownerTestHook.ts");
 const { OWNER_TEST_SCHEMA } = await import("./ownerTestHookProtocol.ts");
 
-// Mock the session/transport boundary; retain the production sendMessage,
-// fetchEvents, mention normalization and native API wrappers.
+// Mock native invoke and the session/transport boundary; retain the stock
+// native send wrapper, independent JS publisher, reads and mention handling.
 relayClient.ensureConnected = async () => {
   onConnect();
   return 1;
@@ -76,6 +94,9 @@ function reset() {
   membersResult = { added: [architectPubkey], errors: [] };
   onSign = () => {};
   onConnect = () => {};
+  onNativeSend = () => {};
+  createdChannelId = channelId;
+  sendCount = 0;
   relayClient.relayUrl = relayUrl;
   relayClient.connectionStateEmitter.set("connected");
 }
@@ -97,7 +118,260 @@ async function create(handler) {
   return result.result.channelId;
 }
 
-test("create/add/send/read binds production channel wrappers and ordinary kind9 h/p message path", async (t) => {
+function nativeSendArgs(id, content, parentEventId = null, rootEventId = null) {
+  return {
+    channelId: id,
+    content,
+    parentEventId,
+    rootEventId,
+    mediaTags: null,
+    emojiTags: null,
+    mentionTags: null,
+    linkPreviewTags: undefined,
+    sentFromThreadTag: null,
+    mentionPubkeys: [architectPubkey],
+    kind: null,
+    expectedRelayUrl: relayUrl,
+    expectedSignerPubkey: ownerPubkey,
+  };
+}
+
+async function prepare(handler) {
+  const id = await create(handler);
+  assert.equal(
+    (await handler(request("add_architect", { channelId: id }))).status,
+    "ok",
+  );
+  return id;
+}
+
+async function send(handler, id, references = {}) {
+  return handler(
+    request("send_message", {
+      channelId: id,
+      content: "ROWVIA_E2E_ thread",
+      ...references,
+    }),
+  );
+}
+
+test("native root, direct and nested sends preserve exact parent/root and closed tag inputs", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const id = await prepare(handler);
+  const root = await send(handler, id);
+  assert.equal(root.status, "ok");
+  const rootId = root.result.eventId;
+  const direct = await send(handler, id, { parentEventId: rootId });
+  assert.equal(direct.status, "ok");
+  const directId = direct.result.eventId;
+  const nested = await send(handler, id, {
+    parentEventId: directId,
+    rootEventId: rootId,
+  });
+  assert.equal(nested.status, "ok");
+  const deeper = await send(handler, id, {
+    parentEventId: nested.result.eventId,
+  });
+  assert.equal(deeper.status, "ok");
+  assert.deepEqual(
+    calls
+      .filter((call) => call.command === "send_channel_message")
+      .map((call) => call.args),
+    [
+      nativeSendArgs(id, "ROWVIA_E2E_ thread"),
+      nativeSendArgs(id, "ROWVIA_E2E_ thread", rootId, rootId),
+      nativeSendArgs(id, "ROWVIA_E2E_ thread", directId, rootId),
+      nativeSendArgs(id, "ROWVIA_E2E_ thread", nested.result.eventId, rootId),
+    ],
+  );
+  assert.equal(
+    calls.some((call) =>
+      ["sign_event", "publish", "history"].includes(call.command),
+    ),
+    false,
+  );
+});
+
+test("malformed thread IDs, root without parent and unrestricted arguments fail schema before native calls", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const malformed = [
+    "a".repeat(63),
+    "a".repeat(65),
+    "A".repeat(64),
+    "g".repeat(64),
+    "",
+    null,
+  ];
+  for (const key of ["parentEventId", "rootEventId"]) {
+    for (const value of malformed) {
+      assert.equal(
+        (
+          await send(handler, channelId, {
+            parentEventId: "c".repeat(64),
+            [key]: value,
+          })
+        ).code,
+        "invalid_request",
+      );
+    }
+  }
+  for (const extra of [
+    { rootEventId: "c".repeat(64) },
+    { tags: [["e", "c".repeat(64), "", "reply"]] },
+    { mentionPubkeys: [ownerPubkey] },
+    { kind: 40002 },
+    { expectedSignerPubkey: ownerPubkey },
+    { privateKey: "c".repeat(64) },
+  ])
+    assert.equal(
+      (await send(handler, channelId, extra)).code,
+      "invalid_request",
+    );
+  assert.equal(calls.length, 0);
+});
+
+test("unknown, cross-channel, cross-handler and inconsistent thread roots fail before native send", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const id = await prepare(handler);
+  const rootId = (await send(handler, id)).result.eventId;
+  const otherRootId = (await send(handler, id)).result.eventId;
+  const directId = (await send(handler, id, { parentEventId: rootId })).result
+    .eventId;
+  createdChannelId = randomUUID();
+  const otherChannel = await prepare(handler);
+  events = [{ id: "f".repeat(64), kind: 9, tags: [["h", id]] }];
+  assert.equal(
+    (await handler(request("read_channel", { channelId: id, limit: 1 })))
+      .status,
+    "ok",
+  );
+  const before = calls.filter(
+    (call) => call.command === "send_channel_message",
+  ).length;
+  for (const [target, references] of [
+    [id, { parentEventId: "f".repeat(64) }],
+    [otherChannel, { parentEventId: rootId, rootEventId: rootId }],
+    [id, { parentEventId: directId, rootEventId: otherRootId }],
+    [id, { parentEventId: directId, rootEventId: directId }],
+    [id, { parentEventId: rootId, rootEventId: "f".repeat(64) }],
+  ])
+    assert.equal(
+      (await send(handler, target, references)).code,
+      "invalid_request",
+    );
+  const separate = createOwnerTestHandler();
+  t.after(separate.dispose);
+  createdChannelId = id;
+  await prepare(separate);
+  assert.equal(
+    (await send(separate, id, { parentEventId: rootId })).code,
+    "invalid_request",
+  );
+  assert.equal(
+    calls.filter((call) => call.command === "send_channel_message").length,
+    before,
+  );
+});
+
+test("native failures and invalid responses never establish targets or retry sends", async (t) => {
+  for (const failure of ["throw", "id", "parent", "root"]) {
+    reset();
+    const handler = createOwnerTestHandler();
+    t.after(handler.dispose);
+    const id = await prepare(handler);
+    onNativeSend = (result) => {
+      if (failure === "throw") throw new Error("uncertain transport");
+      if (failure === "id") result.event_id = "C".repeat(64);
+      if (failure === "parent") result.parent_event_id = "f".repeat(64);
+      if (failure === "root") result.root_event_id = "f".repeat(64);
+    };
+    const item = request("send_message", {
+      channelId: id,
+      content: "ROWVIA_E2E_ unknown",
+    });
+    const result = await handler(item);
+    assert.equal(result.status, "unknown");
+    assert.equal(result.code, "operation_failed");
+    assert.equal((await handler(item)).code, "duplicate_request");
+    onNativeSend = () => {};
+    assert.equal(
+      (await send(handler, id, { parentEventId: "1".padStart(64, "0") })).code,
+      "invalid_request",
+    );
+    assert.equal(
+      calls.filter((call) => call.command === "send_channel_message").length,
+      1,
+    );
+  }
+});
+
+test("duplicate native IDs fail closed without replacing earlier channel provenance", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const id = await prepare(handler);
+  const rootId = (await send(handler, id)).result.eventId;
+  createdChannelId = randomUUID();
+  const otherChannel = await prepare(handler);
+  onNativeSend = (result) => {
+    result.event_id = rootId;
+  };
+  const duplicate = await send(handler, otherChannel);
+  assert.equal(duplicate.status, "unknown");
+  assert.equal(duplicate.code, "operation_failed");
+  onNativeSend = () => {};
+  assert.equal(
+    (await send(handler, otherChannel, { parentEventId: rootId })).code,
+    "invalid_request",
+  );
+  assert.equal(
+    (await send(handler, id, { parentEventId: rootId })).status,
+    "ok",
+  );
+  assert.equal(
+    calls.filter((call) => call.command === "send_channel_message").length,
+    3,
+  );
+});
+
+test("scope drift rejects thread sends before invoke and fences completion provenance", async (t) => {
+  for (const phase of ["before", "during"]) {
+    for (const field of ["owner", "relay"]) {
+      reset();
+      const handler = createOwnerTestHandler();
+      t.after(handler.dispose);
+      const id = await prepare(handler);
+      const rootId = (await send(handler, id)).result.eventId;
+      const drift = () => {
+        if (field === "owner") identity = "f".repeat(64);
+        else relay = "ws://localhost:9999";
+      };
+      if (phase === "before") drift();
+      else onNativeSend = drift;
+      const result = await send(handler, id, { parentEventId: rootId });
+      assert.equal(result.status, phase === "before" ? "error" : "unknown");
+      assert.equal(result.code, "scope_mismatch");
+      assert.equal(
+        calls.filter((call) => call.command === "send_channel_message").length,
+        phase === "before" ? 1 : 2,
+      );
+      identity = ownerPubkey;
+      relay = relayUrl;
+      assert.equal(
+        (await send(handler, id, { parentEventId: rootId })).code,
+        "scope_mismatch",
+      );
+    }
+  }
+});
+
+test("create/add/send/read binds stock native wrappers with pinned kind9 recipients", async (t) => {
   reset();
   const handler = createOwnerTestHandler();
   t.after(handler.dispose);
@@ -111,15 +385,15 @@ test("create/add/send/read binds production channel wrappers and ordinary kind9 
     request("send_message", { channelId: id, content: " ROWVIA_E2E_ hello " }),
   );
   assert.equal(sent.status, "ok");
-  const signed = calls.find((call) => call.command === "sign_event").args;
-  assert.deepEqual(signed, {
-    kind: 9,
-    content: "ROWVIA_E2E_ hello",
-    tags: [
-      ["h", id],
-      ["p", architectPubkey],
-    ],
-  });
+  assert.deepEqual(sent.result, { eventId: "1".padStart(64, "0") });
+  assert.deepEqual(
+    calls.find((call) => call.command === "send_channel_message").args,
+    nativeSendArgs(id, " ROWVIA_E2E_ hello "),
+  );
+  assert.equal(
+    calls.some((call) => ["sign_event", "publish"].includes(call.command)),
+    false,
+  );
   const createArgs = calls.find(
     (call) => call.command === "create_channel",
   ).args;
@@ -129,7 +403,17 @@ test("create/add/send/read binds production channel wrappers and ordinary kind9 
     (call) => call.command === "add_channel_members",
   ).args;
   assert.deepEqual(addArgs.pubkeys, [architectPubkey]);
-  events = [{ ...signed, id: sent.result.eventId }];
+  events = [
+    {
+      kind: 9,
+      content: "ROWVIA_E2E_ hello",
+      tags: [
+        ["h", id],
+        ["p", architectPubkey],
+      ],
+      id: sent.result.eventId,
+    },
+  ];
   assert.deepEqual(
     (
       await handler(
@@ -296,7 +580,7 @@ test("membership errors and missing added confirmation prevent sending", async (
       "membership_failed",
     );
     assert.equal(
-      calls.some((call) => call.command === "sign_event"),
+      calls.some((call) => call.command === "send_channel_message"),
       false,
     );
   }

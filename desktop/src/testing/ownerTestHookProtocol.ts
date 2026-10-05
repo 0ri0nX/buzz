@@ -4,6 +4,7 @@ import { normalizeRelayUrl } from "@/features/communities/relayProbe";
 /** Versioned, deliberately narrow temporary owner workflow protocol. */
 export const OWNER_TEST_SCHEMA = "rowvia.buzz.owner-test/v1";
 const pubkey = z.string().regex(/^[0-9a-f]{64}$/);
+const eventId = z.string().regex(/^[0-9a-f]{64}$/);
 const channelId = z.string().uuid();
 const base = {
   schema: z.literal(OWNER_TEST_SCHEMA),
@@ -46,14 +47,21 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
   z.strictObject({
     ...base,
     operation: z.literal("send_message"),
-    arguments: z.strictObject({
-      channelId,
-      content: z
-        .string()
-        .min(1)
-        .max(4096)
-        .refine((value) => value.includes("ROWVIA_E2E_")),
-    }),
+    arguments: z
+      .strictObject({
+        channelId,
+        content: z
+          .string()
+          .min(1)
+          .max(4096)
+          .refine((value) => value.includes("ROWVIA_E2E_")),
+        parentEventId: eventId.optional(),
+        rootEventId: eventId.optional(),
+      })
+      .refine(
+        (value) =>
+          value.rootEventId === undefined || value.parentEventId !== undefined,
+      ),
   }),
   z.strictObject({
     ...base,

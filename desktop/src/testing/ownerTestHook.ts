@@ -9,6 +9,7 @@ import {
 } from "@/shared/api/tauri";
 import { createChannel } from "@/shared/api/tauriChannels";
 import { getIdentity } from "@/shared/api/tauriIdentity";
+import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import type { Channel } from "@/shared/api/types";
 import {
   OWNER_TEST_SCHEMA,
@@ -29,6 +30,12 @@ class HookFailure extends Error {
 /** A session-local allowlist; only hook-created private streams are accessible. */
 export function createOwnerTestHandler() {
   const seen = new Set<string>();
+  // At most one successful send per accepted request (the ledger caps at 128).
+  // Only native-confirmed sends in this handler's lifetime establish targets.
+  const sentEvents = new Map<
+    string,
+    { channelId: string; rootEventId: string }
+  >();
   const channels = new Map<
     string,
     { channel: Channel; expected: string; added: boolean }
@@ -40,6 +47,7 @@ export function createOwnerTestHandler() {
   const fence = () => {
     fenced = true;
     channels.clear();
+    sentEvents.clear();
   };
   const dispose = relayClient.subscribeToConnectionState((state) => {
     if (boundScope !== null && (state === "idle" || state === "disconnected")) {
@@ -132,6 +140,23 @@ export function createOwnerTestHandler() {
     }
     if (request.operation === "send_message") {
       if (!entry.added) throw new HookFailure("membership_failed");
+      const parentEventId = request.arguments.parentEventId;
+      let rootEventId: string | undefined;
+      if (parentEventId !== undefined) {
+        const parent = sentEvents.get(parentEventId);
+        if (!parent || parent.channelId !== entry.channel.id)
+          throw new HookFailure("invalid_request");
+        rootEventId = parent.rootEventId;
+        const root = sentEvents.get(rootEventId);
+        if (
+          !root ||
+          root.channelId !== entry.channel.id ||
+          root.rootEventId !== rootEventId ||
+          (request.arguments.rootEventId !== undefined &&
+            request.arguments.rootEventId !== rootEventId)
+        )
+          throw new HookFailure("invalid_request");
+      }
       const recipients = messageMentionPubkeys(
         entry.channel,
         request.expected.ownerPubkey,
@@ -144,18 +169,35 @@ export function createOwnerTestHandler() {
         throw new HookFailure("invalid_request");
       await assertScope(request);
       markMutation();
-      const event = await relayClient.sendMessage(
+      const result = await sendChannelMessage(
         entry.channel.id,
         request.arguments.content,
+        parentEventId ?? null,
+        undefined,
         recipients,
-        [],
-        {
-          ownerPubkey: request.expected.ownerPubkey,
-          relayUrl: request.expected.relayUrl,
-        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        request.expected.relayUrl,
+        request.expected.ownerPubkey,
+        rootEventId,
       );
       await assertScope(request);
-      return { eventId: event.id };
+      if (
+        typeof result.eventId !== "string" ||
+        !/^[0-9a-f]{64}$/.test(result.eventId) ||
+        sentEvents.has(result.eventId) ||
+        result.parentEventId !== (parentEventId ?? null) ||
+        result.rootEventId !== (rootEventId ?? null)
+      )
+        throw new HookFailure("operation_failed");
+      sentEvents.set(result.eventId, {
+        channelId: entry.channel.id,
+        rootEventId: rootEventId ?? result.eventId,
+      });
+      return { eventId: result.eventId };
     }
     const events = await relayClient.fetchEvents(
       {
