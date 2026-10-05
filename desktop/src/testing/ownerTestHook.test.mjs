@@ -16,12 +16,41 @@ let onConnect = () => {};
 let createdChannelId = channelId;
 let sendCount = 0;
 let onNativeSend = () => {};
+const nativeOverrides = new Map();
+const eventCallbacks = new Map();
+const eventListeners = new Map();
+let nextCallbackId = 0;
+const ownerRequestEvent = "rowvia-owner-test-request";
 globalThis.window = {
   setTimeout,
   clearTimeout,
+  __TAURI_EVENT_PLUGIN_INTERNALS__: {
+    unregisterListener: (event, eventId) => {
+      assert.equal(eventListeners.get(eventId).event, event);
+      eventCallbacks.delete(eventListeners.get(eventId).handler);
+      eventListeners.delete(eventId);
+    },
+  },
   __TAURI_INTERNALS__: {
+    transformCallback: (callback) => {
+      const id = ++nextCallbackId;
+      eventCallbacks.set(id, callback);
+      return id;
+    },
     invoke: async (command, args) => {
       calls.push({ command, args });
+      if (nativeOverrides.has(command))
+        return nativeOverrides.get(command)(args);
+      if (command === "plugin:event|listen") {
+        const id = eventListeners.size + 1;
+        eventListeners.set(id, args);
+        return id;
+      }
+      if (
+        command === "plugin:event|unlisten" ||
+        command === "rowvia_owner_test_reply"
+      )
+        return;
       if (command === "get_identity")
         return { pubkey: identity, display_name: "Owner" };
       if (command === "get_relay_ws_url") return relay;
@@ -68,7 +97,9 @@ const { RelayClient } = await import("../shared/api/relayClientSession.ts");
 const { activateRateLimit, resetRateLimitGate } = await import(
   "../shared/api/relayRateLimitGate.ts"
 );
-const { createOwnerTestHandler } = await import("./ownerTestHook.ts");
+const { createOwnerTestHandler, installOwnerTestHook } = await import(
+  "./ownerTestHook.ts"
+);
 const { OWNER_TEST_SCHEMA } = await import("./ownerTestHookProtocol.ts");
 
 // Mock native invoke and the session/transport boundary; retain the stock
@@ -97,6 +128,9 @@ function reset() {
   onNativeSend = () => {};
   createdChannelId = channelId;
   sendCount = 0;
+  nativeOverrides.clear();
+  eventCallbacks.clear();
+  eventListeners.clear();
   relayClient.relayUrl = relayUrl;
   relayClient.connectionStateEmitter.set("connected");
 }
@@ -110,6 +144,245 @@ function request(operation, args = {}, overrides = {}) {
     ...overrides,
   };
 }
+
+// owner_test_hook.rs tests::request(): serde uses camelCase for Request and
+// Expected. Keep both pinned public keys and the HTTPS relay of that fixture.
+function nativeStatusRequest() {
+  return JSON.parse(
+    JSON.stringify({
+      schema: "rowvia.buzz.owner-test/v1",
+      requestId: randomUUID(),
+      operation: "status",
+      expected: {
+        ownerPubkey:
+          "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68",
+        architectPubkey:
+          "05d1901b020205f04db1ee6c434d4cd69211af3dbc1d2a46e0e1e93f81f6dd20",
+        relayUrl: "https://buzz.rowvia.ai:8443",
+      },
+      arguments: {},
+    }),
+  );
+}
+
+function setNativeScope(payload) {
+  identity = payload.expected.ownerPubkey;
+  relay = "wss://buzz.rowvia.ai:8443";
+  relayClient.relayUrl = relay;
+}
+
+function dispatchNativeRequest(payload) {
+  const listeners = [...eventListeners.entries()].filter(
+    ([, listener]) => listener.event === ownerRequestEvent,
+  );
+  assert.equal(listeners.length, 1);
+  const [id, listener] = listeners[0];
+  return eventCallbacks.get(listener.handler)({
+    event: ownerRequestEvent,
+    id,
+    payload,
+  });
+}
+
+function replies() {
+  return calls.filter((call) => call.command === "rowvia_owner_test_reply");
+}
+
+function expectedStatusReply(payload) {
+  return {
+    schema: "rowvia.buzz.owner-test/v1",
+    requestId: payload.requestId,
+    status: "ok",
+    result: {
+      ownerPubkey: payload.expected.ownerPubkey,
+      relayUrl: "wss://buzz.rowvia.ai:8443",
+      ready: true,
+    },
+  };
+}
+
+test("installation registers the stock Tauri listener and replies to a native status envelope", async (t) => {
+  reset();
+  const payload = nativeStatusRequest();
+  setNativeScope(payload);
+  const dispose = await installOwnerTestHook();
+  t.after(dispose);
+  const registration = calls[0];
+  assert.equal(registration.command, "plugin:event|listen");
+  assert.deepEqual(registration.args, {
+    event: ownerRequestEvent,
+    target: { kind: "Any" },
+    handler: registration.args.handler,
+  });
+  assert.equal(typeof registration.args.handler, "number");
+  await dispatchNativeRequest(payload);
+  assert.deepEqual(calls.slice(1), [
+    { command: "get_identity", args: {} },
+    { command: "get_relay_ws_url", args: {} },
+    {
+      command: "rowvia_owner_test_reply",
+      args: { response: expectedStatusReply(payload) },
+    },
+  ]);
+});
+
+test("installation propagates listener rejection and releases its relay subscription", async (t) => {
+  reset();
+  const failure = new Error("listener registration denied");
+  nativeOverrides.set("plugin:event|listen", () => {
+    throw failure;
+  });
+  const subscriptions = [];
+  const subscribe = relayClient.subscribeToConnectionState.bind(relayClient);
+  t.mock.method(relayClient, "subscribeToConnectionState", (listener) => {
+    const dispose = t.mock.fn(subscribe(listener));
+    subscriptions.push(dispose);
+    return dispose;
+  });
+  t.after(() => {
+    for (const dispose of subscriptions) dispose();
+  });
+  await assert.rejects(installOwnerTestHook(), (error) => error === failure);
+  assert.equal(eventListeners.size, 0);
+  assert.equal(replies().length, 0);
+  assert.equal(subscriptions.length, 1);
+  assert.equal(subscriptions[0].mock.callCount(), 1);
+});
+
+test("installed handler maps identity and relay IPC failures to correlated unknown replies", async () => {
+  for (const command of ["get_identity", "get_relay_ws_url"]) {
+    reset();
+    const payload = nativeStatusRequest();
+    setNativeScope(payload);
+    nativeOverrides.set(command, () => {
+      throw new Error(`offline ${command} failure`);
+    });
+    const dispose = await installOwnerTestHook();
+    try {
+      await dispatchNativeRequest(payload);
+      assert.deepEqual(replies(), [
+        {
+          command: "rowvia_owner_test_reply",
+          args: {
+            response: {
+              schema: payload.schema,
+              requestId: payload.requestId,
+              status: "unknown",
+              code: "operation_failed",
+            },
+          },
+        },
+      ]);
+      assert.equal(calls.filter((call) => call.command === command).length, 1);
+    } finally {
+      dispose();
+    }
+  }
+});
+
+test("installed status emits no reply while identity or relay IPC is stalled", async () => {
+  for (const command of ["get_identity", "get_relay_ws_url"]) {
+    reset();
+    const payload = nativeStatusRequest();
+    setNativeScope(payload);
+    const started = Promise.withResolvers();
+    const completion = Promise.withResolvers();
+    nativeOverrides.set(command, () => {
+      started.resolve();
+      return completion.promise;
+    });
+    const dispose = await installOwnerTestHook();
+    let settled = false;
+    const pending = dispatchNativeRequest(payload).finally(() => {
+      settled = true;
+    });
+    try {
+      await started.promise;
+      await new Promise(setImmediate);
+      assert.equal(settled, false);
+      assert.equal(replies().length, 0);
+      assert.deepEqual(
+        calls.slice(1).map((call) => call.command),
+        command === "get_identity"
+          ? ["get_identity"]
+          : ["get_identity", "get_relay_ws_url"],
+      );
+    } finally {
+      completion.resolve(
+        command === "get_identity"
+          ? { pubkey: identity, display_name: "Owner" }
+          : relay,
+      );
+      await pending;
+      dispose();
+    }
+    assert.deepEqual(replies()[0].args, {
+      response: expectedStatusReply(payload),
+    });
+  }
+});
+
+test("installed reply rejection propagates and fences further requests without retry", async () => {
+  reset();
+  const payload = nativeStatusRequest();
+  setNativeScope(payload);
+  nativeOverrides.set("rowvia_owner_test_reply", () => {
+    throw new Error("offline reply denied");
+  });
+  const dispose = await installOwnerTestHook();
+  try {
+    await assert.rejects(
+      dispatchNativeRequest(payload),
+      /offline reply denied/,
+    );
+    assert.deepEqual(replies()[0].args, {
+      response: expectedStatusReply(payload),
+    });
+    assert.equal(replies().length, 1);
+    nativeOverrides.delete("rowvia_owner_test_reply");
+    const next = nativeStatusRequest();
+    await dispatchNativeRequest(next);
+    assert.deepEqual(replies()[1].args, {
+      response: {
+        schema: next.schema,
+        requestId: next.requestId,
+        status: "error",
+        code: "scope_mismatch",
+      },
+    });
+    assert.equal(
+      calls.filter((call) => call.command === "get_identity").length,
+      1,
+    );
+  } finally {
+    dispose();
+  }
+});
+
+test("installed hook disposal removes the Tauri listener and relay subscription", async (t) => {
+  reset();
+  const subscribe = relayClient.subscribeToConnectionState.bind(relayClient);
+  const subscriptions = [];
+  t.mock.method(relayClient, "subscribeToConnectionState", (listener) => {
+    const dispose = t.mock.fn(subscribe(listener));
+    subscriptions.push(dispose);
+    return dispose;
+  });
+  const dispose = await installOwnerTestHook();
+  t.after(() => {
+    for (const unsubscribe of subscriptions) unsubscribe();
+  });
+  const [eventId] = eventListeners.keys();
+  dispose();
+  await new Promise(setImmediate);
+  assert.equal(eventListeners.size, 0);
+  assert.equal(eventCallbacks.size, 0);
+  assert.equal(subscriptions[0].mock.callCount(), 1);
+  assert.deepEqual(calls.at(-1), {
+    command: "plugin:event|unlisten",
+    args: { event: ownerRequestEvent, eventId },
+  });
+});
 async function create(handler) {
   const result = await handler(
     request("create_private_stream", { name: "rowvia-e2e-flow" }),
