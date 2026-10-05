@@ -597,6 +597,11 @@ class ChannelDetailPage extends HookConsumerWidget {
       }
     }
 
+    final retention = ephemeralChannelDisplay(resolvedChannel);
+    final nativeHeaderSubtitle = isOneToOneDm
+        ? dmHeader?.presenceLabel
+        : headerMemberLabel;
+
     final timelineMessages = resolvedChannel.isForum
         ? <TimelineMessage>[]
         : formatTimeline(
@@ -616,18 +621,22 @@ class ChannelDetailPage extends HookConsumerWidget {
       appBar: FrostedAppBar(
         alwaysFrosted: true,
         nativeViewSuppressed: messageActionBackdropActive,
-        nativeEphemeralLabel: ephemeralChannelDisplay(
-          resolvedChannel,
-        )?.tooltipLabel,
         nativeTitle:
             dmHeader?.label ??
             resolveDmChannelDisplayLabel(
               resolvedChannel,
               currentPubkey: currentPubkey,
             ),
-        nativeSubtitle: isOneToOneDm
-            ? dmHeader?.presenceLabel
-            : headerMemberLabel,
+        nativeSubtitle: retention == null
+            ? nativeHeaderSubtitle
+            : [
+                'Temporary',
+                if (retention.detailLabel != null) retention.detailLabel!,
+                if (nativeHeaderSubtitle != null &&
+                    nativeHeaderSubtitle.isNotEmpty)
+                  nativeHeaderSubtitle,
+              ].join(' · '),
+        nativeEphemeralLabel: retention?.tooltipLabel,
         nativeTitlePresenceColor: switch (isOneToOneDm
             ? dmHeader?.presence
             : null) {
