@@ -357,12 +357,11 @@ pub(crate) fn rowvia_owner_test_reply(
     result
 }
 
-fn checked_phase(
+fn check_phase_scope(
     window_label: &str,
     hook_enabled: bool,
     shutdown: bool,
-    phase: &str,
-) -> Result<&'static str, &'static str> {
+) -> Result<(), &'static str> {
     if window_label != "main" {
         return Err("invalid_response");
     }
@@ -372,6 +371,58 @@ fn checked_phase(
     if shutdown {
         return Err("shutdown");
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativePhase {
+    SetupEntered,
+    MigrationsReady,
+    IdentityReady,
+    NestReady,
+    SetupCompleted,
+    PageLoadStarted,
+    PageLoadFinished,
+}
+
+fn checked_native_phase(
+    window_label: &str,
+    hook_enabled: bool,
+    shutdown: bool,
+    phase: NativePhase,
+) -> Result<&'static str, &'static str> {
+    check_phase_scope(window_label, hook_enabled, shutdown)?;
+    Ok(match phase {
+        NativePhase::SetupEntered => "native_setup_entered",
+        NativePhase::MigrationsReady => "native_migrations_ready",
+        NativePhase::IdentityReady => "native_identity_ready",
+        NativePhase::NestReady => "native_nest_ready",
+        NativePhase::SetupCompleted => "native_setup_completed",
+        NativePhase::PageLoadStarted => "native_page_load_started",
+        NativePhase::PageLoadFinished => "native_page_load_finished",
+    })
+}
+
+/// Native call-boundary observations, not readiness or frontend IPC authority.
+pub(crate) fn report_native_phase(app: &tauri::AppHandle, window_label: &str, phase: NativePhase) {
+    let hook = app.try_state::<Arc<Hook>>();
+    if let Ok(phase) = checked_native_phase(
+        window_label,
+        hook.is_some(),
+        hook.as_ref().is_some_and(|hook| hook.cancel.is_cancelled()),
+        phase,
+    ) {
+        eprintln!("rowvia-owner-test-phase: {phase}");
+    }
+}
+
+fn checked_phase(
+    window_label: &str,
+    hook_enabled: bool,
+    shutdown: bool,
+    phase: &str,
+) -> Result<&'static str, &'static str> {
+    check_phase_scope(window_label, hook_enabled, shutdown)?;
     // Return literals, never an untrusted input or a serde variant error.
     match phase {
         "bootstrap_started" => Ok("bootstrap_started"),
@@ -542,6 +593,37 @@ async fn wait_for_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_phases_require_active_main_scope_and_remain_native_only() {
+        for (phase, marker) in [
+            (NativePhase::SetupEntered, "native_setup_entered"),
+            (NativePhase::MigrationsReady, "native_migrations_ready"),
+            (NativePhase::IdentityReady, "native_identity_ready"),
+            (NativePhase::NestReady, "native_nest_ready"),
+            (NativePhase::SetupCompleted, "native_setup_completed"),
+            (NativePhase::PageLoadStarted, "native_page_load_started"),
+            (NativePhase::PageLoadFinished, "native_page_load_finished"),
+        ] {
+            assert_eq!(checked_native_phase("main", true, false, phase), Ok(marker));
+            assert_eq!(
+                checked_native_phase("other", true, false, phase),
+                Err("invalid_response")
+            );
+            assert_eq!(
+                checked_native_phase("main", false, false, phase),
+                Err("hook_disabled")
+            );
+            assert_eq!(
+                checked_native_phase("main", true, true, phase),
+                Err("shutdown")
+            );
+            assert_eq!(
+                checked_phase("main", true, false, marker),
+                Err("invalid_phase")
+            );
+        }
+    }
+
     #[test]
     fn phases_require_active_main_scope_and_never_echo_invalid_input() {
         for phase in [
