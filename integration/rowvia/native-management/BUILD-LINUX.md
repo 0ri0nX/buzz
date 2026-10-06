@@ -67,7 +67,7 @@ or a previously created managed cache owned by the caller with mode 700.
 Symlinks, commas, newlines, unmarked directories and unrelated top-level
 contents are rejected. The script creates an absent cache only for an actual
 build and takes a nonblocking exclusive lock. Only `cargo-target` is mounted;
-HOME, Hermit, pnpm, npm and Cargo download caches remain disposable. Source,
+Hermit, pnpm, npm and Cargo download caches remain disposable. Source,
 build and retained cache usage share the existing monitored 25 GiB budget.
 An over-budget cache fails the initial measurement; there is no automatic
 eviction. Cleanup retains the cache after success or failure and deletes only
@@ -86,9 +86,12 @@ variables to a transient container, never through image build arguments or
 image layers.
 
 The container runs as the invoking host UID/GID with a read-only root
-filesystem and Docker logging disabled. Its writable home and tool caches live
-under the disposable bind mount. It uses one Cargo job, two CPUs, 4 GiB RAM, a
-5 GiB RAM plus swap limit, 512 PIDs, and a 512 MiB `/tmp` tmpfs. A host
+filesystem and Docker logging disabled. HOME follows the image default; explicit
+`CARGO_HOME`, `HERMIT_STATE_DIR`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+`NPM_CONFIG_CACHE` and the pnpm store point below the writable disposable bind
+mount. The next real image build must validate operation with the default HOME.
+It uses one Cargo job, two CPUs, 5 GiB RAM, zero swap, 512 PIDs,
+and a 512 MiB `/tmp` tmpfs. A host
 monitor stops it if the disposable source/build tree grows beyond 25 GiB.
 With `--cache-dir`, the monitor sums that tree and the retained cache.
 Hermit, pnpm, Cargo, and

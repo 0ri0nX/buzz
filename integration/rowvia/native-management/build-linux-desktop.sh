@@ -225,7 +225,6 @@ mkdir -- "$scratch/source"
 git -C "$repo" archive --format=tar "$revision" | tar -xf - -C "$scratch/source"
 initial_kib=$(measure_scratch_kib) || die "cannot measure source archive size"
 ((initial_kib <= max_kib)) || die "source archive exceeds scratch limit"
-mkdir -- "$scratch/source/.home"
 
 # The only accepted build inputs are the fixed values and two public identities.
 export BUZZ_BUILD_ROWVIA_MANAGEMENT_ORIGIN=$management_origin
@@ -257,7 +256,6 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
   --env BUZZ_BUILD_CERBERUS_PUBKEY \
   --env ROWVIA_BUILD_MODE="$build_mode" \
   --env CARGO_BUILD_JOBS=1 --env CARGO_INCREMENTAL=0 \
-  --env HOME=/work/source/.home \
   --env CARGO_HOME=/work/source/.cargo-home \
   --env HERMIT_STATE_DIR=/work/source/.hermit-state \
   --env XDG_CACHE_HOME=/work/source/.cache \
