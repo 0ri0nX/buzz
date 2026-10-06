@@ -65,7 +65,12 @@ case $1 in
   run)
     [[ " $* " = *' --read-only '* && " $* " = *' --log-driver=none '* ]] || exit 80
     [[ " $* " = *" --user $(id -u):$(id -g) "* ]] || exit 81
-    [[ " $* " = *' --env HOME=/work/source/.home '* ]] || exit 82
+    for argument in "$@"; do
+      case $argument in HOME=*|home=*|CODEX_HOME=*) exit 82;; esac
+    done
+    for cache in CARGO_HOME=.cargo-home HERMIT_STATE_DIR=.hermit-state XDG_CACHE_HOME=.cache XDG_DATA_HOME=.local/share NPM_CONFIG_CACHE=.npm-cache; do
+      [[ " $* " = *" --env ${cache%%=*}=/work/source/${cache#*=} "* ]] || exit 82
+    done
     for argument in "$@"; do
       case $argument in
         ROWVIA_BUILD_MODE=*) container_build_mode=${argument#ROWVIA_BUILD_MODE=} ;;
