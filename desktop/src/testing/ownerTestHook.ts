@@ -12,6 +12,10 @@ import { getIdentity } from "@/shared/api/tauriIdentity";
 import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import type { Channel } from "@/shared/api/types";
 import {
+  reportOwnerTestPhase,
+  type OwnerTestPhaseReporter,
+} from "./ownerTestHookPhases";
+import {
   OWNER_TEST_SCHEMA,
   ownerTestRequestSchema,
   type OwnerTestCode,
@@ -28,7 +32,9 @@ class HookFailure extends Error {
 }
 
 /** A session-local allowlist; only hook-created private streams are accessible. */
-export function createOwnerTestHandler() {
+export function createOwnerTestHandler(
+  reportPhase: OwnerTestPhaseReporter = reportOwnerTestPhase,
+) {
   const seen = new Set<string>();
   // At most one successful send per accepted request (the ledger caps at 128).
   // Only native-confirmed sends in this handler's lifetime establish targets.
@@ -59,8 +65,18 @@ export function createOwnerTestHandler() {
     const scope = JSON.stringify(request.expected);
     if (fenced || (boundScope !== null && scope !== boundScope))
       throw new HookFailure("scope_mismatch");
-    const identity = await getIdentity();
-    const relayUrl = await getRelayWsUrl();
+    reportPhase("identity_started");
+    const identity = await getIdentity().catch((error: unknown) => {
+      reportPhase("identity_error");
+      throw error;
+    });
+    reportPhase("identity_ready");
+    reportPhase("relay_started");
+    const relayUrl = await getRelayWsUrl().catch((error: unknown) => {
+      reportPhase("relay_error");
+      throw error;
+    });
+    reportPhase("relay_ready");
     if (
       fenced ||
       identity.pubkey !== request.expected.ownerPubkey ||
@@ -301,23 +317,32 @@ export function createOwnerTestHandler() {
 }
 
 /** Installed only through the explicitly opted-in build's dynamic import. */
-export async function installOwnerTestHook() {
-  const handle = createOwnerTestHandler();
+export async function installOwnerTestHook(
+  reportPhase: OwnerTestPhaseReporter = reportOwnerTestPhase,
+) {
+  const handle = createOwnerTestHandler(reportPhase);
+  reportPhase("registration_started");
   const unlisten = await listen<unknown>(
     "rowvia-owner-test-request",
     async ({ payload }) => {
+      reportPhase("request_received");
       const response = await handle(payload);
+      reportPhase("reply_started");
       try {
         await invokeTauri("rowvia_owner_test_reply", { response });
+        reportPhase("reply_accepted");
       } catch (error) {
+        reportPhase("reply_failed");
         handle.fence();
         throw error;
       }
     },
   ).catch((error: unknown) => {
+    reportPhase("registration_failed");
     handle.dispose();
     throw error;
   });
+  reportPhase("registration_ready");
   return () => {
     unlisten();
     handle.dispose();

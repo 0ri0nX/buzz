@@ -357,6 +357,62 @@ pub(crate) fn rowvia_owner_test_reply(
     result
 }
 
+fn checked_phase(
+    window_label: &str,
+    hook_enabled: bool,
+    shutdown: bool,
+    phase: &str,
+) -> Result<&'static str, &'static str> {
+    if window_label != "main" {
+        return Err("invalid_response");
+    }
+    if !hook_enabled {
+        return Err("hook_disabled");
+    }
+    if shutdown {
+        return Err("shutdown");
+    }
+    // Return literals, never an untrusted input or a serde variant error.
+    match phase {
+        "bootstrap_started" => Ok("bootstrap_started"),
+        "bootstrap_completed" => Ok("bootstrap_completed"),
+        "bootstrap_failed" => Ok("bootstrap_failed"),
+        "registration_started" => Ok("registration_started"),
+        "registration_ready" => Ok("registration_ready"),
+        "registration_failed" => Ok("registration_failed"),
+        "request_received" => Ok("request_received"),
+        "identity_started" => Ok("identity_started"),
+        "identity_ready" => Ok("identity_ready"),
+        "identity_error" => Ok("identity_error"),
+        "relay_started" => Ok("relay_started"),
+        "relay_ready" => Ok("relay_ready"),
+        "relay_error" => Ok("relay_error"),
+        "reply_started" => Ok("reply_started"),
+        "reply_accepted" => Ok("reply_accepted"),
+        "reply_failed" => Ok("reply_failed"),
+        _ => Err("invalid_phase"),
+    }
+}
+
+/// Write only closed phase markers for the opted-in main webview hook.
+#[tauri::command]
+pub(crate) async fn rowvia_owner_test_phase(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    phase: String,
+) -> Result<(), &'static str> {
+    let hook = app.try_state::<Arc<Hook>>();
+    let phase = checked_phase(
+        window.label(),
+        hook.is_some(),
+        hook.as_ref().is_some_and(|hook| hook.cancel.is_cancelled()),
+        &phase,
+    )?;
+    // No request payload, arbitrary error text, or identity/ledger mutex access.
+    eprintln!("rowvia-owner-test-phase: {phase}");
+    Ok(())
+}
+
 async fn serve(listener: UnixListener, app: tauri::AppHandle, hook: Arc<Hook>) {
     let permits = Arc::new(Semaphore::new(MAX_PENDING));
     let mut tasks = tokio::task::JoinSet::new();
@@ -486,6 +542,50 @@ async fn wait_for_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn phases_require_active_main_scope_and_never_echo_invalid_input() {
+        for phase in [
+            "bootstrap_started",
+            "bootstrap_completed",
+            "bootstrap_failed",
+            "registration_started",
+            "registration_ready",
+            "registration_failed",
+            "request_received",
+            "identity_started",
+            "identity_ready",
+            "identity_error",
+            "relay_started",
+            "relay_ready",
+            "relay_error",
+            "reply_started",
+            "reply_accepted",
+            "reply_failed",
+        ] {
+            assert_eq!(checked_phase("main", true, false, phase), Ok(phase));
+            assert_eq!(
+                checked_phase("other", true, false, phase),
+                Err("invalid_response")
+            );
+            assert_eq!(
+                checked_phase("main", false, false, phase),
+                Err("hook_disabled")
+            );
+            assert_eq!(checked_phase("main", true, true, phase), Err("shutdown"));
+        }
+        for rejected in [
+            "",
+            "secret_value",
+            "reply_accepted\nsecret_value",
+            "IDENTITY_READY",
+        ] {
+            assert_eq!(
+                checked_phase("main", true, false, rejected),
+                Err("invalid_phase")
+            );
+        }
+    }
+
     fn request() -> Request {
         Request {
             schema: SCHEMA.into(),
