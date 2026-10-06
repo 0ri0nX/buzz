@@ -48,7 +48,8 @@ globalThis.window = {
       }
       if (
         command === "plugin:event|unlisten" ||
-        command === "rowvia_owner_test_reply"
+        command === "rowvia_owner_test_reply" ||
+        command === "rowvia_owner_test_phase"
       )
         return;
       if (command === "get_identity")
@@ -101,6 +102,9 @@ const { createOwnerTestHandler, installOwnerTestHook } = await import(
   "./ownerTestHook.ts"
 );
 const { OWNER_TEST_SCHEMA } = await import("./ownerTestHookProtocol.ts");
+const { createOwnerTestPhaseReporter } = await import(
+  "./ownerTestHookPhases.ts"
+);
 
 // Mock native invoke and the session/transport boundary; retain the stock
 // native send wrapper, independent JS publisher, reads and mention handling.
@@ -382,6 +386,107 @@ test("installed hook disposal removes the Tauri listener and relay subscription"
     command: "plugin:event|unlisten",
     args: { event: ownerRequestEvent, eventId },
   });
+});
+
+test("enabled installation markers follow the actual status IPC path", async () => {
+  reset();
+  const payload = nativeStatusRequest();
+  setNativeScope(payload);
+  const dispose = await installOwnerTestHook(
+    createOwnerTestPhaseReporter(true),
+  );
+  try {
+    await dispatchNativeRequest(payload);
+    assert.deepEqual(
+      calls.map((call) =>
+        call.command === "rowvia_owner_test_phase"
+          ? call.args.phase
+          : call.command,
+      ),
+      [
+        "registration_started",
+        "plugin:event|listen",
+        "registration_ready",
+        "request_received",
+        "identity_started",
+        "get_identity",
+        "identity_ready",
+        "relay_started",
+        "get_relay_ws_url",
+        "relay_ready",
+        "reply_started",
+        "rowvia_owner_test_reply",
+        "reply_accepted",
+      ],
+    );
+    assert.deepEqual(replies()[0].args, {
+      response: expectedStatusReply(payload),
+    });
+    for (const call of calls.filter(
+      (call) => call.command === "rowvia_owner_test_phase",
+    ))
+      assert.deepEqual(Object.keys(call.args), ["phase"]);
+  } finally {
+    dispose();
+  }
+});
+
+test("phase reporting cannot replace registration, identity, relay or reply failures", async () => {
+  for (const command of [
+    "plugin:event|listen",
+    "get_identity",
+    "get_relay_ws_url",
+    "rowvia_owner_test_reply",
+  ]) {
+    reset();
+    const payload = nativeStatusRequest();
+    setNativeScope(payload);
+    const failure = new Error("original business failure");
+    nativeOverrides.set(command, () => {
+      throw failure;
+    });
+    nativeOverrides.set("rowvia_owner_test_phase", () => {
+      throw new Error("private diagnostic failure");
+    });
+    const report = createOwnerTestPhaseReporter(true);
+    if (command === "plugin:event|listen") {
+      await assert.rejects(
+        installOwnerTestHook(report),
+        (error) => error === failure,
+      );
+    } else {
+      const dispose = await installOwnerTestHook(report);
+      try {
+        if (command === "rowvia_owner_test_reply")
+          await assert.rejects(
+            dispatchNativeRequest(payload),
+            /original business failure/,
+          );
+        else {
+          await dispatchNativeRequest(payload);
+          assert.deepEqual(replies()[0].args.response, {
+            schema: payload.schema,
+            requestId: payload.requestId,
+            status: "unknown",
+            code: "operation_failed",
+          });
+        }
+      } finally {
+        dispose();
+      }
+    }
+    const phases = calls
+      .filter((call) => call.command === "rowvia_owner_test_phase")
+      .map((call) => call.args.phase);
+    const expectedFailure = {
+      "plugin:event|listen": "registration_failed",
+      get_identity: "identity_error",
+      get_relay_ws_url: "relay_error",
+      rowvia_owner_test_reply: "reply_failed",
+    }[command];
+    assert.ok(phases.includes(expectedFailure));
+    assert.equal(calls.filter((call) => call.command === command).length, 1);
+  }
 });
 async function create(handler) {
   const result = await handler(

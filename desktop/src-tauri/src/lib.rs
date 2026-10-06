@@ -208,6 +208,17 @@ pub fn run() {
     // builds; see that module for why.
     let builder = ptt_shortcut::install(builder);
 
+    #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+    let builder = builder.on_page_load(|webview, payload| {
+        let phase = match payload.event() {
+            tauri::webview::PageLoadEvent::Started => owner_test_hook::NativePhase::PageLoadStarted,
+            tauri::webview::PageLoadEvent::Finished => {
+                owner_test_hook::NativePhase::PageLoadFinished
+            }
+        };
+        owner_test_hook::report_native_phase(webview.app_handle(), webview.label(), phase);
+    });
+
     // Register the updater only in configured release builds; omit it locally.
     #[cfg(buzz_updater_enabled)]
     let builder = if cfg!(debug_assertions) {
@@ -240,6 +251,12 @@ pub fn run() {
             let app_handle = app.handle().clone();
             #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
             owner_test_hook::setup(&app_handle)?;
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::SetupEntered,
+            );
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;
@@ -272,6 +289,12 @@ pub fn run() {
                 state
                     .reset_failed
                     .store(true, std::sync::atomic::Ordering::Release);
+                #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+                owner_test_hook::report_native_phase(
+                    &app_handle,
+                    "main",
+                    owner_test_hook::NativePhase::SetupCompleted,
+                );
                 return Ok(());
             }
 
@@ -281,6 +304,12 @@ pub fn run() {
             } else {
                 migration::run_boot_migrations(&app_handle);
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::MigrationsReady,
+            );
 
             // Resolve persisted identity key (env var → file → generate+save).
             // This is fatal — the app should not start with an ephemeral identity
@@ -291,6 +320,12 @@ pub fn run() {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::IdentityReady,
+            );
 
             // When the identity is in recovery mode (lost = keyring empty after
             // migration, or keyring-locked = keyring unreachable but marker
@@ -433,6 +468,12 @@ pub fn run() {
             }
 
             try_regenerate_nest(&app_handle);
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::NestReady,
+            );
 
             if let Some(mgr) = huddle::models::global_model_manager() {
                 mgr.start_stt_download(state.http_client.clone());
@@ -522,6 +563,12 @@ pub fn run() {
                     }
                 });
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::SetupCompleted,
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -880,6 +927,8 @@ pub fn run() {
             set_window_vibrancy,
             #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
             owner_test_hook::rowvia_owner_test_reply,
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::rowvia_owner_test_phase,
             #[cfg(target_os = "macos")]
             tray_menu::clear_tray_agent_activity,
             #[cfg(target_os = "macos")]
