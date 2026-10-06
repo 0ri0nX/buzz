@@ -87,9 +87,11 @@ image layers.
 
 The container runs as the invoking host UID/GID with a read-only root
 filesystem and Docker logging disabled. HOME follows the image default; explicit
-`CARGO_HOME`, `HERMIT_STATE_DIR`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+`CARGO_HOME`, `HERMIT_STATE_DIR`, `HERMIT_BIN_INSTALL_DIR`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
 `NPM_CONFIG_CACHE` and the pnpm store point below the writable disposable bind
 mount. The next real image build must validate operation with the default HOME.
+The pinned Hermit installer uses `HERMIT_BIN_INSTALL_DIR` for its bootstrap
+launcher and symlink, avoiding its default `${HOME}/bin` path when HOME is absent.
 It uses one Cargo job, two CPUs, 5 GiB RAM, zero swap, 512 PIDs,
 and a 512 MiB `/tmp` tmpfs. A host
 monitor stops it if the disposable source/build tree grows beyond 25 GiB.
