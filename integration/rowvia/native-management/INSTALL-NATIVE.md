@@ -21,6 +21,10 @@ updating the pinned digest in the installer.
 Its tracked source is Rowvia Context's `integration/architect-live/buzz-desktop.sh`;
 the workspace copy must stay byte-identical to that reviewed source. The current
 pin includes explicit owner-test-hook configuration and socket readiness checks.
+It also includes Core #52's bounded shutdown from accepted source commit `29199b7`
+(merged by PR #53): 105-second stop observation, bounded helper queries and cgroup
+content reads, and `TimeoutStopSec=15s` for future units. This source update does
+not establish live activation or Desktop restart acceptance.
 After this installer's separate stop/start (or a reboot), re-enable the temporary
 test hook with `scripts/buzz-desktop restart --owner-hook` when running pilot tests;
 an ordinary restart preserves it only while the transient unit setting exists.
