@@ -6,6 +6,161 @@ build=$script_dir/build-linux-desktop.sh
 scratch=$(mktemp -d /home/orionx/rowvia-build-test.XXXXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 
+# Exercise the exact installer pinned by bin/hermit without network access.
+# Keep this upstream snapshot pinned to reproduce its empty-HOME bootstrap path.
+cat >"$scratch/hermit-installer.sh" <<'HERMIT_INSTALLER'
+#!/bin/bash
+
+# shellcheck disable=SC2018,SC2019
+# SC2019: Use '[:upper:]' to support accents and foreign alphabets.
+# SC2018: Use '[:lower:]' to support accents and foreign alphabets.
+
+
+set -euo pipefail
+
+if [ -z "${HERMIT_STATE_DIR:-}" ]; then
+  case "$(uname -s)" in
+  Darwin)
+    HERMIT_STATE_DIR_RAW="\${HOME}/Library/Caches/hermit"
+    ;;
+  Linux)
+    HERMIT_STATE_DIR_RAW="\${XDG_CACHE_HOME:-\${HOME}/.cache}/hermit"
+    ;;
+  esac
+  eval HERMIT_STATE_DIR="${HERMIT_STATE_DIR_RAW}"
+else
+  HERMIT_STATE_DIR_RAW="${HERMIT_STATE_DIR}"
+fi
+
+if [ ! "$(type -P curl)"  ]; then
+    echo "No curl detected in the PATH. Please, install curl before installing Hermit"
+    exit 1
+fi
+
+#  This must be in the form <url>/<channel>
+# eg. https://github.com/cashapp/hermit/releases/download/stable
+HERMIT_DIST_URL="${HERMIT_DIST_URL:-https://github.com/cashapp/hermit/releases/download/stable}"
+HERMIT_CHANNEL="$(basename "${HERMIT_DIST_URL}")"
+HERMIT_EXE_RAW="${HERMIT_STATE_DIR_RAW}/pkg/hermit@${HERMIT_CHANNEL}/hermit"
+eval HERMIT_EXE="\${HERMIT_EXE:-${HERMIT_EXE_RAW}}"
+HERMIT_EXE_DIR="$(dirname "${HERMIT_EXE}")"
+
+ID_USER=$(id -u)
+ID_GROUP=$(id -g)
+
+function user_install() {
+  for dir in "${HERMIT_EXE_DIR}" "${HERMIT_STATE_DIR}"; do
+    if [ ! -e "${dir}" ]; then
+      echo "Creating ${dir}"
+      mkdir -p "${dir}"
+      chown "$ID_USER:$ID_GROUP" "${dir}"
+    fi
+
+    if [ ! -w "${dir}" ]; then
+      echo "${dir} is not writeable, making it so"
+      chown "$ID_USER:$ID_GROUP" "${dir}"
+      chmod u+w "${dir}"
+    fi
+  done
+
+  OS="$(uname -s | tr A-Z a-z)"
+  ARCH="$(uname -m | tr A-Z a-z)"
+  if [ "$ARCH" = "x86_64" ]; then
+    ARCH="amd64"
+  elif [ "$ARCH" = "aarch64" ]; then
+    ARCH="arm64"
+  fi
+  URL="${HERMIT_DIST_URL}/hermit-${OS}-${ARCH}.gz"
+  TMP_FILE="${HERMIT_EXE}.download.${RANDOM}"
+  echo "Downloading ${URL} to ${HERMIT_EXE}"
+  chmod -f u+w "${HERMIT_EXE}" 2> /dev/null || true
+  curl -fsSL "${URL}" | gzip -dc > "${TMP_FILE}"
+  chown "$ID_USER:$ID_GROUP" "${TMP_FILE}"
+  chmod u+wx "${TMP_FILE}"
+  mv "${TMP_FILE}" "${HERMIT_EXE}"
+
+  echo "Hermit installed as ${HERMIT_EXE}"
+}
+
+# Install system-wide components
+function system_install() {
+  local HERMIT_INSTALL_NAME=hermit-${HERMIT_CHANNEL}
+  local CREATE_SYMLINK=1
+  # If HERMIT_BIN_INSTALL_DIR is not set, see if we can detect where Hermit was previously installed.
+  if [ -z "${HERMIT_BIN_INSTALL_DIR:-}" ]; then
+    for dir in ${HOME}/bin /opt/homebrew/bin /usr/local/bin; do
+      # shellcheck disable=SC2016
+      if test -x "${dir}/hermit" && grep -Fq ': "${HERMIT' "${dir}/hermit"; then
+        if ! grep -q 'https://github.com/cashapp/hermit/releases/download/stable' "${dir}/hermit"; then
+          echo "Found Hermit in ${dir}/hermit but it is a different distribution, not overwriting."
+          CREATE_SYMLINK=
+        fi
+        HERMIT_BIN_INSTALL_DIR="${dir}"
+        break
+      fi
+    done
+    HERMIT_BIN_INSTALL_DIR="${HERMIT_BIN_INSTALL_DIR:-${HOME}/bin}"
+  fi
+  if [ ! -d "$HERMIT_BIN_INSTALL_DIR" ]; then
+    echo "NOTE: $HERMIT_BIN_INSTALL_DIR should be added to your \$PATH if it is not already"
+    mkdir -p "$HERMIT_BIN_INSTALL_DIR"
+  fi
+
+  if [ -e "$HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME" ]; then
+    echo "Removing the previous $HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME"
+    rm -f "$HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME"
+  fi
+  cat > "$HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME" << EOF
+#!/bin/bash
+: "\${HERMIT_EXE:=${HERMIT_EXE_RAW}}"
+test -x \${HERMIT_EXE} && exec "\${HERMIT_EXE}" "\$@"
+(curl -fsSL "${HERMIT_DIST_URL}/install.sh" | bash) && exec "\${HERMIT_EXE}" "\$@"
+EOF
+  chmod +x "$HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME"
+  if [ -n "${CREATE_SYMLINK}" ]; then
+    echo "Hermit is installed as $HERMIT_BIN_INSTALL_DIR/hermit"
+    ln -fs "$HERMIT_INSTALL_NAME" "$HERMIT_BIN_INSTALL_DIR/hermit"
+  else
+    echo "Hermit is installed as $HERMIT_BIN_INSTALL_DIR/$HERMIT_INSTALL_NAME"
+  fi
+  cat <<-EOF
+
+See https://cashapp.github.io/hermit/usage/get-started/ for more information.
+
+EOF
+}
+
+# Used by system-wide package managers (eg. Homebrew)
+if [ -z "${HERMIT_SKIP_USER_INSTALL:-}" ]; then
+  user_install
+fi
+if [ -z "${HERMIT_SKIP_SYSTEM_INSTALL:-}" ]; then
+  system_install
+fi
+HERMIT_INSTALLER
+[[ $(sha256sum "$scratch/hermit-installer.sh" | cut -d ' ' -f 1) = 09ed936378857886fd4a7a4878c0f0c7e3d839883f39ca8b4f2f242e3126e1c6 ]]
+grep -Fq 'INSTALL_SCRIPT_SHA256="09ed936378857886fd4a7a4878c0f0c7e3d839883f39ca8b4f2f242e3126e1c6"' "$script_dir/../../../bin/hermit"
+mkdir -- "$scratch/bootstrap-bin"
+printf '#!/bin/sh\nexit 0\n' > "$scratch/hermit-binary"
+cat >"$scratch/bootstrap-bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $* = *hermit-linux-amd64.gz* ]] || exit 91
+exec gzip -c "$ROWVIA_TEST_HERMIT_BINARY"
+SH
+chmod +x "$scratch/bootstrap-bin/curl"
+bootstrap_bin=$(sed -n 's/^  --env HERMIT_BIN_INSTALL_DIR=\([^ ]*\) \\/\1/p' "$build")
+[[ $bootstrap_bin = /work/source/.hermit-bin ]]
+env -u HOME -u HERMIT_EXE -u HERMIT_DIST_URL -u HERMIT_SKIP_USER_INSTALL -u HERMIT_SKIP_SYSTEM_INSTALL \
+  HERMIT_STATE_DIR="$scratch/bootstrap-source/.hermit-state" \
+  HERMIT_BIN_INSTALL_DIR="$scratch/bootstrap-source/${bootstrap_bin#/work/source/}" \
+  ROWVIA_TEST_HERMIT_BINARY="$scratch/hermit-binary" \
+  PATH="$scratch/bootstrap-bin:$PATH" bash "$scratch/hermit-installer.sh" >"$scratch/bootstrap-stdout"
+[[ -x $scratch/bootstrap-source/.hermit-state/pkg/hermit@stable/hermit ]]
+[[ -x $scratch/bootstrap-source/.hermit-bin/hermit-stable ]]
+[[ $(readlink "$scratch/bootstrap-source/.hermit-bin/hermit") = hermit-stable ]]
+"$scratch/bootstrap-source/.hermit-bin/hermit" noop
+
 expect_failure() {
   if bash "$build" --dry-run --output "$scratch/output" --identity-file "$scratch/identities.env" "$@" >"$scratch/stdout" 2>"$scratch/stderr"; then
     echo "expected dry-run failure" >&2
@@ -68,7 +223,7 @@ case $1 in
     for argument in "$@"; do
       case $argument in HOME=*|home=*|CODEX_HOME=*) exit 82;; esac
     done
-    for cache in CARGO_HOME=.cargo-home HERMIT_STATE_DIR=.hermit-state XDG_CACHE_HOME=.cache XDG_DATA_HOME=.local/share NPM_CONFIG_CACHE=.npm-cache; do
+    for cache in CARGO_HOME=.cargo-home HERMIT_STATE_DIR=.hermit-state HERMIT_BIN_INSTALL_DIR=.hermit-bin XDG_CACHE_HOME=.cache XDG_DATA_HOME=.local/share NPM_CONFIG_CACHE=.npm-cache; do
       [[ " $* " = *" --env ${cache%%=*}=/work/source/${cache#*=} "* ]] || exit 82
     done
     for argument in "$@"; do
