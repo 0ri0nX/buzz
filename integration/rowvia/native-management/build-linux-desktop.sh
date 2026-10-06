@@ -258,6 +258,7 @@ timeout --signal=TERM --kill-after=30s 6h docker run --rm \
   --env CARGO_BUILD_JOBS=1 --env CARGO_INCREMENTAL=0 \
   --env CARGO_HOME=/work/source/.cargo-home \
   --env HERMIT_STATE_DIR=/work/source/.hermit-state \
+  --env HERMIT_BIN_INSTALL_DIR=/work/source/.hermit-bin \
   --env XDG_CACHE_HOME=/work/source/.cache \
   --env XDG_DATA_HOME=/work/source/.local/share \
   --env NPM_CONFIG_CACHE=/work/source/.npm-cache \
