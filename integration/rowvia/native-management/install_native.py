@@ -28,7 +28,7 @@ NATIVE_BIN = HOME / ".cache/buzz-native-0.5.23/usr/bin"
 CUSTOM_ACP = HOME / ".local/state/rowvia-buzz-mvp/ttc-build-0dd1323d/artifacts/buzz-acp"
 BACKUP_ROOT = HOME / ".local/state/rowvia-buzz-native-install/backups"
 LAUNCHER = Path("/home/orionx/project/RowviaContext/scripts/buzz-desktop")
-LAUNCHER_SHA256 = "0cafd168e129ba9153bcea2da584725f5cd9a60d4ba6de86633c2b6c92c3c4be"
+LAUNCHER_SHA256 = "f40fa8db7a8f917b04d6b2ab42c9bff5cda4754ea6e079e8f9eb4ed115df0180"
 CLI_LINK = HOME / ".local/bin/buzz"
 WRAPPERS = (
     HOME / ".local/state/rowvia-buzz-mvp/run/acp-proxy-desktop.sh",
