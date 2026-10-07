@@ -1020,17 +1020,64 @@ test("disconnect invalidates lifetime channel access", async (t) => {
   );
 });
 
-test("request ledger never evicts identities and rejects when full", async (t) => {
+test("completed status reads retire oldest IDs and keep recent duplicates", async (t) => {
   reset();
   const handler = createOwnerTestHandler();
   t.after(handler.dispose);
   const first = request("status");
   assert.equal((await handler(first)).status, "ok");
+  let last;
   for (let index = 1; index < 128; index++) {
-    assert.equal((await handler(request("status"))).status, "ok");
+    last = request("status");
+    assert.equal((await handler(last)).status, "ok");
+  }
+  assert.equal((await handler(first)).code, "duplicate_request");
+  assert.equal((await handler(request("status"))).status, "ok");
+  assert.equal((await handler(first)).status, "ok");
+  assert.equal((await handler(last)).code, "duplicate_request");
+});
+
+test("completed channel reads remain available beyond 128 requests", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const id = await create(handler);
+  const first = request("read_channel", { channelId: id, limit: 1 });
+  assert.equal((await handler(first)).status, "ok");
+  for (let index = 1; index < 150; index++) {
+    assert.equal(
+      (await handler(request("read_channel", { channelId: id, limit: 1 })))
+        .status,
+      "ok",
+    );
+  }
+  assert.equal((await handler(first)).status, "ok");
+});
+
+test("mutation IDs and unknown reads stay protected when cache fills", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const mutation = request("send_message", {
+    channelId,
+    content: "ROWVIA_E2E_test",
+  });
+  assert.equal((await handler(mutation)).code, "channel_not_owned");
+  nativeOverrides.set("get_identity", () => {
+    throw new Error("identity unavailable");
+  });
+  const unknownRead = request("status");
+  assert.equal((await handler(unknownRead)).status, "unknown");
+  nativeOverrides.delete("get_identity");
+  for (let index = 2; index < 128; index++) {
+    const reply = await handler(
+      request("send_message", { channelId, content: "ROWVIA_E2E_test" }),
+    );
+    assert.equal(reply.code, "channel_not_owned");
   }
   assert.equal((await handler(request("status"))).code, "capacity_exceeded");
-  assert.equal((await handler(first)).code, "duplicate_request");
+  assert.equal((await handler(mutation)).code, "duplicate_request");
+  assert.equal((await handler(unknownRead)).code, "duplicate_request");
 });
 
 test("architect scope drift and signer drift fail closed", async (t) => {
