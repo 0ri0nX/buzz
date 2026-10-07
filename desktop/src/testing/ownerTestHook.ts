@@ -36,7 +36,8 @@ export function createOwnerTestHandler(
   reportPhase: OwnerTestPhaseReporter = reportOwnerTestPhase,
 ) {
   const seen = new Set<string>();
-  // At most one successful send per accepted request (the ledger caps at 128).
+  const completedReads: string[] = [];
+  // At most one successful send per accepted request (mutation IDs are retained).
   // Only native-confirmed sends in this handler's lifetime establish targets.
   const sentEvents = new Map<
     string,
@@ -267,12 +268,17 @@ export function createOwnerTestHandler(
       return { ...response, status: "error", code: "invalid_request" };
     if (seen.has(requestId))
       return { ...response, status: "error", code: "duplicate_request" };
-    if (seen.size >= 128)
-      return { ...response, status: "error", code: "capacity_exceeded" };
+    if (seen.size >= 128) {
+      const retired = completedReads.shift();
+      if (retired === undefined)
+        return { ...response, status: "error", code: "capacity_exceeded" };
+      seen.delete(retired);
+    }
     seen.add(requestId);
     let mutationStarted = false;
+    let outcome: OwnerTestResponse;
     try {
-      return {
+      outcome = {
         ...response,
         status: "ok",
         result: await execute(parsed.data, () => {
@@ -280,7 +286,7 @@ export function createOwnerTestHandler(
         }),
       };
     } catch (error) {
-      return {
+      outcome = {
         ...response,
         status:
           !mutationStarted && error instanceof HookFailure
@@ -289,6 +295,13 @@ export function createOwnerTestHandler(
         code: error instanceof HookFailure ? error.code : "operation_failed",
       };
     }
+    if (
+      (parsed.data.operation === "status" ||
+        parsed.data.operation === "read_channel") &&
+      outcome.status !== "unknown"
+    )
+      completedReads.push(requestId);
+    return outcome;
   }
 
   const handler = (payload: unknown): Promise<OwnerTestResponse> => {

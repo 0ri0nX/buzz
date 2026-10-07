@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -116,6 +116,7 @@ struct Entry {
 #[derive(Default)]
 struct Ledger {
     entries: HashMap<String, Entry>,
+    completed_reads: VecDeque<String>,
 }
 
 enum Admission {
@@ -134,7 +135,7 @@ impl Ledger {
                 })
             });
         }
-        if self.entries.len() >= MAX_CACHE {
+        if self.entries.len() >= MAX_CACHE && self.completed_reads.is_empty() {
             return Admission::Return(Response::failure(
                 &request.request_id,
                 Status::Error,
@@ -153,6 +154,17 @@ impl Ledger {
                 Status::Error,
                 Code::Busy,
             ));
+        }
+        if self.entries.len() >= MAX_CACHE {
+            if let Some(id) = self.completed_reads.pop_front() {
+                self.entries.remove(&id);
+            } else {
+                return Admission::Return(Response::failure(
+                    &request.request_id,
+                    Status::Error,
+                    Code::CacheFull,
+                ));
+            }
         }
         let (tx, rx) = oneshot::channel();
         self.entries.insert(
@@ -178,6 +190,11 @@ impl Ledger {
             return Err("duplicate_request");
         }
         entry.response = Some(response.clone());
+        if matches!(entry.request.operation.as_str(), "status" | "read_channel")
+            && response.status != Status::Unknown
+        {
+            self.completed_reads.push_back(response.request_id.clone());
+        }
         if let Some(tx) = entry.pending.take() {
             // Retain the result even when the socket caller has disconnected.
             let _ = tx.send(response);
@@ -750,32 +767,174 @@ mod tests {
             .is_err());
         let timed_out = Response::failure(&r.request_id, Status::Unknown, Code::Timeout);
         assert!(ledger.complete(timed_out.clone()).is_ok());
-        assert!(ledger.complete(timed_out).is_err());
+        assert!(ledger.complete(timed_out.clone()).is_err());
         let Admission::Return(repeated) = ledger.admit(&r) else {
             panic!("duplicate was dispatched")
         };
-        assert_eq!(repeated.status, Status::Unknown);
+        assert_eq!(
+            serde_json::to_value(repeated).unwrap(),
+            serde_json::to_value(timed_out).unwrap()
+        );
         let mut changed = r;
         changed.operation = "send_message".into();
         assert!(matches!(ledger.admit(&changed), Admission::Return(_)));
     }
 
     #[test]
-    fn capacity_does_not_evict_previous_ids() {
+    fn completed_reads_retire_oldest_id_when_full() {
         let mut ledger = Ledger::default();
         let first = request();
-        for r in std::iter::once(first.clone()).chain((1..MAX_CACHE).map(|_| request())) {
+        let mut last = first.clone();
+        for index in 0..(MAX_CACHE + 32) {
+            let mut r = if index == 0 { first.clone() } else { request() };
+            if index % 2 == 1 {
+                r.operation = "read_channel".into();
+            }
             assert!(matches!(ledger.admit(&r), Admission::Dispatch(_)));
             assert!(ledger
                 .complete(Response::failure(
                     &r.request_id,
-                    Status::Unknown,
-                    Code::Timeout
+                    Status::Error,
+                    Code::NotReady
+                ))
+                .is_ok());
+            if index == MAX_CACHE - 1 {
+                let Admission::Return(cached) = ledger.admit(&first) else {
+                    panic!("retained read was dispatched")
+                };
+                assert_eq!(
+                    serde_json::to_value(&cached).unwrap(),
+                    serde_json::to_value(Response::failure(
+                        &first.request_id,
+                        Status::Error,
+                        Code::NotReady
+                    ))
+                    .unwrap()
+                );
+            }
+            last = r;
+        }
+        assert_eq!(ledger.entries.len(), MAX_CACHE);
+        assert_eq!(ledger.completed_reads.len(), MAX_CACHE);
+        assert!(matches!(ledger.admit(&first), Admission::Dispatch(_)));
+        let Admission::Return(cached) = ledger.admit(&last) else {
+            panic!("recent read was dispatched")
+        };
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(Response::failure(
+                &last.request_id,
+                Status::Error,
+                Code::NotReady
+            ))
+            .unwrap()
+        );
+        assert_eq!(ledger.entries.len(), MAX_CACHE);
+    }
+
+    #[test]
+    fn protected_requests_exhaust_cache_without_eviction() {
+        let mut ledger = Ledger::default();
+        let mut mutation = request();
+        mutation.operation = "send_message".into();
+        assert!(matches!(ledger.admit(&mutation), Admission::Dispatch(_)));
+        assert!(ledger
+            .complete(Response::failure(
+                &mutation.request_id,
+                Status::Error,
+                Code::ChannelNotOwned
+            ))
+            .is_ok());
+        let mut unknown_read = request();
+        unknown_read.operation = "read_channel".into();
+        assert!(matches!(
+            ledger.admit(&unknown_read),
+            Admission::Dispatch(_)
+        ));
+        assert!(ledger
+            .complete(Response::failure(
+                &unknown_read.request_id,
+                Status::Unknown,
+                Code::Timeout
+            ))
+            .is_ok());
+        for _ in 2..MAX_CACHE {
+            let mut r = request();
+            r.operation = "create_private_stream".into();
+            assert!(matches!(ledger.admit(&r), Admission::Dispatch(_)));
+            assert!(ledger
+                .complete(Response::failure(
+                    &r.request_id,
+                    Status::Error,
+                    Code::NotReady
                 ))
                 .is_ok());
         }
         assert!(matches!(ledger.admit(&request()), Admission::Return(_)));
-        assert!(matches!(ledger.admit(&first), Admission::Return(_)));
+        assert!(matches!(ledger.admit(&mutation), Admission::Return(_)));
+        assert!(matches!(ledger.admit(&unknown_read), Admission::Return(_)));
+        assert_eq!(ledger.entries.len(), MAX_CACHE);
+    }
+
+    #[test]
+    fn full_protected_cache_takes_priority_over_pending_limit() {
+        let mut ledger = Ledger::default();
+        for _ in 0..(MAX_CACHE - MAX_PENDING) {
+            let mut r = request();
+            r.operation = "send_message".into();
+            assert!(matches!(ledger.admit(&r), Admission::Dispatch(_)));
+            assert!(ledger
+                .complete(Response::failure(
+                    &r.request_id,
+                    Status::Error,
+                    Code::NotReady
+                ))
+                .is_ok());
+        }
+        for _ in 0..MAX_PENDING {
+            assert!(matches!(ledger.admit(&request()), Admission::Dispatch(_)));
+        }
+        let Admission::Return(denied) = ledger.admit(&request()) else {
+            panic!("full cache dispatched a request")
+        };
+        assert!(matches!(denied.code, Some(Code::CacheFull)));
+        assert_eq!(ledger.entries.len(), MAX_CACHE);
+        assert!(ledger.completed_reads.is_empty());
+    }
+
+    #[test]
+    fn busy_refusal_does_not_retire_a_completed_read() {
+        let mut ledger = Ledger::default();
+        let read = request();
+        assert!(matches!(ledger.admit(&read), Admission::Dispatch(_)));
+        assert!(ledger
+            .complete(Response::failure(
+                &read.request_id,
+                Status::Error,
+                Code::NotReady
+            ))
+            .is_ok());
+        for _ in 1..(MAX_CACHE - MAX_PENDING) {
+            let mut r = request();
+            r.operation = "send_message".into();
+            assert!(matches!(ledger.admit(&r), Admission::Dispatch(_)));
+            assert!(ledger
+                .complete(Response::failure(
+                    &r.request_id,
+                    Status::Error,
+                    Code::NotReady
+                ))
+                .is_ok());
+        }
+        for _ in 0..MAX_PENDING {
+            assert!(matches!(ledger.admit(&request()), Admission::Dispatch(_)));
+        }
+        let Admission::Return(denied) = ledger.admit(&request()) else {
+            panic!("busy ledger dispatched a request")
+        };
+        assert!(matches!(denied.code, Some(Code::Busy)));
+        assert!(matches!(ledger.admit(&read), Admission::Return(_)));
+        assert_eq!(ledger.completed_reads.len(), 1);
         assert_eq!(ledger.entries.len(), MAX_CACHE);
     }
 
