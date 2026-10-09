@@ -230,6 +230,7 @@ def main() -> None:
         production_closed = installer._closed
         original_path = installer.Path
         original_run = installer.subprocess.run
+        original_readlink = installer.os.readlink
         proc = root / "fake-proc"
         cgroup = root / "fake-cgroup"
         proc.mkdir()
@@ -254,6 +255,18 @@ def main() -> None:
 
         installer.Path = routed_path
         installer.subprocess.run = fake_show
+        opaque_process = proc / "124"
+        opaque_process.mkdir()
+        assert opaque_process.stat().st_uid == os.getuid()
+
+        def opaque_readlink(path: object, **kwargs: object) -> str:
+            """Model an unrelated same-UID host agent with an inaccessible exe."""
+
+            if path == opaque_process / "exe":
+                raise PermissionError("opaque unrelated host process")
+            return original_readlink(path, **kwargs)
+
+        installer.os.readlink = opaque_readlink
         try:
             production_closed(pinned)
             for property_name, bad_value in (("ActiveState", "active"), ("MainPID", "1")):
@@ -288,6 +301,7 @@ def main() -> None:
         finally:
             installer.Path = original_path
             installer.subprocess.run = original_run
+            installer.os.readlink = original_readlink
         installer._closed = lambda _layout: None
         installer.preflight(desktop, sidecars, pinned)
         helper = sidecars / installer.ROOT_HELPERS[0]

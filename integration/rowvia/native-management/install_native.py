@@ -233,7 +233,8 @@ def _closed(layout: Layout) -> None:
         except FileNotFoundError:
             continue
         except PermissionError:
-            _require(entry.stat().st_uid != os.getuid(), "owned native reader inspection denied")
+            # Unrelated host agents can hide exe even from their own UID. The
+            # selected unit/cgroup must be empty; global inspection is best-effort.
             continue
         _require(executable not in selected, "selected native reader remains active")
 

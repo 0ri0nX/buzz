@@ -86,6 +86,12 @@ special entries before downtime. Existing owned primary-group modes, including
 0664/0775 app state, are preserved inside private snapshot custody.
 The snapshot is bounded to 20,000 entries/2 GiB.
 Fallback identity bytes and all snapshot content remain opaque and private.
+Closure requires the stopped Desktop unit, MainPID zero and an empty selected
+cgroup including descendants; readable selected native executables anywhere on
+the host also block capture or restore. Unrelated processes with inaccessible
+`/proc/PID/exe` links do not block recovery. This is a trusted-host MVP gate, not
+proof that an opaque process outside the Desktop cgroup cannot run a selected
+binary; the operator must not launch separate native writers during the upgrade.
 
 The new root contains Desktop, CLI, ACP, `buzz-agent`,
 `buzz-backend-kubernetes`, `buzz-dev-mcp`, and `git-credential-nostr` from the
