@@ -2,7 +2,7 @@
 
 ## Active
 
-- [ ] BUZZ-527-BUILD — Separately repin and verify native build/install provenance and accepted artifacts under the bounded build process.
+- [-] BUZZ-527-BUILD — Actual Desktop765 source/live-owner-hook build and independent ELF/host-loader/provenance gate passed; actual same-source six-sidecar build and focused frontend checks ongoing. Coherent artifacts not yet accepted.
 - [ ] BUZZ-527-DEPLOY — Separately install the accepted paired Desktop/sidecar artifacts with protected state and rollback evidence.
 - [ ] BUZZ-527-LIVE — Separately observe the real owner workflow and UI after deployment without inferring it from synthetic tests.
 
