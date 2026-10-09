@@ -43,6 +43,16 @@ class AddMembersException implements Exception {
   String toString() => 'AddMembersException($message)';
 }
 
+/// The keys in a DM. Current membership is authoritative. The channel
+/// metadata's `p` tags can lag membership changes, so they count only when
+/// the membership snapshot is unavailable or empty.
+Iterable<String> dmParticipantPubkeys(
+  Channel channel,
+  List<ChannelMember>? members,
+) => members != null && members.isNotEmpty
+    ? members.map((member) => member.pubkey)
+    : channel.participantPubkeys;
+
 @immutable
 class ChannelMember {
   final String pubkey;
@@ -585,6 +595,24 @@ final channelMembersProvider = FutureProvider.autoDispose
       );
       return members;
     });
+
+/// The latest roster for [channelId] in the current relay, account, and
+/// channel scope, or null if none has loaded in that scope yet.
+///
+/// While [channelMembersProvider] reloads (for example after a kind:39002
+/// update), this keeps the roster from the last completed load in the same
+/// scope instead of dropping it. Another relay or account never sees it.
+List<ChannelMember>? watchLatestChannelMembers(Ref ref, String channelId) {
+  final loaded = ref.watch(channelMembersProvider(channelId)).asData?.value;
+  if (loaded != null) return loaded;
+  return ref
+      .read(_channelMembersSnapshotCacheProvider)
+      .read(
+        relayBaseUrl: ref.watch(relayConfigProvider).baseUrl,
+        pubkey: ref.watch(myPubkeyProvider)?.toLowerCase(),
+        channelId: channelId,
+      );
+}
 
 /// Channel canvas (kind:40100 for the channel).
 final channelCanvasProvider = FutureProvider.family<ChannelCanvas, String>((

@@ -58,24 +58,27 @@ pub const DB_CONNECTION_TERMINALS: [(DbPoolRole, DbConnectionStep, DbConnectionO
 /// Raw Prometheus series ceiling per pod for connection-step telemetry.
 pub const DB_CONNECTION_RAW_SERIES_PER_POD: usize = runtime::CONNECTION_RAW_SERIES_PER_POD;
 pub(crate) use runtime::{
-    insert_mentions_in_transaction, observability, route_proof, ReadSessionInner, RouteDecision,
-    RoutePredicate,
+    begin_community_event_write_transaction,
+    begin_community_event_write_transaction_with_legacy_metrics, insert_mentions_in_transaction,
+    observability, route_proof, ReadSessionInner, RouteDecision, RoutePredicate,
 };
 pub use store::{
-    admin_moderation, allowlist, api_token, archived_identities, channel, channel_members,
-    community, deletion, dm, event, feed, git_repo, moderation, partition, product_feedback, push,
-    reaction, relay_admin_actions, relay_invite, relay_members, relay_operators, reminder,
-    replaceable, storage_accounting, thread, usage, user, workflow,
+    admin_moderation, allowlist, api_token, archived_identities, artifact, channel,
+    channel_members, community, deletion, dm, event, feed, git_repo, moderation, operator_listener,
+    partition, product_feedback, push, reaction, read_state, relay_admin_actions, relay_invite,
+    relay_members, relay_operators, reminder, replaceable, storage_accounting, thread,
+    thread_window, usage, user, workflow,
 };
 
 pub use allowlist::AllowlistEntry;
 pub use api_token::{ApiTokenRecord, TokenSummary};
 pub use community::{
     ArchivedCommunityRecord, CommunityRecord, CreateCommunityWithOwnerResult,
-    CreatedCommunityRecord, EnsuredCommunityRecord, OwnedCommunityRecord,
+    CreatedCommunityRecord, EnsuredCommunityRecord, OwnedCommunityRecord, UnarchiveCommunityResult,
     UnarchivedCommunityRecord,
 };
 pub use error::{DbError, Result};
+pub use event::{ChannelHeadPrecondition, ChannelHeadWriteStatus};
 pub use event::{EventQuery, DEFAULT_MAX_PAGE_LIMIT};
 pub use reaction::ReactionEventInsertOutcome;
 pub use reminder::DueReminder;

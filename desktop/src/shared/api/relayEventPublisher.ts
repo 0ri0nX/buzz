@@ -13,20 +13,32 @@ type PublishSession = {
   recoverSocketFailure: (error: unknown, fallback: string) => Error;
 };
 
-/** Publish once, with one reconnect retry, without crossing session ownership. */
+/** Typed so no relay rejection text can be mistaken for a caller's cancel. */
+export class PublishCanceledError extends Error {
+  constructor() {
+    super("Relay publish canceled by its caller.");
+    this.name = "PublishCanceledError";
+  }
+}
+
+/**
+ * Publish once, with one reconnect retry, without crossing session ownership.
+ * `currentCheck`, when given, is checked immediately before every socket send.
+ * A false result cancels; a thrown scope error is preserved for the caller.
+ */
 export async function publishSessionEvent(
   session: PublishSession,
   event: RelayEvent,
   timeoutMessage: string,
   sendErrorMessage: string,
-  assertScope?: () => void,
+  currentCheck?: () => void | boolean,
 ): Promise<RelayEvent> {
   const publishOwnership = session.ownership();
   await waitForRateLimit();
   if (publishOwnership !== session.ownership()) {
     throw new Error("Relay disconnected for community switch.");
   }
-  assertScope?.();
+  if (currentCheck?.() === false) throw new PublishCanceledError();
   const publishGeneration = session.generation();
 
   return new Promise<RelayEvent>((resolve, reject) => {
@@ -68,7 +80,7 @@ export async function publishSessionEvent(
             );
           }
           try {
-            assertScope?.();
+            if (currentCheck?.() === false) throw new PublishCanceledError();
           } catch (scopeError) {
             window.clearTimeout(timeout);
             session.pendingEvents.delete(event.id);
