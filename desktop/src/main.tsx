@@ -23,6 +23,7 @@ import { recoverLocalStorageQuotaOnStartup } from "@/shared/lib/localStorageQuot
 import { startLocalStorageSweep } from "@/shared/lib/localStorageSweep";
 import { initializeConversationDensityPreference } from "@/shared/lib/conversationDensityPreference";
 import { initializeFontSizePreference } from "@/shared/lib/fontSizePreference";
+import { runOwnerTestBootstrap } from "@/testing/ownerTestHookPhases";
 
 type E2eWindow = Window & {
   __BUZZ_E2E__?: unknown;
@@ -134,6 +135,10 @@ async function bootstrap() {
   await installE2eBridgeIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
   renderApp();
+  if (import.meta.env.VITE_ROWVIA_OWNER_TEST_HOOK === "1") {
+    const { installOwnerTestHook } = await import("@/testing/ownerTestHook");
+    await installOwnerTestHook();
+  }
 }
 
-void bootstrap();
+void runOwnerTestBootstrap(bootstrap);

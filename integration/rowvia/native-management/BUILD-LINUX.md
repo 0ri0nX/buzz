@@ -1,0 +1,121 @@
+# Isolated Linux Buzz Desktop build
+
+`build-linux-desktop.sh` exports an exact Buzz commit with `git archive`, builds
+the Rowvia management desktop in the existing local
+`rowvia-buzz-desktop-dev:rust-1.95.0` image, then checks the resulting ELF on
+the host. It does not install host packages, build a new Docker image, alter the
+source checkout, or replace a running Desktop. The script checks that the tag
+resolves to the pinned local image ID before any source export.
+
+```bash
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --dry-run --output /home/orionx/rowvia-buzz-compile-check
+
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --output /home/orionx/rowvia-buzz-compile-check
+
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --dry-run --output /home/orionx/rowvia-buzz-live
+
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --output /home/orionx/rowvia-buzz-live
+```
+
+The default `compile-check` mode verifies compilation and host ABI only. It
+produces a non-executable `buzz-desktop.compile-check` file. Its custom Tauri
+identifier, `ai.rowvia.buzz.compile-check`, does **not** isolate runtime state:
+Buzz still uses the production `buzz-desktop` keyring and `~/.buzz` nest. Never
+launch or install this artifact.
+
+The explicit `--live` mode is the only deployable build. It uses the source Tauri config's canonical
+`xyz.block.buzz.app` identifier and `Buzz` product name; it fails if either
+source value differs. Tauri derives its app data directory from that
+identifier, so the live binary addresses the existing Buzz state when run.
+Both modes still write only to the chosen absent output directory during the
+build. Neither mode launches, installs, or replaces Desktop. `provenance.json`
+records deployability, artifact filename, selected mode, identifier, and
+product name alongside the source, image, binary hash, and host loader check.
+
+The output directory must be absent and outside the Buzz source repository.
+For a later upstream integration, pass a full commit SHA with `--revision` after
+the native management change has been applied and committed there. The script
+requires the source commit to contain the management command and its build-time
+configuration. It verifies that the Cargo, Tauri, and desktop package versions
+agree. The default revision is the current Buzz `HEAD` at invocation time; the
+full SHA is printed and recorded in `provenance.json`.
+
+For an owner-test-hook build, explicitly add `--owner-test-hook`. This passes
+`--features rowvia-owner-test-hook` to Tauri/Cargo and the literal
+`VITE_ROWVIA_OWNER_TEST_HOOK=1` to the build container. The selected committed
+revision must contain both implementations. Inherited host environment flags
+cannot enable the hook. The build still uses the production keyring and the
+canonical live identifier; this option does not import a token or launch the
+hook. `provenance.json` records `owner_test_hook` as a boolean.
+
+An optional `--cache-dir` retains Cargo target artifacts across builds:
+
+```bash
+integration/rowvia/native-management/build-linux-desktop.sh \
+  --live --owner-test-hook --dry-run \
+  --cache-dir /home/orionx/rowvia-buzz-owner-build-cache \
+  --output /home/orionx/rowvia-buzz-owner-live
+```
+
+Remove `--dry-run` only when ready to build. The cache path must be absolute,
+separate from the source repository and output directory, and either absent
+or a previously created managed cache owned by the caller with mode 700.
+Symlinks, commas, newlines, unmarked directories and unrelated top-level
+contents are rejected. The script creates an absent cache only for an actual
+build and takes a nonblocking exclusive lock. Only `cargo-target` is mounted;
+Hermit, pnpm, npm and Cargo download caches remain disposable. Source,
+build and retained cache usage share the existing monitored 25 GiB budget.
+An over-budget cache fails the initial measurement; there is no automatic
+eviction. Cleanup retains the cache after success or failure and deletes only
+the exact disposable scratch/output staging directories. Cache reuse is
+explicit and assumes trusted build artifacts, rather than proving a fresh
+build. Omit `--cache-dir` for the original disposable build workflow.
+
+The script reads only `ROWVIA_CONTEXT_BUZZ_OWNER_PUBKEY` and
+`ROWVIA_CONTEXT_CERBERUS_PUBKEY` from
+`/home/orionx/.local/state/rowvia-management-pilot-v75/public-identities.env`.
+Both must be distinct, 64-character hex public keys. It parses the file as
+data, rejects unknown fields, and does not print the keys. The fixed build
+configuration is `orionx-hive-buzz-desktop` and
+`https://buzz.rowvia.ai:8443`. These public values are passed as environment
+variables to a transient container, never through image build arguments or
+image layers.
+
+The container runs as the invoking host UID/GID with a read-only root
+filesystem and Docker logging disabled. HOME follows the image default; explicit
+`CARGO_HOME`, `HERMIT_STATE_DIR`, `HERMIT_BIN_INSTALL_DIR`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+`NPM_CONFIG_CACHE` and the pnpm store point below the writable disposable bind
+mount. The next real image build must validate operation with the default HOME.
+The pinned Hermit installer uses `HERMIT_BIN_INSTALL_DIR` for its bootstrap
+launcher and symlink, avoiding its default `${HOME}/bin` path when HOME is absent.
+It uses one Cargo job, two CPUs, 5 GiB RAM, zero swap, 512 PIDs,
+and a 512 MiB `/tmp` tmpfs. A host
+monitor stops it if the disposable source/build tree grows beyond 25 GiB.
+With `--cache-dir`, the monitor sums that tree and the retained cache.
+Hermit, pnpm, Cargo, and
+Node caches are directed into that tree so the monitor includes them. If the
+monitor cannot measure disk usage, it stops the build. The build has a six-hour
+timeout. The temporary tree is deleted on exit; only the verified desktop ELF
+and provenance file are retained. Sidecar placeholders satisfy Tauri's build
+validation inside that disposable tree; this output is a standalone binary for
+the native management MVP, not a full sidecar bundle.
+
+Before publishing the binary, the script checks its ELF architecture, required
+embedded public configuration and version string, SHA-256, and `ldd -r` on the host. The latter is
+required because the build image has WebKitGTK 2.50.6 while the host has
+2.50.3; version numbers alone cannot establish ABI compatibility. A passing
+`ldd -r` establishes loader and symbol resolution, not a successful GUI launch.
+The build neither launches the Desktop nor changes live Buzz configuration or
+state. Keep the live binary stopped until coordinating a deliberate switch
+from the installed Buzz Desktop; it shares the canonical app data directory.
+
+Run the narrow script checks before a full build:
+
+```bash
+bash -n integration/rowvia/native-management/build-linux-desktop.sh
+bash integration/rowvia/native-management/test-build-linux-desktop.sh
+```

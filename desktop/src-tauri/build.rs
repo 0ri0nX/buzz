@@ -7,9 +7,42 @@ include!("src/managed_agents/reserved_env_keys.rs");
 
 use base64::Engine as _;
 
+fn valid_management_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.len() > 253
+        || authority
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':')))
+    {
+        return false;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    let valid_port = port
+        .is_none_or(|port| !port.is_empty() && port.parse::<u16>().is_ok_and(|value| value > 0));
+    valid_port
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_ROWVIA_MANAGEMENT_ORIGIN");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_CERBERUS_PUBKEY");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_ROWVIA_OWNER_PUBKEY");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_ROWVIA_SOURCE_INSTANCE");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_PUBLIC_KEY");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_ENDPOINT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_BUZZ_AGENT_PROVIDER");
@@ -53,6 +86,47 @@ fn main() {
 
     if let Ok(relay_http) = std::env::var("BUZZ_RELAY_HTTP") {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_RELAY_HTTP={relay_http}");
+    }
+
+    if let Ok(origin) = std::env::var("BUZZ_BUILD_ROWVIA_MANAGEMENT_ORIGIN") {
+        assert!(
+            valid_management_origin(&origin),
+            "BUZZ_BUILD_ROWVIA_MANAGEMENT_ORIGIN must be a bare HTTPS DNS origin"
+        );
+        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_ROWVIA_MANAGEMENT_ORIGIN={origin}");
+    }
+    if let Ok(pubkey) = std::env::var("BUZZ_BUILD_CERBERUS_PUBKEY") {
+        assert!(
+            pubkey.len() == 64 && pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "BUZZ_BUILD_CERBERUS_PUBKEY must be a 64-character hex pubkey"
+        );
+        println!(
+            "cargo:rustc-env=BUZZ_DESKTOP_BUILD_CERBERUS_PUBKEY={}",
+            pubkey.to_ascii_lowercase()
+        );
+    }
+    if let Ok(pubkey) = std::env::var("BUZZ_BUILD_ROWVIA_OWNER_PUBKEY") {
+        assert!(
+            pubkey.len() == 64 && pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "BUZZ_BUILD_ROWVIA_OWNER_PUBKEY must be a 64-character hex pubkey"
+        );
+        println!(
+            "cargo:rustc-env=BUZZ_DESKTOP_BUILD_ROWVIA_OWNER_PUBKEY={}",
+            pubkey.to_ascii_lowercase()
+        );
+    }
+    if let Ok(source) = std::env::var("BUZZ_BUILD_ROWVIA_SOURCE_INSTANCE") {
+        assert!(
+            !source.is_empty()
+                && source.len() <= 64
+                && source.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-'))
+                && (source.as_bytes()[0].is_ascii_lowercase()
+                    || source.as_bytes()[0].is_ascii_digit()),
+            "BUZZ_BUILD_ROWVIA_SOURCE_INSTANCE must be a lowercase source identifier"
+        );
+        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_ROWVIA_SOURCE_INSTANCE={source}");
     }
 
     if let Ok(provider) = std::env::var("BUZZ_BUILD_BUZZ_AGENT_PROVIDER") {

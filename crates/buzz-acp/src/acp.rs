@@ -8,8 +8,9 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+mod launch;
+
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
@@ -17,6 +18,9 @@ use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
+
+#[path = "acp_frame_writer.rs"]
+mod frame_writer;
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
@@ -126,10 +130,19 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     AcpError::AgentError { code, message }
 }
 
-fn build_initialize_params() -> serde_json::Value {
+fn build_initialize_params(offer_trusted_context: bool) -> serde_json::Value {
+    let mut capabilities = build_client_capabilities();
+    if !offer_trusted_context {
+        if let Some(meta) = capabilities
+            .pointer_mut("/_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meta.remove("buzz");
+        }
+    }
     serde_json::json!({
         "protocolVersion": 2,
-        "clientCapabilities": build_client_capabilities(),
+        "clientCapabilities": capabilities,
         "clientInfo": {
             "name": "buzz-acp",
             "version": env!("CARGO_PKG_VERSION")
@@ -144,8 +157,8 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
-    /// Write end of the agent's stdin pipe.
-    stdin: ChildStdin,
+    /// Sole stdin writer; None after an interrupted/failed frame closes it.
+    stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
     /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
@@ -203,6 +216,18 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter exactly accepted Buzz's private v1 context offer.
+    trusted_turn_context_accepted: bool,
+    /// Immutable host facts for the active Buzz turn.
+    trusted_turn: Option<crate::trusted_turn_context::TurnFacts>,
+    /// Last context generation written for the active Buzz turn.
+    trusted_turn_generation: u32,
+    /// Context consumed by the next ordinary `session/prompt` write.
+    trusted_next_prompt: Option<(
+        crate::trusted_turn_context::Source,
+        Vec<crate::trusted_turn_context::EventFacts>,
+        usize,
+    )>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -217,6 +242,10 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Ask Claude Code for summarized thinking on `session/new`. Opus omits
+    /// readable thinking unless asked; set only when the CLI the adapter runs
+    /// is new enough to accept `--thinking-display`.
+    claude_thinking_summaries: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -411,7 +440,12 @@ fn build_client_capabilities() -> serde_json::Value {
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
-            "terminal-auth": true
+            "terminal-auth": true,
+            "buzz": {
+                "trustedTurnContext": {
+                    "versions": [crate::trusted_turn_context::VERSION]
+                }
+            }
         }
     })
 }
@@ -460,10 +494,24 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
+        Self::spawn_with_env(command, args, extra_env, has_generated_codex_config, &[]).await
+    }
+
+    /// Spawn with authoritative launch environment overrides. Unlike persona
+    /// defaults, these values take precedence over the inherited environment.
+    pub(crate) async fn spawn_with_env(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        launch_env: &[(String, String)],
+    ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args);
+        // A launch prefix may change the CLI or environment the adapter sees,
+        // so the version check below could inspect the wrong binary.
+        let launch_prefixed = std::env::var_os(launch::PREFIX_ENV).is_some();
+        let mut cmd = launch::command(command, args)?;
         if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
             if !args.iter().any(|arg| arg == "--") {
                 cmd.arg("--");
@@ -528,6 +576,32 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
+        // The harness composes the entire Git config block once. It must replace
+        // inherited counts/PATH rather than mixing two independently indexed blocks.
+        for (name, value) in extra_env
+            .iter()
+            .filter(|(name, _)| crate::git::is_managed_env(name))
+        {
+            cmd.env(name, value);
+        }
+        // Git applies this older injection channel after GIT_CONFIG_COUNT.
+        // Keeping it would let an ambient user.name or signing setting win
+        // over the harness-owned agent identity in native shells.
+        cmd.env_remove("GIT_CONFIG_PARAMETERS");
+        cmd.env_remove("NOSTR_PRIVATE_KEY");
+        if extra_env.iter().any(|(name, _)| name == "GIT_CONFIG_COUNT") {
+            // Native shells inherit these overrides, while buzz-agent clears
+            // them for MCP. Let both paths use the harness's agent identity.
+            for name in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            ] {
+                cmd.env_remove(name);
+            }
+        }
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
@@ -546,7 +620,17 @@ impl AcpClient {
                 "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
                 _ => None,
             };
-        let mut child = cmd.spawn()?;
+        cmd.envs(launch_env.iter().cloned());
+        cmd.env_remove(launch::PREFIX_ENV);
+        let claude_thinking_summaries = standard_adapter == Some(StandardAdapterKind::Claude)
+            && !launch_prefixed
+            && claude_cli_accepts_thinking_display(&cmd).await;
+        let mut child = cmd.spawn().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to spawn {:?}: {error}", cmd.as_std().get_program()),
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -559,7 +643,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             pending_permission_id: None,
@@ -571,10 +655,15 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            trusted_turn_context_accepted: false,
+            trusted_turn: None,
+            trusted_turn_generation: 0,
+            trusted_next_prompt: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            claude_thinking_summaries,
         })
     }
 
@@ -621,16 +710,120 @@ impl AcpClient {
     /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
     /// Parsed here rather than at each call site so no caller can forget it.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_trusted_context(true).await
+    }
+
+    /// Isolated local tasks have no admitted Buzz event or trusted turn source.
+    /// Do not offer the private extension on their separate ACP process.
+    pub(crate) async fn initialize_isolated(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_trusted_context(false).await
+    }
+
+    async fn initialize_with_trusted_context(
+        &mut self,
+        offer_trusted_context: bool,
+    ) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
-        let params = build_initialize_params();
+        let params = build_initialize_params(offer_trusted_context);
         let result = self.send_request("initialize", params).await?;
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.trusted_turn_context_accepted =
+            offer_trusted_context && crate::trusted_turn_context::accepts_v1(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Bind immutable host facts for one Buzz turn.
+    pub(crate) fn begin_trusted_turn(
+        &mut self,
+        turn: Option<crate::trusted_turn_context::TurnFacts>,
+    ) {
+        self.trusted_turn = turn;
+        self.trusted_turn_generation = 0;
+        self.trusted_next_prompt = None;
+    }
+
+    /// Stage context for the next ordinary prompt. It is consumed exactly once.
+    pub(crate) fn stage_trusted_prompt(
+        &mut self,
+        source: crate::trusted_turn_context::Source,
+        events: Vec<crate::trusted_turn_context::EventFacts>,
+        expected_event_count: usize,
+    ) {
+        self.trusted_next_prompt = Some((source, events, expected_event_count));
+    }
+
+    fn attach_trusted_context(
+        &mut self,
+        params: &mut serde_json::Value,
+        session_id: &str,
+        staged: Option<(
+            crate::trusted_turn_context::Source,
+            Vec<crate::trusted_turn_context::EventFacts>,
+            usize,
+        )>,
+    ) -> Result<Option<u32>, AcpError> {
+        if !self.trusted_turn_context_accepted {
+            return Ok(None);
+        }
+        let (source, events, expected_event_count) = staged.ok_or_else(|| {
+            AcpError::Protocol("trusted turn context missing for negotiated prompt".into())
+        })?;
+        if events.len() != expected_event_count {
+            return Err(AcpError::Protocol(
+                "trusted turn context is incomplete for authoritative events".into(),
+            ));
+        }
+        let turn = self.trusted_turn.as_ref().ok_or_else(|| {
+            AcpError::Protocol("trusted turn facts missing for negotiated prompt".into())
+        })?;
+        let generation = self
+            .trusted_turn_generation
+            .checked_add(1)
+            .ok_or_else(|| AcpError::Protocol("trusted turn generation overflow".into()))?;
+        let envelope = crate::trusted_turn_context::build_envelope(
+            turn, session_id, source, generation, &events,
+        )
+        .map_err(|error| AcpError::Protocol(error.to_string()))?;
+        let meta = params
+            .as_object_mut()
+            .ok_or_else(|| AcpError::Protocol("prompt params must be an object".into()))?
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}));
+        let meta = meta.as_object_mut().ok_or_else(|| {
+            AcpError::Protocol("prompt _meta collision for trusted turn context".into())
+        })?;
+        if meta.contains_key("buzz") {
+            return Err(AcpError::Protocol(
+                "prompt _meta.buzz collision for trusted turn context".into(),
+            ));
+        }
+        meta.insert(
+            "buzz".into(),
+            serde_json::json!({"trustedTurnContext": envelope}),
+        );
+        Ok(Some(generation))
+    }
+
+    fn commit_trusted_generation(&mut self, candidate: Option<u32>) -> Result<(), AcpError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let expected = self
+            .trusted_turn_generation
+            .checked_add(1)
+            .ok_or_else(|| AcpError::Protocol("trusted turn generation overflow".into()))?;
+        if candidate != expected {
+            return Err(AcpError::Protocol(
+                "trusted turn generation commit was not contiguous".into(),
+            ));
+        }
+        self.trusted_turn_generation = candidate;
+        Ok(())
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -655,10 +848,11 @@ impl AcpClient {
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
-    /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
-    /// omitted entirely otherwise, since adapters may distinguish an absent
-    /// member from a null one. Metadata prompt transports and the title are
-    /// merged into a single object.
+    /// `session_title` rides in `_meta.sessionTitle` when `Some`, and a Claude
+    /// CLI that supports it gets `_meta.claudeCode.options.extraArgs` asking
+    /// for summarized thinking. These and the metadata prompt transports merge
+    /// into a single object; with none of them, `_meta` is omitted entirely,
+    /// since adapters may distinguish an absent member from a null one.
     ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
@@ -689,6 +883,11 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry a system prompt from an adapter extension.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if self.claude_thinking_summaries {
+            // Merge — claude-agent-acp spreads these into the CLI's argv.
+            params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
+                serde_json::Value::String("summarized".to_owned());
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -798,7 +997,9 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let mut params = build_prompt_params(session_id, prompt_blocks);
+        let staged = self.trusted_next_prompt.take();
+        let trusted_generation = self.attach_trusted_context(&mut params, session_id, staged)?;
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -825,6 +1026,7 @@ impl AcpClient {
             self.current_hard_deadline = None;
             return Err(e);
         }
+        self.commit_trusted_generation(trusted_generation)?;
 
         let result = self
             .read_until_response_with_idle_timeout(
@@ -1085,12 +1287,10 @@ impl AcpClient {
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(WRITE_TIMEOUT, async {
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await?;
-            Ok::<(), std::io::Error>(())
-        })
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
+        )
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
@@ -1467,7 +1667,24 @@ impl AcpClient {
                                 crate::pool::SteerError::ExpectedRunIdMissing,
                             ));
                         }
-                        Some((transport, method, params)) => {
+                        Some((transport, method, mut params)) => {
+                            let trusted_generation = match self.attach_trusted_context(
+                                &mut params,
+                                session_id,
+                                Some((
+                                    crate::trusted_turn_context::Source::Steer,
+                                    req.trusted_event.clone().into_iter().collect(),
+                                    1,
+                                )),
+                            ) {
+                                Ok(generation) => generation,
+                                Err(error) => {
+                                    let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
+                                        crate::pool::SteerError::Transport(error.to_string()),
+                                    ));
+                                    continue;
+                                }
+                            };
                             let id = self.next_id;
                             self.next_id += 1;
                             let msg = serde_json::json!({
@@ -1483,6 +1700,14 @@ impl AcpClient {
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
+                                    if let Err(error) =
+                                        self.commit_trusted_generation(trusted_generation)
+                                    {
+                                        let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
+                                            crate::pool::SteerError::Transport(error.to_string()),
+                                        ));
+                                        continue;
+                                    }
                                     pending_steer = Some((id, transport, req.ack_tx));
                                 }
                                 Err(e) => {
@@ -2180,8 +2405,8 @@ pub enum ModelSwitchMethod {
 /// Extract `configOptions` entries with `category == "model"` from a `session/new` result.
 ///
 /// Returns the raw JSON array entries. Each entry has `configId` (spelled `id`
-/// by some adapters, e.g. claude-agent-acp), `displayName`,
-/// `options: [{ value, displayName }]`, etc.
+/// by some adapters, e.g. claude-agent-acp), `name`,
+/// `options: [{ value, name }]`, etc.
 pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
     result["configOptions"]
         .as_array()
@@ -2354,6 +2579,99 @@ fn kill_process_group(_pid: u32) -> bool {
     false
 }
 
+/// First Claude Code release with `--thinking-display`. Older CLIs exit on
+/// unknown flags, so sending it to them would fail every `session/new`.
+const CLAUDE_THINKING_DISPLAY_MIN_VERSION: (u64, u64, u64) = (2, 1, 94);
+
+/// Parse `claude --version` output such as `2.1.284 (Claude Code)`. The
+/// first word must be exactly three dot-separated digit runs.
+fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = output.split_whitespace().next()?.split('.');
+    let mut next = || {
+        let part = parts.next()?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// Whether the CLI claude-agent-acp will run accepts `--thinking-display`.
+///
+/// The adapter runs `CLAUDE_CODE_EXECUTABLE` when set and its bundled CLI
+/// otherwise; the bundled one cannot be inspected from here, so an unset
+/// variable, a hung or failing binary, or unparseable output all answer
+/// `false` and leave the session exactly as before.
+async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> bool {
+    const KEY: &str = "CLAUDE_CODE_EXECUTABLE";
+    let executable = cmd
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == KEY)
+        .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        .unwrap_or_else(|| std::env::var_os(KEY))
+        .filter(|path| !path.is_empty());
+    let Some(executable) = executable else {
+        tracing::debug!(target: "acp::spawn", "{KEY} unset; not requesting thinking summaries");
+        return false;
+    };
+    let mut version_cmd = tokio::process::Command::new(&executable);
+    version_cmd.arg("--version");
+    configure_version_probe(&mut version_cmd);
+    let version = match version_cmd.spawn() {
+        Ok(child) => claude_version_within(child, std::time::Duration::from_secs(5)).await,
+        Err(_) => None,
+    };
+    let accepts = version.is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION);
+    tracing::debug!(
+        target: "acp::spawn",
+        "{executable:?} --version = {version:?}; thinking summaries requested: {accepts}"
+    );
+    accepts
+}
+
+/// Pipe stdout only, and put the probe in its own process group (like the
+/// adapter) so a timeout also kills a launcher's children.
+fn configure_version_probe(cmd: &mut tokio::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    configure_no_window(cmd);
+}
+
+/// Read at most a version line from `child` and require a clean exit within
+/// `limit`. On timeout the whole process group is killed.
+async fn claude_version_within(
+    mut child: tokio::process::Child,
+    limit: std::time::Duration,
+) -> Option<(u64, u64, u64)> {
+    use tokio::io::AsyncReadExt;
+    const MAX_VERSION_BYTES: u64 = 256;
+    let pid = child.id();
+    let probe = async {
+        let mut stdout = Vec::new();
+        let pipe = child.stdout.take()?;
+        pipe.take(MAX_VERSION_BYTES)
+            .read_to_end(&mut stdout)
+            .await
+            .ok()?;
+        child.wait().await.ok()?.success().then_some(stdout)
+    };
+    match tokio::time::timeout(limit, probe).await {
+        Ok(stdout) => parse_claude_version(&String::from_utf8_lossy(&stdout?)),
+        Err(_) => {
+            if !pid.is_some_and(kill_process_group) {
+                let _ = child.start_kill();
+            }
+            None
+        }
+    }
+}
+
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
@@ -2370,6 +2688,16 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_trusted_event() -> crate::trusted_turn_context::EventFacts {
+        crate::trusted_turn_context::EventFacts {
+            event_id: "a".repeat(64),
+            author_pubkey: "b".repeat(64),
+            actor_pubkey: "b".repeat(64),
+            channel_type: crate::trusted_turn_context::ChannelType::Stream,
+            thread_root_event_id: Some("c".repeat(64)),
+        }
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -2537,6 +2865,11 @@ mod tests {
             msg["params"]["clientCapabilities"]["_meta"]["goose"]["customNotifications"].as_bool(),
             Some(true),
             "goose customNotifications capability must be advertised"
+        );
+        assert_eq!(
+            msg["params"]["clientCapabilities"]["_meta"]["buzz"]["trustedTurnContext"],
+            serde_json::json!({"versions":[crate::trusted_turn_context::VERSION]}),
+            "the private offer must use the exact frozen bilateral negotiation shape"
         );
     }
 
@@ -2734,17 +3067,17 @@ mod tests {
                 {
                     "configId": "model",
                     "category": "model",
-                    "displayName": "Model",
+                    "name": "Model",
                     "options": [
-                        { "value": "claude-sonnet-4-20250514", "displayName": "Claude Sonnet 4" },
-                        { "value": "claude-opus-4-20250514", "displayName": "Claude Opus 4" }
+                        { "value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" },
+                        { "value": "claude-opus-4-20250514", "name": "Claude Opus 4" }
                     ]
                 },
                 {
                     "configId": "theme",
                     "category": "appearance",
-                    "displayName": "Theme",
-                    "options": [{ "value": "dark", "displayName": "Dark" }]
+                    "name": "Theme",
+                    "options": [{ "value": "dark", "name": "Dark" }]
                 }
             ]
         });
@@ -2847,7 +3180,7 @@ mod tests {
                 "configId": "model",
                 "category": "model",
                 "options": [
-                    { "value": "claude-sonnet-4-20250514", "displayName": "Sonnet 4" }
+                    { "value": "claude-sonnet-4-20250514", "name": "Sonnet 4" }
                 ]
             }],
             "models": {
@@ -3046,6 +3379,372 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    fn trusted_turn() -> crate::trusted_turn_context::TurnFacts {
+        crate::trusted_turn_context::TurnFacts {
+            process: crate::trusted_turn_context::ProcessFacts {
+                relay_origin: "wss://relay.example".into(),
+                agent_pubkey: "a".repeat(64),
+                process_instance_id: uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                    .unwrap(),
+                owner: None,
+            },
+            channel_id: Some(
+                uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            ),
+            channel_type: Some(crate::trusted_turn_context::ChannelType::Stream),
+            execution_scope: Some(crate::trusted_turn_context::ExecutionScope::Conversation),
+            turn_id: uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+        }
+    }
+
+    async fn trusted_acceptance_after_initialize(result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; sleep 5"
+        );
+        let mut client = spawn_script(&script).await;
+        client.initialize().await.expect("initialize response");
+        let accepted = client.trusted_turn_context_accepted;
+        client.shutdown().await;
+        accepted
+    }
+
+    #[tokio::test]
+    async fn trusted_context_initialize_requires_exact_acceptance() {
+        let exact = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}"}}}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(trusted_acceptance_after_initialize(&exact).await);
+        assert!(!trusted_acceptance_after_initialize(r#"{"agentCapabilities":{}}"#).await);
+        let extra = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}","extra":true}}}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(!trusted_acceptance_after_initialize(&extra).await);
+        let sibling = format!(
+            r#"{{"agentCapabilities":{{"_meta":{{"buzz":{{"trustedTurnContext":{{"version":"{}"}},"unknown":true}}}}}}}}"#,
+            crate::trusted_turn_context::VERSION
+        );
+        assert!(!trusted_acceptance_after_initialize(&sibling).await);
+        assert!(
+            !trusted_acceptance_after_initialize(
+                r#"{"agentCapabilities":{"_meta":{"buzz":"collision"}}}"#
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_task_prompt_omits_trusted_offer_even_if_adapter_advertises_it() {
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "agentCapabilities": {
+                    "_meta": {
+                        "buzz": {
+                            "trustedTurnContext": {
+                                "version": crate::trusted_turn_context::VERSION
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let script = format!(
+            r#"read -r init
+case "$init" in *trustedTurnContext*) exit 1 ;; esac
+printf '%s\n' '{initialize_response}'
+read -r _session
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"isolated-task"}}}}'
+read -r _prompt
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize_isolated()
+            .await
+            .expect("isolated initialize");
+        assert!(!client.trusted_turn_context_accepted);
+        let session = client
+            .session_new("/tmp", vec![], None, None)
+            .await
+            .expect("task session");
+        assert_eq!(session, "isolated-task");
+        let outcome = client
+            .session_prompt_with_idle_timeout(
+                &session,
+                "prepared local task",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(matches!(outcome, Ok(StopReason::EndTurn)));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_context_is_absent_without_exact_acceptance() {
+        let mut client = spawn_script("sleep 10").await;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut params = build_prompt_params("session", &["unchanged"]);
+        let before = params.clone();
+        client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .unwrap();
+        assert_eq!(params, before);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_context_attaches_to_prompt_and_both_steer_builders() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let cases = [
+            build_prompt_params("session", &["ordinary"]),
+            build_goose_steer_params("session", "run", &["goose"]),
+            build_acp_steer_params("session", &["acp"]),
+        ];
+        for (index, mut params) in cases.into_iter().enumerate() {
+            let candidate = client
+                .attach_trusted_context(
+                    &mut params,
+                    "session",
+                    Some((
+                        if index == 0 {
+                            crate::trusted_turn_context::Source::Message
+                        } else {
+                            crate::trusted_turn_context::Source::Steer
+                        },
+                        vec![test_trusted_event()],
+                        1,
+                    )),
+                )
+                .unwrap();
+            let envelope = &params["_meta"]["buzz"]["trustedTurnContext"];
+            assert_eq!(envelope["generation"], (index + 1) as u64);
+            assert_eq!(envelope["sessionId"], "session");
+            assert_eq!(envelope["currentEventId"], "a".repeat(64));
+            client.commit_trusted_generation(candidate).unwrap();
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_context_collision_and_overflow_fail_before_write_state() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut collision = serde_json::json!({
+            "sessionId":"session", "prompt":[], "_meta":{"buzz":{"other":true}}
+        });
+        assert!(client
+            .attach_trusted_context(
+                &mut collision,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .is_err());
+        assert_eq!(client.trusted_turn_generation, 0);
+        client.trusted_turn_generation = u32::MAX;
+        let mut params = build_prompt_params("session", &["ordinary"]);
+        assert!(client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Message,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .is_err());
+        assert!(params.get("_meta").is_none());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_generation_rolls_back_when_prompt_write_fails() {
+        let mut client = spawn_script("exit 0").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let _ = client.child.wait().await;
+        client.stage_trusted_prompt(
+            crate::trusted_turn_context::Source::Message,
+            vec![test_trusted_event()],
+            1,
+        );
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "will not be written",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(client.trusted_turn_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn trusted_generation_rolls_back_when_native_steer_write_fails() {
+        let mut client = spawn_script("exit 0").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let _ = client.child.wait().await;
+        let mut params = build_acp_steer_params("session", &["steer"]);
+        let candidate = client
+            .attach_trusted_context(
+                &mut params,
+                "session",
+                Some((
+                    crate::trusted_turn_context::Source::Steer,
+                    vec![test_trusted_event()],
+                    1,
+                )),
+            )
+            .unwrap();
+        let msg = serde_json::json!({
+            "jsonrpc":"2.0", "id":0, "method":ACP_STEER_METHOD, "params":params
+        });
+        assert!(client.write_ndjson(&msg).await.is_err());
+        assert_eq!(candidate, Some(1));
+        assert_eq!(client.trusted_turn_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn trusted_context_rejects_partially_attested_batch_before_write() {
+        let mut client = spawn_script("sleep 10").await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        let mut params = build_prompt_params("session", &["two-event batch"]);
+        let result = client.attach_trusted_context(
+            &mut params,
+            "session",
+            Some((
+                crate::trusted_turn_context::Source::Message,
+                vec![test_trusted_event()],
+                2,
+            )),
+        );
+        assert!(result.is_err());
+        assert!(params.get("_meta").is_none());
+        assert_eq!(client.trusted_turn_generation, 0);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_bootstrap_then_message_commit_contiguous_generations_on_wire() {
+        let script = r#"
+IFS= read -r first
+case "$first" in
+  *'"source":"bootstrap"'*) ;;
+  *) exit 31 ;;
+esac
+case "$first" in *'"generation":1'*) ;; *) exit 34 ;; esac
+case "$first" in *'currentEventId'*) exit 32 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+IFS= read -r second
+case "$second" in
+  *'"source":"message"'*) ;;
+  *) exit 33 ;;
+esac
+case "$second" in *'"generation":2'*) ;; *) exit 35 ;; esac
+case "$second" in *'"currentEventId"'*) ;; *) exit 36 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Bootstrap, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "bootstrap",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        client.stage_trusted_prompt(
+            crate::trusted_turn_context::Source::Message,
+            vec![test_trusted_event()],
+            1,
+        );
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "message",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.trusted_turn_generation, 2);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_resume_and_heartbeat_have_no_current_authority_on_wire() {
+        let script = r#"
+IFS= read -r resume
+case "$resume" in *'"source":"resume"'*) ;; *) exit 41 ;; esac
+case "$resume" in *'"channelId"'*) ;; *) exit 42 ;; esac
+case "$resume" in *'"events"'*|*'"currentEventId"'*) exit 43 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+IFS= read -r heartbeat
+case "$heartbeat" in *'"source":"heartbeat"'*) ;; *) exit 44 ;; esac
+case "$heartbeat" in *'"channelId"'*|*'"events"'*|*'"currentEventId"'*) exit 45 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        client.trusted_turn_context_accepted = true;
+
+        client.begin_trusted_turn(Some(trusted_turn()));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Resume, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "session",
+                "resume",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let mut heartbeat_turn = trusted_turn();
+        heartbeat_turn.channel_id = None;
+        heartbeat_turn.channel_type = None;
+        heartbeat_turn.execution_scope = None;
+        client.begin_trusted_turn(Some(heartbeat_turn));
+        client.stage_trusted_prompt(crate::trusted_turn_context::Source::Heartbeat, vec![], 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "heartbeat-session",
+                "heartbeat",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.trusted_turn_generation, 1);
+        client.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -3648,6 +4347,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_version_gate_admits_only_cli_with_thinking_display() {
+        let accepts = |out: &str| {
+            parse_claude_version(out).is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION)
+        };
+        assert!(!accepts("2.1.92 (Claude Code)"), "below the minimum");
+        assert!(!accepts("1.0.100 (Claude Code)"), "older major");
+        assert!(accepts("2.1.94 (Claude Code)"), "exactly the minimum");
+        assert!(accepts("2.1.284 (Claude Code)"), "newer");
+        assert!(accepts("3.0.0"), "newer major");
+        assert!(!accepts(""), "empty output");
+        assert!(!accepts("error: unknown"), "unparseable output");
+        assert!(!accepts("2.1.284.garbage"), "trailing junk");
+        assert!(!accepts("2.1.+284"), "sign in a component");
+    }
+
+    #[tokio::test]
+    async fn claude_thinking_display_check_fails_closed_without_readable_cli() {
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env("CLAUDE_CODE_EXECUTABLE", "/nonexistent/claude");
+        assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+        cmd.env("CLAUDE_CODE_EXECUTABLE", "");
+        assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_version_timeout_kills_launcher_children() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-hang-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let pidfile = dir.join("child.pid");
+        // A launcher that starts a child holding stdout open, then hangs.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 300 & echo $! > {}; wait", pidfile.display()));
+        configure_version_probe(&mut cmd);
+        let child = cmd.spawn().expect("spawn launcher");
+        let version = claude_version_within(child, std::time::Duration::from_millis(500)).await;
+        assert_eq!(version, None);
+        let grandchild = std::fs::read_to_string(&pidfile).expect("pidfile");
+        let grandchild = nix::unistd::Pid::from_raw(grandchild.trim().parse().expect("pid"));
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = nix::sys::signal::kill(grandchild, None).is_ok();
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::remove_dir_all(&dir).expect("remove dir");
+        assert!(!alive, "the launcher's child must not outlive the timeout");
+    }
+
+    /// Spawn a fake `claude-agent-acp` whose `CLAUDE_CODE_EXECUTABLE` is a
+    /// fake CLI running `cli_body`, then return the `_meta` its `session/new`
+    /// actually received.
+    #[cfg(unix)]
+    async fn claude_session_meta_with_cli(cli_body: &str) -> serde_json::Value {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("buzz-acp-claude-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake dir");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake");
+            path
+        };
+        let cli = write("claude", cli_body);
+        let adapter = write(
+            "claude-agent-acp",
+            r#"read -r _init
+echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read -r REQ
+echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+sleep 1"#,
+        );
+        let mut client = AcpClient::spawn_with_env(
+            adapter.to_str().expect("utf8 path"),
+            &[],
+            &[],
+            false,
+            &[(
+                "CLAUDE_CODE_EXECUTABLE".into(),
+                cli.to_str().expect("utf8 path").into(),
+            )],
+        )
+        .await
+        .expect("spawn fake claude adapter");
+        client.initialize().await.expect("initialize");
+        let resp = client
+            .session_new_full(
+                "/tmp",
+                vec![],
+                Some(SystemPromptTransport::ClaudeMeta("be brief")),
+                Some("Fizz"),
+            )
+            .await
+            .expect("session_new_full");
+        client.shutdown().await;
+        std::fs::remove_dir_all(&dir).expect("remove fake dir");
+        resp.raw["_receivedRequest"]["params"]["_meta"].clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_spawn_requests_thinking_summaries_only_from_supporting_cli() {
+        let meta = claude_session_meta_with_cli("echo '2.1.284 (Claude Code)'").await;
+        assert_eq!(
+            meta["claudeCode"]["options"]["extraArgs"],
+            serde_json::json!({ "thinking-display": "summarized" })
+        );
+        assert_eq!(
+            meta["systemPrompt"],
+            serde_json::json!({ "append": "be brief" })
+        );
+        assert_eq!(meta["sessionTitle"], "Fizz");
+
+        for (case, cli) in [
+            ("old CLI", "echo '2.1.93 (Claude Code)'"),
+            ("failing CLI", "echo '2.1.284 (Claude Code)'; exit 1"),
+            ("unclean version", "echo '2.1.284.garbage'"),
+        ] {
+            let meta = claude_session_meta_with_cli(cli).await;
+            assert!(meta.get("claudeCode").is_none(), "{case}: {meta}");
+            assert_eq!(meta["sessionTitle"], "Fizz", "{case}");
+        }
+    }
+
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
 
     include!("acp/system_prompt_tests.rs");
@@ -3756,6 +4586,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3825,6 +4656,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3897,6 +4729,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -3971,6 +4804,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -4154,8 +4988,22 @@ mod tests {
         )
         .await;
         set_steering_supported(&mut client);
+        client.trusted_turn_context_accepted = true;
+        client.begin_trusted_turn(Some(trusted_turn()));
 
-        let (_written, ack) = run_one_steer(&mut client, &capture).await;
+        let (written, ack) = run_one_steer(&mut client, &capture).await;
+
+        let written: serde_json::Value = serde_json::from_str(
+            written
+                .as_deref()
+                .expect("rejected steer was still written for admission"),
+        )
+        .expect("steer wire JSON");
+        assert_eq!(
+            written["params"]["_meta"]["buzz"]["trustedTurnContext"]["source"],
+            "steer"
+        );
+        assert_eq!(client.trusted_turn_generation, 1);
 
         match ack {
             crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
@@ -4221,6 +5069,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await
@@ -4274,6 +5123,7 @@ mod tests {
             steer_tx
                 .send(crate::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
+                    trusted_event: Some(test_trusted_event()),
                     ack_tx,
                 })
                 .await

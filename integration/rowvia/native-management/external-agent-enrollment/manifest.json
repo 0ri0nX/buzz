@@ -1,0 +1,8 @@
+{
+  "contract_version": "buzz.rowvia-external-agent-enrollment/v1",
+  "patch_commit": "2ea9d5391d8f90f02b9b060cd5d95b019702f3e1",
+  "patch_filename": "0001-feat-enroll-external-agents-with-owner-proof.patch",
+  "patch_sha256": "510b2fdd429c930ad4c17304b6b359b3f9c67984aae0709a9b63c41284818bff",
+  "result_tree": "a04d3eb1309eca212aac0610b41fcb0d22feb36e",
+  "upstream_base": "41994cb179ae59cfd8a23122eac5e1869e4a2d6c"
+}

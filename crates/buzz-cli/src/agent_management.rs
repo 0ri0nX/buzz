@@ -10,6 +10,8 @@ const AGENT_REQUEST_KIND: &str = "agent_management_request";
 const PROJECT_CHANNEL_REQUEST_KIND: &str = "project_channel_request";
 const MAX_NAME_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 20_000;
+const MAX_GMAIL_LABEL_HINTS: usize = 4;
+const MAX_GMAIL_LABEL_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +40,32 @@ pub struct UpdateAgentDraft {
     pub respond_to: Option<String>,
 }
 
+/// The only connector actions an agent may propose for owner review.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ConnectorDraftAction {
+    Grant,
+    Revoke,
+}
+
+impl ConnectorDraftAction {
+    fn to_wire(self) -> &'static str {
+        match self {
+            Self::Grant => "connector.grant",
+            Self::Revoke => "connector.revoke",
+        }
+    }
+}
+
+/// Human-readable selection hints; no authority or resolved IDs are accepted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorDraft {
+    pub channel_id: String,
+    pub target_name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gmail_labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProjectChannelDraft {
@@ -57,6 +85,8 @@ pub struct CreateProjectChannelDraft {
 struct ManagementRequest<T> {
     #[serde(rename = "type")]
     request_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<u8>,
     action: &'static str,
     request_id: String,
     request: T,
@@ -104,10 +134,30 @@ fn build<T: Serialize>(
     owner: &PublicKey,
     channel_id: String,
     request_kind: &'static str,
+    version: Option<u8>,
     action: &'static str,
     request: T,
 ) -> Result<BuiltDraftRequest, CliError> {
-    let request_id = uuid::Uuid::new_v4().to_string();
+    build_with_request_id(
+        keys,
+        owner,
+        channel_id,
+        (request_kind, version, action),
+        request,
+        None,
+    )
+}
+
+fn build_with_request_id<T: Serialize>(
+    keys: &Keys,
+    owner: &PublicKey,
+    channel_id: String,
+    metadata: (&'static str, Option<u8>, &'static str),
+    request: T,
+    request_id: Option<String>,
+) -> Result<BuiltDraftRequest, CliError> {
+    let (request_kind, version, action) = metadata;
+    let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let payload = ObserverEvent {
         seq: 0,
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -118,6 +168,7 @@ fn build<T: Serialize>(
         turn_id: None,
         payload: ManagementRequest {
             request_type: request_kind,
+            version,
             action,
             request_id: request_id.clone(),
             request,
@@ -159,6 +210,7 @@ pub fn build_create(
         owner,
         channel_id,
         AGENT_REQUEST_KIND,
+        None,
         "create",
         request,
     )
@@ -210,9 +262,82 @@ pub fn build_update(
         owner,
         channel_id,
         AGENT_REQUEST_KIND,
+        None,
         "update",
         request,
     )
+}
+
+/// Build an agent-signed, owner-encrypted connector proposal, never an approval.
+pub fn build_connector(
+    keys: &Keys,
+    owner: &PublicKey,
+    action: ConnectorDraftAction,
+    draft: ConnectorDraft,
+) -> Result<BuiltDraftRequest, CliError> {
+    build_connector_with_request_id(keys, owner, action, draft, None)
+}
+
+/// Reuse a trusted, persisted observer UUIDv4 for exact draft delivery retries.
+/// This ID is not a Rowvia management request ID and conveys no owner authority.
+pub fn build_connector_with_request_id(
+    keys: &Keys,
+    owner: &PublicKey,
+    action: ConnectorDraftAction,
+    draft: ConnectorDraft,
+    request_id: Option<String>,
+) -> Result<BuiltDraftRequest, CliError> {
+    let request_id = request_id
+        .map(|value| {
+            let parsed = uuid::Uuid::parse_str(&value)
+                .map_err(|_| CliError::Usage("request ID must be a UUIDv4".into()))?;
+            if parsed.get_version_num() != 4 || parsed.get_variant() != uuid::Variant::RFC4122 {
+                return Err(CliError::Usage("request ID must be a UUIDv4".into()));
+            }
+            Ok(parsed.to_string())
+        })
+        .transpose()?;
+    let supplied_channel_id = required(draft.channel_id, "channel", 128)?;
+    let channel_id = uuid::Uuid::parse_str(&supplied_channel_id)
+        .map_err(|_| CliError::Usage(format!("invalid channel UUID: {supplied_channel_id}")))?
+        .to_string();
+    let target_name = selection_hint(draft.target_name, "target name", MAX_NAME_CHARS)?;
+    if draft.gmail_labels.len() > MAX_GMAIL_LABEL_HINTS {
+        return Err(CliError::Usage(format!(
+            "too many Gmail label hints (max {MAX_GMAIL_LABEL_HINTS})"
+        )));
+    }
+    let gmail_labels = draft
+        .gmail_labels
+        .into_iter()
+        .map(|label| selection_hint(label, "Gmail label hint", MAX_GMAIL_LABEL_CHARS))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_with_request_id(
+        keys,
+        owner,
+        channel_id.clone(),
+        (AGENT_REQUEST_KIND, Some(1), action.to_wire()),
+        ConnectorDraft {
+            channel_id,
+            target_name,
+            gmail_labels,
+        },
+        request_id,
+    )
+}
+
+fn selection_hint(value: String, label: &str, max: usize) -> Result<String, CliError> {
+    let value = required(value, label, max)?;
+    if value.chars().any(char::is_control)
+        || value.contains("://")
+        || value.starts_with("www.")
+        || value.contains('@')
+        || uuid::Uuid::parse_str(&value).is_ok()
+        || (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(CliError::Usage(format!("{label} must be a plain name")));
+    }
+    Ok(value)
 }
 
 pub fn build_project_channel(
@@ -246,6 +371,7 @@ pub fn build_project_channel(
         owner,
         home_channel_id,
         PROJECT_CHANNEL_REQUEST_KIND,
+        None,
         "create",
         request,
     )
@@ -369,5 +495,203 @@ mod tests {
             payload["payload"]["request"]["templateName"],
             "Release team"
         );
+    }
+
+    #[test]
+    fn connector_draft_has_exact_versioned_hint_only_schema() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let draft = || ConnectorDraft {
+            channel_id: CHANNEL.into(),
+            target_name: "Research helper".into(),
+            gmail_labels: vec!["Work/Reports".into()],
+        };
+        for (action, expected) in [
+            (ConnectorDraftAction::Grant, "connector.grant"),
+            (ConnectorDraftAction::Revoke, "connector.revoke"),
+        ] {
+            let built = build_connector(&agent, &owner.public_key(), action, draft()).unwrap();
+            assert_eq!(built.event.pubkey, agent.public_key());
+            assert_eq!(built.event.kind.as_u16(), 24_200);
+            assert!(built.event.verify().is_ok());
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner, &built.event).unwrap();
+            let request_id = payload["payload"]["requestId"].as_str().unwrap();
+            assert_eq!(
+                uuid::Uuid::parse_str(request_id).unwrap().get_version_num(),
+                4
+            );
+            assert_eq!(
+                payload["payload"],
+                serde_json::json!({
+                    "type": AGENT_REQUEST_KIND,
+                    "version": 1,
+                    "action": expected,
+                    "requestId": request_id,
+                    "request": {
+                        "channelId": CHANNEL,
+                        "targetName": "Research helper",
+                        "gmailLabels": ["Work/Reports"]
+                    }
+                })
+            );
+            assert_eq!(payload["channelId"], CHANNEL);
+            assert!(payload["sessionId"].is_null());
+            assert!(payload["turnId"].is_null());
+            assert_ne!(
+                built.event.content,
+                serde_json::to_string(&payload).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn connector_draft_omits_empty_label_hints_and_generates_fresh_ids() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let draft = || ConnectorDraft {
+            channel_id: CHANNEL.into(),
+            target_name: "Research helper".into(),
+            gmail_labels: Vec::new(),
+        };
+        let first = build_connector(
+            &agent,
+            &owner.public_key(),
+            ConnectorDraftAction::Grant,
+            draft(),
+        )
+        .unwrap();
+        let second = build_connector(
+            &agent,
+            &owner.public_key(),
+            ConnectorDraftAction::Grant,
+            draft(),
+        )
+        .unwrap();
+        assert_ne!(first.request_id, second.request_id);
+        let payload: serde_json::Value = decrypt_observer_payload(&owner, &first.event).unwrap();
+        assert!(payload["payload"]["request"].get("gmailLabels").is_none());
+    }
+
+    #[test]
+    fn connector_draft_canonicalizes_accepted_channel_uuid_forms() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        for supplied in [
+            "7c07e659361042f49a5e1e9973c09da9",
+            "7C07E659-3610-42F4-9A5E-1E9973C09DA9",
+            "urn:uuid:7c07e659-3610-42f4-9a5e-1e9973c09da9",
+        ] {
+            let built = build_connector(
+                &agent,
+                &owner.public_key(),
+                ConnectorDraftAction::Grant,
+                ConnectorDraft {
+                    channel_id: supplied.into(),
+                    target_name: "Research helper".into(),
+                    gmail_labels: Vec::new(),
+                },
+            )
+            .unwrap();
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner, &built.event).unwrap();
+            assert_eq!(payload["channelId"], CHANNEL);
+            assert_eq!(payload["payload"]["request"]["channelId"], CHANNEL);
+        }
+    }
+
+    #[test]
+    fn connector_draft_retry_id_is_exact_and_uuidv4_only() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let draft = || ConnectorDraft {
+            channel_id: CHANNEL.into(),
+            target_name: "Research helper".into(),
+            gmail_labels: Vec::new(),
+        };
+        let supplied = "550E8400E29B41D4A716446655440000";
+        let expected = "550e8400-e29b-41d4-a716-446655440000";
+        for _ in 0..2 {
+            let built = build_connector_with_request_id(
+                &agent,
+                &owner.public_key(),
+                ConnectorDraftAction::Grant,
+                draft(),
+                Some(supplied.into()),
+            )
+            .unwrap();
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner, &built.event).unwrap();
+            assert_eq!(built.request_id, expected);
+            assert_eq!(payload["payload"]["requestId"], expected);
+        }
+        for invalid in [
+            "not-a-uuid",
+            "7c07e659-3610-72f4-9a5e-1e9973c09da9",
+            "550e8400-e29b-41d4-0716-446655440000",
+            "7c07e659-3610-42f4-9a5e-1e9973c09da9-extra",
+        ] {
+            assert!(build_connector_with_request_id(
+                &agent,
+                &owner.public_key(),
+                ConnectorDraftAction::Grant,
+                draft(),
+                Some(invalid.into()),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn connector_draft_rejects_non_hint_values_and_bounds() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let make = |target_name: String, gmail_labels: Vec<String>| ConnectorDraft {
+            channel_id: CHANNEL.into(),
+            target_name,
+            gmail_labels,
+        };
+        for target in [
+            "".to_owned(),
+            "x".repeat(MAX_NAME_CHARS + 1),
+            "https://example.test".to_owned(),
+            "someone@example.test".to_owned(),
+            CHANNEL.to_owned(),
+            "a".repeat(64),
+            "name\nsecret".to_owned(),
+        ] {
+            assert!(build_connector(
+                &agent,
+                &owner.public_key(),
+                ConnectorDraftAction::Grant,
+                make(target, Vec::new())
+            )
+            .is_err());
+        }
+        for labels in [
+            vec!["Inbox".into(); MAX_GMAIL_LABEL_HINTS + 1],
+            vec!["".into()],
+            vec!["x".repeat(MAX_GMAIL_LABEL_CHARS + 1)],
+            vec!["https://example.test".into()],
+            vec!["token@example.test".into()],
+        ] {
+            assert!(build_connector(
+                &agent,
+                &owner.public_key(),
+                ConnectorDraftAction::Revoke,
+                make("Research helper".into(), labels)
+            )
+            .is_err());
+        }
+        assert!(build_connector(
+            &agent,
+            &owner.public_key(),
+            ConnectorDraftAction::Grant,
+            ConnectorDraft {
+                channel_id: "wrong".into(),
+                ..make("Research helper".into(), Vec::new())
+            }
+        )
+        .is_err());
     }
 }

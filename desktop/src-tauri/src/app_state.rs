@@ -18,6 +18,8 @@ use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 
 pub struct AppState {
     pub keys: Mutex<Keys>,
+    /// One-time, process-local challenges for externally hosted agent enrollment.
+    pub(crate) external_agent_enrollments: Mutex<HashMap<String, ExternalAgentEnrollment>>,
     /// Durable backend holding `keys`. Updated after the key write and before
     /// recovery flags are cleared so `get_identity` reports a consistent state.
     pub(crate) identity_storage: AtomicU8,
@@ -32,6 +34,9 @@ pub struct AppState {
     /// validated relay origin.
     pub media_fetch_client: reqwest::Client,
     pub relay_url_override: Mutex<Option<String>>,
+    /// User-configured communities, supplied by narrow workspace IPC, never learned
+    /// from profile URLs. Only these origins may supply portable agent media.
+    pub agent_avatar_communities: Mutex<Vec<String>>,
     pub workspace_apply_lock: Arc<AsyncMutex<()>>,
     pub workspace_apply_generation: AtomicU64,
     /// Defers managed-agent restore until `apply_workspace` installs relay and identity.
@@ -43,7 +48,8 @@ pub struct AppState {
     /// Serializes every managed-runtime transition that changes the protected
     /// PID set: spawn/register, adoption, stop, shutdown, and sweep snapshots.
     /// Never perform network I/O while holding this lock.
-    pub managed_agent_runtime_transition: Mutex<()>,
+    /// Owns the per-relay admission record every local pair spawn re-checks.
+    pub managed_agent_runtime_transition: Mutex<crate::managed_agents::RelayAdmissions>,
     pub managed_agents_store_lock: Mutex<()>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
@@ -141,6 +147,13 @@ pub struct AppState {
     pub archive_db: crate::archive::ArchiveDb,
 }
 
+pub(crate) struct ExternalAgentEnrollment {
+    pub agent_pubkey: String,
+    pub owner_pubkey: String,
+    pub relay_url: String,
+    pub issued_at: u64,
+}
+
 /// Parse the `BUZZ_PRIVATE_KEY` env var into identity keys. `Some` means the
 /// env var was present and valid and MUST win over any persisted/keyring key
 /// (the dev/CI/harness override). `None` means absent or malformed — callers
@@ -200,6 +213,7 @@ pub fn build_app_state() -> AppState {
 
     AppState {
         keys: Mutex::new(keys),
+        external_agent_enrollments: Mutex::new(HashMap::new()),
         identity_storage: AtomicU8::new(identity_storage as u8),
         http_client: reqwest::Client::builder()
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -213,12 +227,13 @@ pub fn build_app_state() -> AppState {
              header across origins (redirect-hop SSRF)",
         ),
         relay_url_override: Mutex::new(None),
+        agent_avatar_communities: Mutex::new(Vec::new()),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),
         workspace_apply_generation: AtomicU64::new(0),
         managed_agent_restore_pending: AtomicBool::new(false),
         managed_agent_experiments: crate::managed_agents::ManagedAgentExperimentState::default(),
         shutdown_started: AtomicBool::new(false),
-        managed_agent_runtime_transition: Mutex::new(()),
+        managed_agent_runtime_transition: Mutex::default(),
         identity_mutation: Mutex::new(()),
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),

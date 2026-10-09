@@ -288,6 +288,13 @@ type MockBridgeOptions = {
   deepHistoryMessageCount?: number;
   feedReadError?: string;
   canvasReadError?: string;
+  /** Seed canvas revisions (oldest first); see e2eBridge mock config. */
+  canvasRevisions?: Array<{
+    content: string;
+    createdAt?: number;
+    eventId?: string;
+    author?: string;
+  }>;
   /** Delay (ms) for `apply_workspace`; see e2eBridge mock config. */
   applyCommunityDelayMs?: number;
   /** Reject `clear_pending_navigation_deep_links` with this message. */
@@ -604,6 +611,12 @@ type MockBridgeOptions = {
    * returning a catalog. Exercises the discovery-failure UI path.
    */
   discoverAgentModelsError?: string;
+  /** Delay (ms) before `discover_agent_models` settles. */
+  discoverAgentModelsDelayMs?: number;
+  /** Config surface returned for every agent instead of the per-runtime mocks. */
+  agentConfigSurface?: Record<string, unknown>;
+  /** ACP commands returned by `discover_acp_commands`. Defaults to `[]`. */
+  acpCommands?: Array<{ command: string; binaryPath: string }>;
   /**
    * Providers returned by `discover_backend_providers`. Defaults to `[]`
    * (the "Run on" section stays hidden). Setting this renders the remote

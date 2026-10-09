@@ -1,0 +1,1551 @@
+From 2ea9d5391d8f90f02b9b060cd5d95b019702f3e1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ji=C5=99=C3=AD=20Hroza?= <jiri.hroza@gmail.com>
+Date: Sat, 26 Sep 2026 23:03:52 +0200
+Subject: [PATCH] feat: enroll external agents with owner proof
+
+---
+ desktop/src-tauri/src/app_state.rs            |  10 +
+ .../src/commands/external_agent_enrollment.rs | 381 ++++++++++++++++
+ .../external_agent_enrollment_tests.rs        | 424 ++++++++++++++++++
+ desktop/src-tauri/src/commands/mod.rs         |   3 +
+ desktop/src-tauri/src/lib.rs                  |   2 +
+ .../src/managed_agents/persona_events.rs      |  21 +
+ .../managed_agents/persona_events/tests.rs    | 125 ++++++
+ desktop/src/features/agents/ui/AgentsView.tsx |  20 +
+ .../ui/ExternalAgentEnrollmentDialog.tsx      | 300 +++++++++++++
+ desktop/src/shared/api/tauri.ts               |  35 ++
+ .../EXTERNAL-AGENT-ENROLLMENT.md              |  57 +++
+ 11 files changed, 1378 insertions(+)
+ create mode 100644 desktop/src-tauri/src/commands/external_agent_enrollment.rs
+ create mode 100644 desktop/src-tauri/src/commands/external_agent_enrollment_tests.rs
+ create mode 100644 desktop/src/features/agents/ui/ExternalAgentEnrollmentDialog.tsx
+ create mode 100644 integration/rowvia/native-management/EXTERNAL-AGENT-ENROLLMENT.md
+
+diff --git a/desktop/src-tauri/src/app_state.rs b/desktop/src-tauri/src/app_state.rs
+index f1136e889..aa72f8daf 100644
+--- a/desktop/src-tauri/src/app_state.rs
++++ b/desktop/src-tauri/src/app_state.rs
+@@ -18,6 +18,8 @@ use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
+ 
+ pub struct AppState {
+     pub keys: Mutex<Keys>,
++    /// One-time, process-local challenges for externally hosted agent enrollment.
++    pub(crate) external_agent_enrollments: Mutex<HashMap<String, ExternalAgentEnrollment>>,
+     /// Durable backend holding `keys`. Updated after the key write and before
+     /// recovery flags are cleared so `get_identity` reports a consistent state.
+     pub(crate) identity_storage: AtomicU8,
+@@ -141,6 +143,13 @@ pub struct AppState {
+     pub archive_db: crate::archive::ArchiveDb,
+ }
+ 
++pub(crate) struct ExternalAgentEnrollment {
++    pub agent_pubkey: String,
++    pub owner_pubkey: String,
++    pub relay_url: String,
++    pub issued_at: u64,
++}
++
+ /// Parse the `BUZZ_PRIVATE_KEY` env var into identity keys. `Some` means the
+ /// env var was present and valid and MUST win over any persisted/keyring key
+ /// (the dev/CI/harness override). `None` means absent or malformed — callers
+@@ -200,6 +209,7 @@ pub fn build_app_state() -> AppState {
+ 
+     AppState {
+         keys: Mutex::new(keys),
++        external_agent_enrollments: Mutex::new(HashMap::new()),
+         identity_storage: AtomicU8::new(identity_storage as u8),
+         http_client: reqwest::Client::builder()
+             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+diff --git a/desktop/src-tauri/src/commands/external_agent_enrollment.rs b/desktop/src-tauri/src/commands/external_agent_enrollment.rs
+new file mode 100644
+index 000000000..63f1f79ac
+--- /dev/null
++++ b/desktop/src-tauri/src/commands/external_agent_enrollment.rs
+@@ -0,0 +1,381 @@
++//! One-time owner authorization for an agent whose signer stays outside Buzz.
++//! No managed-agent record or ACP runtime is created by this module.
++
++use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use tauri::{AppHandle, State};
++
++use crate::{
++    app_state::{AppState, ExternalAgentEnrollment},
++    managed_agents::{
++        load_managed_agents,
++        retention::{
++            active_retention_scope, get_retained_event, open_retention_db, retain_event,
++            RetainedEvent,
++        },
++        validate_managed_agent_definition_text,
++    },
++    relay::relay_ws_url_with_override,
++};
++
++const ENROLLMENT_TTL_SECONDS: u64 = 300;
++const AGENT_KIND: u32 = 30177;
++const MAX_PROOF_JSON_BYTES: usize = 8192;
++
++#[derive(Serialize, Deserialize)]
++pub(crate) struct ExternalAnnouncement {
++    name: String,
++    parallelism: u32,
++    respond_to: String,
++    external_enrollment: EnrollmentEvidence,
++}
++
++#[derive(Serialize, Deserialize)]
++struct EnrollmentEvidence {
++    version: u8,
++    challenge_hash: String,
++    proof_event_id: String,
++    issued_at: u64,
++    relay_url_hash: String,
++}
++
++fn challenge_hash(challenge: &str) -> String {
++    hex::encode(Sha256::digest(challenge.as_bytes()))
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ExternalAgentChallenge {
++    challenge: String,
++    owner_pubkey: String,
++    relay_url: String,
++    expires_at: u64,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CompleteExternalAgentEnrollment {
++    name: String,
++    challenge: String,
++    proof_event_json: String,
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ExternalAgentAuthorization {
++    agent_pubkey: String,
++    owner_pubkey: String,
++    relay_url: String,
++    auth_tag: String,
++}
++
++fn now_unix() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs()
++}
++
++#[tauri::command]
++pub fn prepare_external_agent_enrollment(
++    agent_pubkey: String,
++    state: State<'_, AppState>,
++) -> Result<ExternalAgentChallenge, String> {
++    let agent = PublicKey::from_hex(agent_pubkey.trim())
++        .map_err(|_| "agent public key must be a valid 64-character hex key".to_string())?;
++    let owner = state.signing_keys()?.public_key().to_hex();
++    if agent.to_hex() == owner {
++        return Err("agent and owner must have different public keys".into());
++    }
++    let relay_url = relay_ws_url_with_override(&state);
++    let issued_at = now_unix();
++    // The random key is discarded; only its public bytes serve as a nonce.
++    let nonce = Keys::generate().public_key().to_hex();
++    let challenge = format!(
++        "buzz:external-agent-enrollment:v1:{owner}:{}:{nonce}",
++        agent.to_hex()
++    );
++    let mut pending = state
++        .external_agent_enrollments
++        .lock()
++        .map_err(|e| e.to_string())?;
++    pending.retain(|_, entry| issued_at.saturating_sub(entry.issued_at) <= ENROLLMENT_TTL_SECONDS);
++    if pending.len() >= 32 {
++        return Err("too many pending agent enrollments".into());
++    }
++    pending.insert(
++        challenge.clone(),
++        ExternalAgentEnrollment {
++            agent_pubkey: agent.to_hex(),
++            owner_pubkey: owner.clone(),
++            relay_url: relay_url.clone(),
++            issued_at,
++        },
++    );
++    Ok(ExternalAgentChallenge {
++        challenge,
++        owner_pubkey: owner,
++        relay_url,
++        expires_at: issued_at + ENROLLMENT_TTL_SECONDS,
++    })
++}
++
++fn verify_proof(
++    proof: &Event,
++    challenge: &str,
++    entry: &ExternalAgentEnrollment,
++    now: u64,
++) -> Result<(), String> {
++    proof
++        .verify()
++        .map_err(|_| "invalid agent proof signature".to_string())?;
++    if proof.kind != Kind::TextNote
++        || proof.pubkey.to_hex() != entry.agent_pubkey
++        || proof.content != challenge
++    {
++        return Err("agent proof does not match the enrollment challenge".into());
++    }
++    let owner_tags: Vec<_> = proof
++        .tags
++        .iter()
++        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("p"))
++        .collect();
++    if owner_tags.len() != 1
++        || owner_tags[0].as_slice().get(1).map(String::as_str) != Some(entry.owner_pubkey.as_str())
++    {
++        return Err("agent proof must address exactly the current owner".into());
++    }
++    let created_at = proof.created_at.as_secs();
++    if now > entry.issued_at + ENROLLMENT_TTL_SECONDS
++        || created_at < entry.issued_at
++        || created_at > entry.issued_at + ENROLLMENT_TTL_SECONDS
++        || created_at > now.saturating_add(30)
++    {
++        return Err("agent proof is stale or outside the challenge lifetime".into());
++    }
++    Ok(())
++}
++
++fn mint_auth_tag(owner_keys: &Keys, agent_pubkey: &str) -> Result<String, String> {
++    // Bridge the desktop's nostr version to buzz-sdk's NIP-OA implementation.
++    let compat_owner = nostr::Keys::parse(&owner_keys.secret_key().to_secret_hex())
++        .map_err(|e| format!("failed to bridge owner signer: {e}"))?;
++    let compat_agent =
++        nostr::PublicKey::from_hex(agent_pubkey).map_err(|e| format!("invalid agent key: {e}"))?;
++    buzz_sdk_pkg::nip_oa::compute_auth_tag(&compat_owner, &compat_agent, "kind=0")
++        .map_err(|e| format!("failed to authorize agent profile: {e}"))
++}
++
++/// Only owner-signed rows with the external enrollment marker can be recovered
++/// or refreshed at flush time. Managed-agent 30177 rows never carry this marker.
++pub(crate) fn verified_external_announcement(
++    row: &RetainedEvent,
++    event: &Event,
++    owner_pubkey: &str,
++    relay_url: &str,
++) -> Option<ExternalAnnouncement> {
++    if row.kind != AGENT_KIND
++        || row.pubkey != owner_pubkey
++        || event.kind != Kind::Custom(AGENT_KIND as u16)
++        || event.pubkey.to_hex() != owner_pubkey
++        || event.content != row.content
++        || event.created_at.as_secs() as i64 != row.created_at
++        || event.tags.len() != 1
++        || event.tags.iter().next()?.as_slice().len() != 2
++        || event.tags.iter().next()?.as_slice()[0] != "d"
++        || event.tags.iter().next()?.as_slice()[1] != row.d_tag.as_str()
++        || event.verify().is_err()
++    {
++        return None;
++    }
++    let content: ExternalAnnouncement = serde_json::from_str(&row.content).ok()?;
++    (content.external_enrollment.version == 1
++        && content.parallelism == 1
++        && content.respond_to == "owner-only"
++        && content.external_enrollment.relay_url_hash == challenge_hash(relay_url)
++        && content.external_enrollment.challenge_hash.len() == 64
++        && content.external_enrollment.proof_event_id.len() == 64)
++        .then_some(content)
++}
++
++fn authorize_public_agent(
++    conn: &rusqlite::Connection,
++    owner_keys: &Keys,
++    agent_pubkey: &str,
++    name: &str,
++    challenge: &str,
++    proof: &Event,
++    issued_at: u64,
++    relay_url: &str,
++) -> Result<String, String> {
++    let owner_pubkey = owner_keys.public_key().to_hex();
++    if get_retained_event(conn, AGENT_KIND, &owner_pubkey, agent_pubkey)?.is_some() {
++        return Err("this agent is already announced in this workspace".into());
++    }
++
++    let auth_tag = mint_auth_tag(owner_keys, agent_pubkey)?;
++    let content = serde_json::to_string(&ExternalAnnouncement {
++        name: name.to_string(),
++        parallelism: 1,
++        respond_to: "owner-only".to_string(),
++        external_enrollment: EnrollmentEvidence {
++            version: 1,
++            challenge_hash: challenge_hash(challenge),
++            proof_event_id: proof.id.to_hex(),
++            issued_at,
++            relay_url_hash: challenge_hash(relay_url),
++        },
++    })
++    .map_err(|e| format!("failed to serialize agent announcement: {e}"))?;
++    let event = EventBuilder::new(Kind::Custom(AGENT_KIND as u16), content)
++        .tags([Tag::parse(["d", agent_pubkey]).map_err(|e| e.to_string())?])
++        .sign_with_keys(owner_keys)
++        .map_err(|e| format!("failed to sign agent announcement: {e}"))?;
++    retain_event(
++        conn,
++        &RetainedEvent {
++            kind: AGENT_KIND,
++            pubkey: owner_pubkey,
++            d_tag: agent_pubkey.to_string(),
++            content: event.content.clone(),
++            created_at: event.created_at.as_secs() as i64,
++            raw_event: event.as_json(),
++            pending_sync: true,
++        },
++    )?;
++    Ok(auth_tag)
++}
++
++fn complete_external_agent_enrollment_at(
++    input: CompleteExternalAgentEnrollment,
++    state: &AppState,
++    conn: &rusqlite::Connection,
++    owner_keys: &Keys,
++    relay_url: &str,
++    managed_exists: bool,
++    now: u64,
++) -> Result<ExternalAgentAuthorization, String> {
++    let name = input.name.trim();
++    validate_managed_agent_definition_text(name, None, None)?;
++    if input.challenge.len() > 256 || input.proof_event_json.len() > MAX_PROOF_JSON_BYTES {
++        return Err("enrollment challenge or proof is too large".into());
++    }
++    let proof: Event = serde_json::from_str(&input.proof_event_json)
++        .map_err(|_| "proof must be a signed Nostr event JSON object".to_string())?;
++    let agent_pubkey = proof.pubkey.to_hex();
++    let owner_pubkey = owner_keys.public_key().to_hex();
++    if managed_exists {
++        return Err("this public key already belongs to a local managed agent".into());
++    }
++    let existing = get_retained_event(conn, AGENT_KIND, &owner_pubkey, &agent_pubkey)?;
++    let auth_tag = if let Some(existing) = existing {
++        let event = Event::from_json(&existing.raw_event)
++            .map_err(|_| "existing agent announcement is invalid".to_string())?;
++        let content =
++            verified_external_announcement(&existing, &event, &owner_pubkey, relay_url)
++                .ok_or_else(|| "this key already has a different owner announcement".to_string())?;
++        if content.name != name {
++            return Err("existing agent name differs; enrollment cannot change policy".into());
++        }
++        if content.external_enrollment.relay_url_hash != challenge_hash(relay_url) {
++            return Err("workspace changed since enrollment".into());
++        }
++        if content.external_enrollment.challenge_hash == challenge_hash(&input.challenge)
++            && content.external_enrollment.proof_event_id == proof.id.to_hex()
++        {
++            // Exact retry, including after restart: the durable owner-signed
++            // row proves this proof passed the original fresh challenge gate.
++            let original = ExternalAgentEnrollment {
++                agent_pubkey: agent_pubkey.clone(),
++                owner_pubkey: owner_pubkey.clone(),
++                relay_url: relay_url.to_string(),
++                issued_at: content.external_enrollment.issued_at,
++            };
++            verify_proof(
++                &proof,
++                &input.challenge,
++                &original,
++                proof.created_at.as_secs(),
++            )?;
++        } else {
++            // If the original challenge/proof was lost, a fresh proof by the
++            // same agent key can recover the public tag without rewriting 30177.
++            let pending = state
++                .external_agent_enrollments
++                .lock()
++                .map_err(|e| e.to_string())?
++                .remove(&input.challenge)
++                .ok_or_else(|| "unknown or already-used enrollment challenge".to_string())?;
++            if pending.owner_pubkey != owner_pubkey || pending.relay_url != relay_url {
++                return Err("owner or workspace changed since challenge creation".into());
++            }
++            verify_proof(&proof, &input.challenge, &pending, now)?;
++        }
++        mint_auth_tag(owner_keys, &agent_pubkey)?
++    } else {
++        // First enrollment consumes its challenge before proof verification.
++        let pending = state
++            .external_agent_enrollments
++            .lock()
++            .map_err(|e| e.to_string())?
++            .remove(&input.challenge)
++            .ok_or_else(|| "unknown or already-used enrollment challenge".to_string())?;
++        if pending.owner_pubkey != owner_pubkey || pending.relay_url != relay_url {
++            return Err("owner or workspace changed since challenge creation".into());
++        }
++        verify_proof(&proof, &input.challenge, &pending, now)?;
++        authorize_public_agent(
++            conn,
++            owner_keys,
++            &agent_pubkey,
++            name,
++            &input.challenge,
++            &proof,
++            pending.issued_at,
++            relay_url,
++        )?
++    };
++    Ok(ExternalAgentAuthorization {
++        agent_pubkey,
++        owner_pubkey,
++        relay_url: relay_url.to_string(),
++        auth_tag,
++    })
++}
++
++#[tauri::command]
++pub fn complete_external_agent_enrollment(
++    input: CompleteExternalAgentEnrollment,
++    app: AppHandle,
++    state: State<'_, AppState>,
++) -> Result<ExternalAgentAuthorization, String> {
++    let _store_guard = state
++        .managed_agents_store_lock
++        .lock()
++        .map_err(|e| e.to_string())?;
++    let scope = active_retention_scope(&app, &state)?;
++    let proof: Event = if input.proof_event_json.len() <= MAX_PROOF_JSON_BYTES {
++        serde_json::from_str(&input.proof_event_json)
++            .map_err(|_| "proof must be a signed Nostr event JSON object".to_string())?
++    } else {
++        return Err("enrollment proof is too large".into());
++    };
++    let managed_exists = load_managed_agents(&app)?
++        .iter()
++        .any(|agent| agent.pubkey.eq_ignore_ascii_case(&proof.pubkey.to_hex()));
++    let conn = open_retention_db(&scope.db_path)?;
++    complete_external_agent_enrollment_at(
++        input,
++        &state,
++        &conn,
++        &scope.owner_keys,
++        &scope.relay_url,
++        managed_exists,
++        now_unix(),
++    )
++}
++
++#[cfg(test)]
++#[path = "external_agent_enrollment_tests.rs"]
++mod tests;
+diff --git a/desktop/src-tauri/src/commands/external_agent_enrollment_tests.rs b/desktop/src-tauri/src/commands/external_agent_enrollment_tests.rs
+new file mode 100644
+index 000000000..b5abe4847
+--- /dev/null
++++ b/desktop/src-tauri/src/commands/external_agent_enrollment_tests.rs
+@@ -0,0 +1,424 @@
++use super::*;
++use nostr::Timestamp;
++
++fn entry(owner: &Keys, agent: &Keys, issued_at: u64) -> ExternalAgentEnrollment {
++    ExternalAgentEnrollment {
++        agent_pubkey: agent.public_key().to_hex(),
++        owner_pubkey: owner.public_key().to_hex(),
++        relay_url: "wss://relay.example".into(),
++        issued_at,
++    }
++}
++
++fn proof(signer: &Keys, challenge: &str, owner: &Keys, created_at: u64) -> Event {
++    EventBuilder::new(Kind::TextNote, challenge)
++        .tags([Tag::parse(["p", owner.public_key().to_hex().as_str()]).unwrap()])
++        .custom_created_at(Timestamp::from(created_at))
++        .sign_with_keys(signer)
++        .unwrap()
++}
++
++#[test]
++fn accepts_only_fresh_agent_signed_proof_for_the_named_owner() {
++    let owner = Keys::generate();
++    let agent = Keys::generate();
++    let other = Keys::generate();
++    let issued_at = 1_700_000_000;
++    let challenge = "buzz:external-agent-enrollment:v1:test";
++    let pending = entry(&owner, &agent, issued_at);
++    assert!(verify_proof(
++        &proof(&agent, challenge, &owner, issued_at),
++        challenge,
++        &pending,
++        issued_at
++    )
++    .is_ok());
++    assert!(
++        verify_proof(
++            &proof(&other, challenge, &owner, issued_at),
++            challenge,
++            &pending,
++            issued_at
++        )
++        .is_err(),
++        "forged agent identity"
++    );
++    assert!(
++        verify_proof(
++            &proof(&agent, challenge, &other, issued_at),
++            challenge,
++            &pending,
++            issued_at
++        )
++        .is_err(),
++        "wrong owner"
++    );
++    let duplicate_owner = EventBuilder::new(Kind::TextNote, challenge)
++        .tags([
++            Tag::parse(["p", owner.public_key().to_hex().as_str()]).unwrap(),
++            Tag::parse(["p", owner.public_key().to_hex().as_str()]).unwrap(),
++        ])
++        .custom_created_at(Timestamp::from(issued_at))
++        .sign_with_keys(&agent)
++        .unwrap();
++    assert!(
++        verify_proof(&duplicate_owner, challenge, &pending, issued_at).is_err(),
++        "duplicate owner tags"
++    );
++    assert!(
++        verify_proof(
++            &proof(&agent, "another challenge", &owner, issued_at),
++            challenge,
++            &pending,
++            issued_at
++        )
++        .is_err(),
++        "wrong challenge"
++    );
++    assert!(
++        verify_proof(
++            &proof(&agent, challenge, &owner, issued_at - 1),
++            challenge,
++            &pending,
++            issued_at
++        )
++        .is_err(),
++        "pre-challenge signature"
++    );
++    assert!(
++        verify_proof(
++            &proof(&agent, challenge, &owner, issued_at),
++            challenge,
++            &pending,
++            issued_at + ENROLLMENT_TTL_SECONDS + 1
++        )
++        .is_err(),
++        "expired challenge"
++    );
++    assert!(
++        verify_proof(
++            &proof(&agent, challenge, &owner, issued_at + 31),
++            challenge,
++            &pending,
++            issued_at
++        )
++        .is_err(),
++        "future proof"
++    );
++}
++
++fn seed(state: &AppState, challenge: &str, owner: &Keys, agent: &Keys, issued_at: u64) {
++    state
++        .external_agent_enrollments
++        .lock()
++        .unwrap()
++        .insert(challenge.to_string(), entry(owner, agent, issued_at));
++}
++
++fn input(name: &str, challenge: &str, proof: &Event) -> CompleteExternalAgentEnrollment {
++    CompleteExternalAgentEnrollment {
++        name: name.into(),
++        challenge: challenge.into(),
++        proof_event_json: proof.as_json(),
++    }
++}
++
++#[test]
++fn completion_recovers_public_tag_without_rewriting_announcement_or_spawning_acp() {
++    let owner = Keys::generate();
++    let agent = Keys::generate();
++    let state = crate::app_state::build_app_state();
++    let issued_at = 1_700_000_000;
++    let challenge = "buzz:external-agent-enrollment:v1:first";
++    seed(&state, challenge, &owner, &agent, issued_at);
++    let signed_proof = proof(&agent, challenge, &owner, issued_at);
++    let temp = tempfile::tempdir().unwrap();
++    let conn = open_retention_db(&temp.path().join("retention.db")).unwrap();
++    let result = complete_external_agent_enrollment_at(
++        input("Remote Scout", challenge, &signed_proof),
++        &state,
++        &conn,
++        &owner,
++        "wss://relay.example",
++        false,
++        issued_at,
++    )
++    .unwrap();
++    let tag = result.auth_tag;
++    let tag_fields: Vec<String> = serde_json::from_str(&tag).unwrap();
++    assert_eq!(tag_fields[0], "auth");
++    assert_eq!(tag_fields[1], owner.public_key().to_hex());
++    assert_eq!(tag_fields[2], "kind=0");
++    let compat_agent = nostr::PublicKey::from_hex(&agent.public_key().to_hex()).unwrap();
++    let verified_owner = buzz_sdk_pkg::nip_oa::verify_auth_tag(&tag, &compat_agent).unwrap();
++    assert_eq!(verified_owner.to_hex(), owner.public_key().to_hex());
++    let retained = get_retained_event(
++        &conn,
++        AGENT_KIND,
++        &owner.public_key().to_hex(),
++        &agent.public_key().to_hex(),
++    )
++    .unwrap()
++    .unwrap();
++    let announcement: Event = serde_json::from_str(&retained.raw_event).unwrap();
++    announcement.verify().unwrap();
++    assert_eq!(announcement.pubkey, owner.public_key());
++    assert_eq!(announcement.kind, Kind::Custom(30177));
++    assert!(verified_external_announcement(
++        &retained,
++        &announcement,
++        &owner.public_key().to_hex(),
++        "wss://relay.example"
++    )
++    .is_some());
++    assert!(verified_external_announcement(
++        &retained,
++        &announcement,
++        &owner.public_key().to_hex(),
++        "wss://another-relay.example"
++    )
++    .is_none());
++    assert!(verified_external_announcement(
++        &retained,
++        &announcement,
++        &Keys::generate().public_key().to_hex(),
++        "wss://relay.example"
++    )
++    .is_none());
++    assert!(retained.pending_sync);
++    assert!(
++        !temp.path().join("managed-agents.json").exists(),
++        "external enrollment must not write a managed ACP record"
++    );
++    let recovered = complete_external_agent_enrollment_at(
++        input("Remote Scout", challenge, &signed_proof),
++        &state,
++        &conn,
++        &owner,
++        "wss://relay.example",
++        false,
++        issued_at + 1000,
++    )
++    .unwrap();
++    assert_eq!(recovered.agent_pubkey, agent.public_key().to_hex());
++    assert_eq!(
++        get_retained_event(
++            &conn,
++            AGENT_KIND,
++            &owner.public_key().to_hex(),
++            &agent.public_key().to_hex()
++        )
++        .unwrap()
++        .unwrap()
++        .raw_event,
++        retained.raw_event
++    );
++
++    // Recovery still works when the old proof was lost: a fresh challenge and
++    // fresh proof by the same signer return the tag without changing policy.
++    let next_challenge = "buzz:external-agent-enrollment:v1:second";
++    seed(&state, next_challenge, &owner, &agent, issued_at + 1000);
++    let next_proof = proof(&agent, next_challenge, &owner, issued_at + 1000);
++    complete_external_agent_enrollment_at(
++        input("Remote Scout", next_challenge, &next_proof),
++        &state,
++        &conn,
++        &owner,
++        "wss://relay.example",
++        false,
++        issued_at + 1000,
++    )
++    .unwrap();
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote Scout", next_challenge, &next_proof),
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at + 1000,
++        )
++        .is_err(),
++        "fresh recovery proof is one-use"
++    );
++    assert_eq!(
++        get_retained_event(
++            &conn,
++            AGENT_KIND,
++            &owner.public_key().to_hex(),
++            &agent.public_key().to_hex()
++        )
++        .unwrap()
++        .unwrap()
++        .raw_event,
++        retained.raw_event
++    );
++    assert!(complete_external_agent_enrollment_at(
++        input("Changed name", challenge, &signed_proof),
++        &state,
++        &conn,
++        &owner,
++        "wss://relay.example",
++        false,
++        issued_at + 1000,
++    )
++    .is_err());
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote Scout", challenge, &signed_proof),
++            &state,
++            &conn,
++            &owner,
++            "wss://another-relay.example",
++            false,
++            issued_at + 1000,
++        )
++        .is_err(),
++        "retained evidence is bound to its relay"
++    );
++}
++
++#[test]
++fn completion_rejects_forged_proof_owner_drift_managed_collision_and_large_input() {
++    let owner = Keys::generate();
++    let agent = Keys::generate();
++    let stranger = Keys::generate();
++    let state = crate::app_state::build_app_state();
++    let issued_at = 1_700_000_000;
++    let temp = tempfile::tempdir().unwrap();
++    let conn = open_retention_db(&temp.path().join("retention.db")).unwrap();
++    let challenge = "buzz:external-agent-enrollment:v1:guard";
++    let signed = proof(&agent, challenge, &owner, issued_at);
++
++    seed(&state, challenge, &owner, &agent, issued_at);
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote", challenge, &signed),
++            &state,
++            &conn,
++            &stranger,
++            "wss://relay.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "owner drift"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote", challenge, &signed),
++            &state,
++            &conn,
++            &owner,
++            "wss://other.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "relay drift"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote", challenge, &signed),
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            true,
++            issued_at
++        )
++        .is_err(),
++        "managed key collision"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    let forged = proof(&stranger, challenge, &owner, issued_at);
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote", challenge, &forged),
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "wrong signer"
++    );
++    assert!(
++        complete_external_agent_enrollment_at(
++            input("Remote", challenge, &signed),
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at,
++        )
++        .is_err(),
++        "failed proof consumed the challenge"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    let mut tampered: serde_json::Value = serde_json::from_str(&signed.as_json()).unwrap();
++    tampered["id"] = serde_json::json!("00".repeat(32));
++    let mut bad = input("Remote", challenge, &signed);
++    bad.proof_event_json = tampered.to_string();
++    assert!(
++        complete_external_agent_enrollment_at(
++            bad,
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "tampered id"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    let mut tampered_sig: serde_json::Value = serde_json::from_str(&signed.as_json()).unwrap();
++    tampered_sig["sig"] = serde_json::json!("00".repeat(64));
++    let mut bad_sig = input("Remote", challenge, &signed);
++    bad_sig.proof_event_json = tampered_sig.to_string();
++    assert!(
++        complete_external_agent_enrollment_at(
++            bad_sig,
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "tampered signature"
++    );
++    seed(&state, challenge, &owner, &agent, issued_at);
++    let mut oversized = input("Remote", challenge, &signed);
++    oversized.proof_event_json = "x".repeat(MAX_PROOF_JSON_BYTES + 1);
++    assert!(
++        complete_external_agent_enrollment_at(
++            oversized,
++            &state,
++            &conn,
++            &owner,
++            "wss://relay.example",
++            false,
++            issued_at
++        )
++        .is_err(),
++        "proof input bound"
++    );
++    assert!(get_retained_event(
++        &conn,
++        AGENT_KIND,
++        &owner.public_key().to_hex(),
++        &agent.public_key().to_hex()
++    )
++    .unwrap()
++    .is_none());
++}
+diff --git a/desktop/src-tauri/src/commands/mod.rs b/desktop/src-tauri/src/commands/mod.rs
+index 5f9e8f224..4a5d83107 100644
+--- a/desktop/src-tauri/src/commands/mod.rs
++++ b/desktop/src-tauri/src/commands/mod.rs
+@@ -20,6 +20,7 @@ mod channels;
+ mod clipboard;
+ mod dms;
+ mod engrams;
++mod external_agent_enrollment;
+ mod export_util;
+ mod global_agent_config;
+ mod identity;
+@@ -88,6 +89,8 @@ pub use agent_providers::*;
+ pub use agent_settings::*;
+ pub use agents::*;
+ pub use bestie::*;
++pub use external_agent_enrollment::*;
++pub(crate) use external_agent_enrollment::verified_external_announcement;
+ pub use canvas::*;
+ pub use channel_reconnect_repair::*;
+ pub use channel_templates::*;
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index 7e1dbcd93..5af48c492 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -705,6 +705,8 @@ pub fn run() {
+             reconcile_managed_agent_runtimes,
+             put_managed_agent_runtime_lifecycle,
+             create_managed_agent,
++            prepare_external_agent_enrollment,
++            complete_external_agent_enrollment,
+             start_managed_agent,
+             stop_managed_agent,
+             set_agent_managed_profiles,
+diff --git a/desktop/src-tauri/src/managed_agents/persona_events.rs b/desktop/src-tauri/src/managed_agents/persona_events.rs
+index 25ebb78d6..dd30d76bb 100644
+--- a/desktop/src-tauri/src/managed_agents/persona_events.rs
++++ b/desktop/src-tauri/src/managed_agents/persona_events.rs
+@@ -413,6 +413,27 @@ pub(crate) async fn flush_pending_events_at(
+             // and `mark_synced` below still compares against the retained row's
+             // original `created_at`/`content`, which are untouched.
+             resign_with_fresh_timestamp(&event, state)?
++        } else if crate::commands::verified_external_announcement(
++            &current,
++            &event,
++            &owner_pubkey,
++            relay_url,
++        )
++        .is_some()
++            && current
++                .created_at
++                .abs_diff(nostr::Timestamp::now().as_secs() as i64)
++                > 600
++        {
++            // An offline external enrollment has no managed-agent record for
++            // boot reconcile to re-sign. Refresh only this verified owner
++            // announcement at send time; the retained row stays byte-stable
++            // for mark_synced's compare-and-clear and outage retries.
++            EventBuilder::new(event.kind, event.content.clone())
++                .tags(event.tags.iter().cloned())
++                .custom_created_at(nostr::Timestamp::now())
++                .sign_with_keys(owner_keys)
++                .map_err(|e| format!("failed to refresh external agent announcement: {e}"))?
+         } else {
+             event
+         };
+diff --git a/desktop/src-tauri/src/managed_agents/persona_events/tests.rs b/desktop/src-tauri/src/managed_agents/persona_events/tests.rs
+index 5f09d6e47..2329e0e20 100644
+--- a/desktop/src-tauri/src/managed_agents/persona_events/tests.rs
++++ b/desktop/src-tauri/src/managed_agents/persona_events/tests.rs
+@@ -948,6 +948,131 @@ mod flush_barrier {
+         .expect("retain test event");
+     }
+ 
++    #[tokio::test]
++    async fn external_announcement_is_refreshed_after_outage_and_restart() {
++        use sha2::Digest;
++        use std::sync::{
++            atomic::{AtomicUsize, Ordering},
++            Arc, Mutex,
++        };
++
++        use axum::{http::StatusCode, routing::post, Router};
++
++        let calls = Arc::new(AtomicUsize::new(0));
++        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
++        let route_calls = calls.clone();
++        let route_seen = seen.clone();
++        let app = Router::new().route(
++            "/events",
++            post(move |body: String| {
++                let calls = route_calls.clone();
++                let seen = route_seen.clone();
++                async move {
++                    let event: serde_json::Value = serde_json::from_str(&body).unwrap();
++                    seen.lock().unwrap().push(event.clone());
++                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
++                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
++                    }
++                    let created_at = event["created_at"].as_i64().unwrap();
++                    let now = nostr::Timestamp::now().as_secs() as i64;
++                    if created_at.abs_diff(now) > 900 {
++                        return (StatusCode::BAD_REQUEST, String::new());
++                    }
++                    (
++                        StatusCode::OK,
++                        serde_json::json!({
++                            "event_id": event["id"],
++                            "accepted": true,
++                            "message": ""
++                        })
++                        .to_string(),
++                    )
++                }
++            }),
++        );
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let relay_url = format!("http://{}", listener.local_addr().unwrap());
++        tokio::spawn(async move {
++            axum::serve(listener, app).await.ok();
++        });
++
++        let keys = nostr::Keys::generate();
++        let owner = keys.public_key().to_hex();
++        let agent = nostr::Keys::generate().public_key().to_hex();
++        let content = serde_json::json!({
++            "name": "Remote",
++            "parallelism": 1,
++            "respond_to": "owner-only",
++            "external_enrollment": {
++                "version": 1,
++                "challenge_hash": "a".repeat(64),
++                "proof_event_id": "b".repeat(64),
++                "issued_at": 1,
++                "relay_url_hash": hex::encode(sha2::Sha256::digest(relay_url.as_bytes()))
++            }
++        })
++        .to_string();
++        let dir = tempfile::tempdir().unwrap();
++        let db_path = dir.path().join("retention.db");
++        {
++            let conn = open_retention_db(&db_path).unwrap();
++            let event = EventBuilder::new(Kind::Custom(30177), content)
++                .tags([Tag::parse(["d", agent.as_str()]).unwrap()])
++                .custom_created_at(nostr::Timestamp::from(1))
++                .sign_with_keys(&keys)
++                .unwrap();
++            retain_event(
++                &conn,
++                &RetainedEvent {
++                    kind: 30177,
++                    pubkey: owner.clone(),
++                    d_tag: agent.clone(),
++                    content: event.content.clone(),
++                    created_at: 1,
++                    raw_event: event.as_json(),
++                    pending_sync: true,
++                },
++            )
++            .unwrap();
++        }
++
++        let first_state = build_app_state();
++        *first_state.keys.lock().unwrap() = keys.clone();
++        *first_state.relay_url_override.lock().unwrap() = Some(relay_url.clone());
++        assert_eq!(
++            flush_pending_events(&db_path, &first_state).await.unwrap(),
++            0
++        );
++        assert!(
++            get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
++                .unwrap()
++                .unwrap()
++                .pending_sync
++        );
++
++        // A new AppState has no memory of the enrollment challenge. The
++        // retained, owner-signed marker is enough to re-sign for relay TTL.
++        let restarted_state = build_app_state();
++        *restarted_state.keys.lock().unwrap() = keys;
++        *restarted_state.relay_url_override.lock().unwrap() = Some(relay_url);
++        assert_eq!(
++            flush_pending_events(&db_path, &restarted_state)
++                .await
++                .unwrap(),
++            1
++        );
++        let row = get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
++            .unwrap()
++            .unwrap();
++        assert!(!row.pending_sync);
++        let seen = seen.lock().unwrap();
++        assert_eq!(seen.len(), 2);
++        assert_eq!(seen[0]["content"], seen[1]["content"]);
++        assert_eq!(seen[0]["tags"], seen[1]["tags"]);
++        assert_eq!(seen[1]["pubkey"], owner);
++        assert!(seen[1]["created_at"].as_i64().unwrap() > 1);
++    }
++
+     #[test]
+     fn archive_request_resign_refreshes_timestamp_and_preserves_payload() {
+         use nostr::JsonUtil;
+diff --git a/desktop/src/features/agents/ui/AgentsView.tsx b/desktop/src/features/agents/ui/AgentsView.tsx
+index a31fec44c..bea5f5de2 100644
+--- a/desktop/src/features/agents/ui/AgentsView.tsx
++++ b/desktop/src/features/agents/ui/AgentsView.tsx
+@@ -7,6 +7,7 @@ import {
+ import { AddAgentToChannelDialog } from "./AddAgentToChannelDialog";
+ import { AddTeamToChannelDialog } from "./AddTeamToChannelDialog";
+ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
++import { ExternalAgentEnrollmentDialog } from "./ExternalAgentEnrollmentDialog";
+ import { AgentDialog } from "./AgentDialog";
+ import { CommunityCatalogDialog } from "./CommunityCatalogDialog";
+ import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
+@@ -49,6 +50,8 @@ export function AgentsView() {
+   const fullAiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
+   const compactActionsTriggerRef = React.useRef<HTMLButtonElement>(null);
+   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
++  const [isExternalEnrollmentOpen, setIsExternalEnrollmentOpen] =
++    React.useState(false);
+ 
+   function openAiDefaults(trigger: HTMLButtonElement | null) {
+     aiDefaultsTriggerRef.current = trigger;
+@@ -147,6 +150,14 @@ export function AgentsView() {
+             action={
+               <>
+                 <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
++                  <Button
++                    onClick={() => setIsExternalEnrollmentOpen(true)}
++                    size="sm"
++                    type="button"
++                    variant="outline"
++                  >
++                    Authorize external agent
++                  </Button>
+                   <Button
+                     data-testid="agent-defaults-button"
+                     ref={fullAiDefaultsTriggerRef}
+@@ -189,6 +200,11 @@ export function AgentsView() {
+                     </Button>
+                   </DropdownMenuTrigger>
+                   <DropdownMenuContent align="end">
++                    <DropdownMenuItem
++                      onSelect={() => setIsExternalEnrollmentOpen(true)}
++                    >
++                      Authorize external agent
++                    </DropdownMenuItem>
+                     <DropdownMenuItem
+                       onSelect={() => {
+                         openAiDefaults(compactActionsTriggerRef.current);
+@@ -312,6 +328,10 @@ export function AgentsView() {
+         open={isAiDefaultsOpen}
+         returnFocusRef={aiDefaultsTriggerRef}
+       />
++      <ExternalAgentEnrollmentDialog
++        open={isExternalEnrollmentOpen}
++        onOpenChange={setIsExternalEnrollmentOpen}
++      />
+ 
+       {agents.agentToAddToChannel ? (
+         <AddAgentToChannelDialog
+diff --git a/desktop/src/features/agents/ui/ExternalAgentEnrollmentDialog.tsx b/desktop/src/features/agents/ui/ExternalAgentEnrollmentDialog.tsx
+new file mode 100644
+index 000000000..ab594c581
+--- /dev/null
++++ b/desktop/src/features/agents/ui/ExternalAgentEnrollmentDialog.tsx
+@@ -0,0 +1,300 @@
++import * as React from "react";
++
++import {
++  useAddChannelMembersMutation,
++  useChannelsQuery,
++} from "@/features/channels/hooks";
++import {
++  completeExternalAgentEnrollment,
++  getRelayWsUrl,
++  prepareExternalAgentEnrollment,
++  type ExternalAgentAuthorization,
++  type ExternalAgentChallenge,
++} from "@/shared/api/tauri";
++import { Button } from "@/shared/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++import { Input } from "@/shared/ui/input";
++import { Textarea } from "@/shared/ui/textarea";
++
++export function ExternalAgentEnrollmentDialog({
++  open,
++  onOpenChange,
++}: {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}) {
++  const [name, setName] = React.useState("");
++  const [agentPubkey, setAgentPubkey] = React.useState("");
++  const [challenge, setChallenge] =
++    React.useState<ExternalAgentChallenge | null>(null);
++  const [proofEventJson, setProofEventJson] = React.useState("");
++  const [authorization, setAuthorization] =
++    React.useState<ExternalAgentAuthorization | null>(null);
++  const [error, setError] = React.useState<string | null>(null);
++  const [pending, setPending] = React.useState(false);
++  const [channelId, setChannelId] = React.useState("");
++  const [memberAdded, setMemberAdded] = React.useState(false);
++  const channelsQuery = useChannelsQuery({
++    enabled: open && Boolean(authorization),
++  });
++  const addMembers = useAddChannelMembersMutation(null);
++  const streams = (channelsQuery.data ?? []).filter(
++    (channel) =>
++      channel.channelType === "stream" &&
++      !channel.archivedAt &&
++      (channel.visibility === "open" || channel.isMember),
++  );
++  const selectedStream = streams.find((channel) => channel.id === channelId);
++  const alreadyMember = selectedStream?.memberPubkeys.some(
++    (pubkey) => pubkey.toLowerCase() === authorization?.agentPubkey,
++  );
++
++  React.useEffect(() => {
++    if (!open) return;
++    setName("");
++    setAgentPubkey("");
++    setChallenge(null);
++    setProofEventJson("");
++    setAuthorization(null);
++    setError(null);
++    setPending(false);
++    setChannelId("");
++    setMemberAdded(false);
++  }, [open]);
++
++  async function prepare() {
++    setPending(true);
++    setError(null);
++    setChallenge(null);
++    try {
++      setChallenge(await prepareExternalAgentEnrollment(agentPubkey));
++    } catch (cause) {
++      setError(String(cause));
++    } finally {
++      setPending(false);
++    }
++  }
++
++  async function addToStream() {
++    if (!authorization || !selectedStream || alreadyMember) return;
++    setPending(true);
++    setError(null);
++    try {
++      if ((await getRelayWsUrl()) !== authorization.relayUrl) {
++        throw new Error("Workspace changed since agent authorization.");
++      }
++      const result = await addMembers.mutateAsync({
++        channelId: selectedStream.id,
++        pubkeys: [authorization.agentPubkey],
++        role: "bot",
++        expectedRelayUrl: authorization.relayUrl,
++        expectedSignerPubkey: authorization.ownerPubkey,
++      });
++      if (!result.added.includes(authorization.agentPubkey)) {
++        throw new Error(
++          result.errors[0]?.error ?? "Agent was not added to the stream.",
++        );
++      }
++      setMemberAdded(true);
++    } catch (cause) {
++      setError(String(cause));
++    } finally {
++      setPending(false);
++    }
++  }
++
++  async function complete() {
++    if (!challenge) return;
++    setPending(true);
++    setError(null);
++    try {
++      setAuthorization(
++        await completeExternalAgentEnrollment({
++          name,
++          challenge: challenge.challenge,
++          proofEventJson,
++        }),
++      );
++      setChallenge(null);
++    } catch (cause) {
++      setChallenge(null);
++      setError(`${String(cause)} Start a new challenge before retrying.`);
++    } finally {
++      setPending(false);
++    }
++  }
++
++  return (
++    <Dialog
++      open={open}
++      onOpenChange={(nextOpen) => {
++        if (pending && !nextOpen) return;
++        onOpenChange(nextOpen);
++      }}
++    >
++      <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl overflow-y-auto">
++        <DialogHeader>
++          <DialogTitle>Authorize an external agent</DialogTitle>
++          <DialogDescription>
++            The agent keeps its private key and runs outside Buzz. This adds its
++            public identity to this workspace; it does not start an agent.
++          </DialogDescription>
++        </DialogHeader>
++        <div className="space-y-4">
++          <label
++            htmlFor="external-agent-name"
++            className="block space-y-1 text-sm"
++          >
++            <span>Agent display name</span>
++            <Input
++              id="external-agent-name"
++              disabled={pending || Boolean(authorization)}
++              value={name}
++              onChange={(event) => setName(event.target.value)}
++            />
++          </label>
++          <label
++            htmlFor="external-agent-pubkey"
++            className="block space-y-1 text-sm"
++          >
++            <span>External agent public key (hex)</span>
++            <Input
++              id="external-agent-pubkey"
++              disabled={pending || Boolean(challenge) || Boolean(authorization)}
++              value={agentPubkey}
++              onChange={(event) => setAgentPubkey(event.target.value)}
++            />
++          </label>
++          {!challenge && !authorization ? (
++            <Button
++              disabled={pending || !name.trim() || !agentPubkey.trim()}
++              onClick={() => void prepare()}
++              type="button"
++            >
++              Create signing challenge
++            </Button>
++          ) : null}
++          {challenge ? (
++            <>
++              <p className="text-sm">
++                On the external host, sign a Nostr kind 1 event with its own
++                key. Use the exact challenge below as content, one{" "}
++                <code>p</code> tag for the owner shown below, and the current
++                Unix time as <code>created_at</code>. Keep the signed event
++                private and paste its full JSON here within five minutes.
++              </p>
++              <label
++                htmlFor="external-agent-challenge"
++                className="block space-y-1 text-sm"
++              >
++                <span>Challenge (event content)</span>
++                <Textarea
++                  id="external-agent-challenge"
++                  readOnly
++                  value={challenge.challenge}
++                />
++              </label>
++              <p className="break-all text-xs">
++                Owner p tag: {challenge.ownerPubkey}
++              </p>
++              <p className="break-all text-xs">
++                Workspace relay: {challenge.relayUrl}
++              </p>
++              <label
++                htmlFor="external-agent-proof"
++                className="block space-y-1 text-sm"
++              >
++                <span>Signed proof event JSON</span>
++                <Textarea
++                  id="external-agent-proof"
++                  maxLength={8192}
++                  value={proofEventJson}
++                  onChange={(event) => setProofEventJson(event.target.value)}
++                />
++              </label>
++              <Button
++                disabled={pending || !proofEventJson.trim()}
++                onClick={() => void complete()}
++                type="button"
++              >
++                Authorize public key
++              </Button>
++            </>
++          ) : null}
++          {authorization ? (
++            <>
++              <p className="text-sm">
++                Owner announcement queued for {authorization.relayUrl}. On the
++                external host, publish a kind 0 profile signed by the agent key
++                with exactly one auth tag below. The profile must be the latest
++                kind 0 event for this key. You can add the public key to a
++                stream below even before its profile appears. If this tag is
++                lost, repeat this flow with the same public key and name; a
++                fresh signed proof recovers it without creating another
++                announcement.
++              </p>
++              <label
++                htmlFor="external-agent-auth"
++                className="block space-y-1 text-sm"
++              >
++                <span>NIP-OA auth tag (JSON array)</span>
++                <Textarea
++                  id="external-agent-auth"
++                  readOnly
++                  value={authorization.authTag}
++                />
++              </label>
++              <label
++                htmlFor="external-agent-stream"
++                className="block space-y-1 text-sm"
++              >
++                <span>Optional stream membership</span>
++                <select
++                  id="external-agent-stream"
++                  className="w-full rounded-md border bg-background px-3 py-2"
++                  disabled={pending || channelsQuery.isLoading}
++                  value={channelId}
++                  onChange={(event) => {
++                    setChannelId(event.target.value);
++                    setMemberAdded(false);
++                  }}
++                >
++                  <option value="">Select a stream</option>
++                  {streams.map((stream) => (
++                    <option key={stream.id} value={stream.id}>
++                      {stream.name}
++                    </option>
++                  ))}
++                </select>
++              </label>
++              {alreadyMember || memberAdded ? (
++                <p className="text-sm">
++                  Agent is already a member of this stream.
++                </p>
++              ) : (
++                <Button
++                  disabled={pending || !selectedStream}
++                  onClick={() => void addToStream()}
++                  type="button"
++                >
++                  Add agent to stream as bot
++                </Button>
++              )}
++            </>
++          ) : null}
++          {error ? (
++            <p role="alert" className="text-sm text-destructive">
++              {error}
++            </p>
++          ) : null}
++        </div>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/shared/api/tauri.ts b/desktop/src/shared/api/tauri.ts
+index e3de3d540..daebc5575 100644
+--- a/desktop/src/shared/api/tauri.ts
++++ b/desktop/src/shared/api/tauri.ts
+@@ -764,6 +764,41 @@ export async function listManagedAgents(): Promise<ManagedAgent[]> {
+     fromRawManagedAgent,
+   );
+ }
++
++export type ExternalAgentChallenge = {
++  challenge: string;
++  ownerPubkey: string;
++  relayUrl: string;
++  expiresAt: number;
++};
++
++export type ExternalAgentAuthorization = {
++  agentPubkey: string;
++  ownerPubkey: string;
++  relayUrl: string;
++  authTag: string;
++};
++
++export function prepareExternalAgentEnrollment(agentPubkey: string) {
++  return invokeTauri<ExternalAgentChallenge>(
++    "prepare_external_agent_enrollment",
++    {
++      agentPubkey,
++    },
++  );
++}
++
++export function completeExternalAgentEnrollment(input: {
++  name: string;
++  challenge: string;
++  proofEventJson: string;
++}) {
++  return invokeTauri<ExternalAgentAuthorization>(
++    "complete_external_agent_enrollment",
++    { input },
++  );
++}
++
+ export async function createManagedAgent(input: CreateManagedAgentInput) {
+   const response = await invokeTauri<RawCreateManagedAgentResponse>(
+     "create_managed_agent",
+diff --git a/integration/rowvia/native-management/EXTERNAL-AGENT-ENROLLMENT.md b/integration/rowvia/native-management/EXTERNAL-AGENT-ENROLLMENT.md
+new file mode 100644
+index 000000000..3377ab6eb
+--- /dev/null
++++ b/integration/rowvia/native-management/EXTERNAL-AGENT-ENROLLMENT.md
+@@ -0,0 +1,57 @@
++# External agent enrollment seam
++
++This fork adds a one-time Desktop operation for an agent whose signer and runtime
++stay outside Buzz. It does not import, export, or store the external secret key,
++create a managed-agent record, or start ACP. The only durable Buzz write is an
++owner-signed kind 30177 announcement in the active workspace's retention queue.
++
++## Operator flow
++
++1. Generate and retain the agent key **on the external host**. Bring only its
++   64-character public-key hex to Buzz Desktop.
++2. Open **Agents → Authorize external agent**. Enter a display name and that
++   public key; select **Create signing challenge**.
++3. On the external host, sign a private Nostr kind 1 event with the agent key:
++   `content` is the challenge verbatim; `tags` contains exactly one
++   `["p", "<owner public key shown by Desktop>"]`; `created_at` is the current
++   Unix second. Do not publish this proof event. Paste its complete signed JSON
++   into Desktop before the five-minute deadline.
++4. Select **Authorize public key**. Desktop verifies the agent signature,
++   challenge, owner binding, and time; consumes the challenge; queues the
++   owner-signed kind 30177; and returns a public NIP-OA `auth` tag. Copy the
++   tag to the external host. A failed attempt consumes the challenge, so begin
++   again with a new one.
++5. On the external host, publish a kind 0 profile signed by the **agent** key
++   with exactly this one `auth` tag. The tag is restricted to `kind=0`. The
++   profile must be the latest kind 0 for this key. Optionally select an existing
++   stream in the same Desktop dialog and add this exact public key with bot role.
++   That direct membership action works before discovery finds the kind 0 profile;
++   it does not start ACP. The 30177 announcement itself grants no membership or
++   availability evidence.
++
++If the response is lost after Desktop queued the 30177 announcement, submit
++the same challenge and signed proof again. If those were also lost, start a new
++challenge for the same public key and display name and sign a new proof. Desktop
++verifies either recovery path and returns a new public auth tag without changing
++the existing 30177 policy or spawning anything. A different display name is
++rejected. A pending external announcement is re-signed at publication time if
++it aged outside the relay's safe timestamp window during an outage or restart;
++only verified external-enrollment rows take this path.
++
++The Desktop's owner key never appears in this flow as a secret. A returned
++`auth` tag is public authorization evidence, not a signing key. Do not try to
++extract the Desktop's key or pass the external agent's secret to Desktop.
++
++## Patch custody
++
++The implementation touches `desktop/src-tauri/src/app_state.rs`,
++`desktop/src-tauri/src/commands/{mod.rs,external_agent_enrollment.rs,
++external_agent_enrollment_tests.rs}`, `desktop/src-tauri/src/lib.rs`,
++`desktop/src-tauri/src/managed_agents/persona_events{.rs,/tests.rs}`,
++`desktop/src/shared/api/tauri.ts`, and
++`desktop/src/features/agents/ui/{AgentsView.tsx,ExternalAgentEnrollmentDialog.tsx}`.
++Replay these focused edits after rebasing the Buzz fork, then run the Rust
++enrollment tests and Desktop typecheck. Once this work has an authorized commit,
++regenerate the native-management patch and its `manifest.json` hash, commit, and
++result-tree fields against that committed fork revision. The current manifest
++describes the earlier management patch and must not be changed to guessed hashes.

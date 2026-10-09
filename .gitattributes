@@ -6,3 +6,7 @@
 # patches/*.patch with `\n`-joined patterns. Normalize to LF in the working
 # copy on every platform; the stored blobs are already LF.
 * text=auto eol=lf
+
+# The pinned format-patch is kept byte-for-byte; its diff markers contain
+# intentional trailing spaces that must not be normalized by whitespace checks.
+integration/rowvia/native-management/*.patch whitespace=-blank-at-eol

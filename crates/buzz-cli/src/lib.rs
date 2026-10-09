@@ -335,6 +335,24 @@ pub enum AgentsCmd {
         #[arg(long, value_enum)]
         respond_to: Option<RespondToArg>,
     },
+    /// Propose fixed Gmail read/search access for an existing agent; owner review is required
+    DraftConnector {
+        /// Current conversation channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Grant or revoke the fixed Gmail read/search permission pair
+        #[arg(long, value_enum)]
+        action: agent_management::ConnectorDraftAction,
+        /// Existing target agent's display name (selection hint only)
+        #[arg(long)]
+        target_name: String,
+        /// Optional Gmail label hint; repeat up to four times
+        #[arg(long)]
+        gmail_label: Vec<String>,
+        /// Observer draft UUIDv4 to reuse for an exact trusted retry; generated if omitted
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Submit a NIP-IA archive request for an identity (kind 9035)
     #[command(
         after_help = "Auth flow: when target != signer, the CLI fetches the target's kind:0 and \
@@ -760,6 +778,10 @@ pub enum CanvasCmd {
         /// Channel UUID
         #[arg(long)]
         channel: String,
+        /// Fetch a specific historical revision by event ID (64-char hex);
+        /// defaults to the current head
+        #[arg(long)]
+        revision: Option<String>,
     },
     /// Set (replace) the canvas document for a channel
     Set {
@@ -769,6 +791,24 @@ pub enum CanvasCmd {
         /// Canvas content (markdown; use '-' to read from stdin)
         #[arg(long)]
         content: String,
+    },
+    /// List canvas revision history for a channel, newest first
+    History {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Maximum number of revisions to return (1–10000)
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        limit: u32,
+    },
+    /// Restore the canvas to a previous revision by re-publishing its content
+    Restore {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Revision event ID to restore (64-char hex)
+        #[arg(long)]
+        revision: String,
     },
 }
 
@@ -2246,6 +2286,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connector_draft_cli_accepts_only_closed_arguments() {
+        let base = [
+            "buzz",
+            "agents",
+            "draft-connector",
+            "--channel",
+            "7c07e659-3610-42f4-9a5e-1e9973c09da9",
+            "--action",
+            "grant",
+            "--target-name",
+            "Research helper",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for extra in [
+            "--operations",
+            "--binding-id",
+            "--owner",
+            "--url",
+            "--credentials",
+            "--approval",
+            "--envelope",
+        ] {
+            let mut args = base.to_vec();
+            args.extend([extra, "arbitrary"]);
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "unexpectedly accepted {extra}"
+            );
+        }
+        let mut wrong_action = base.to_vec();
+        wrong_action[6] = "approve";
+        assert!(Cli::try_parse_from(wrong_action).is_err());
+        let mut retry = base.to_vec();
+        retry.extend(["--request-id", "550e8400-e29b-41d4-a716-446655440000"]);
+        assert!(Cli::try_parse_from(retry).is_ok());
+    }
+
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
     fn cli_definition_is_valid() {
@@ -2291,6 +2369,29 @@ mod tests {
             event.as_str(),
         ])
         .is_err());
+    }
+
+    /// `canvas history --limit` is bounded 1–10000 at parse time: zero and
+    /// max+1 reject, the maximum is accepted, and the max stays above one
+    /// 1,000-row relay page so the >1,000 pagination path remains reachable.
+    #[test]
+    fn canvas_history_limit_is_bounded() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let parse = |limit: &str| {
+            Cli::try_parse_from([
+                "buzz",
+                "canvas",
+                "history",
+                "--channel",
+                channel,
+                "--limit",
+                limit,
+            ])
+        };
+        assert!(parse("0").is_err(), "zero must reject");
+        assert!(parse("10001").is_err(), "max+1 must reject");
+        assert!(parse("10000").is_ok(), "maximum must be accepted");
+        assert!(parse("1000").is_ok(), "one relay page must be reachable");
     }
 
     #[test]
@@ -2389,6 +2490,7 @@ mod tests {
             vec![
                 "archive",
                 "archived",
+                "draft-connector",
                 "draft-create",
                 "draft-update",
                 "unarchive"
@@ -2428,7 +2530,10 @@ mod tests {
                 "update"
             ]
         );
-        assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
+        assert_eq!(
+            names(&cmd, "canvas"),
+            vec!["get", "history", "restore", "set"]
+        );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
             names(&cmd, "emoji"),
@@ -2531,8 +2636,8 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
-            ("canvas", 2),
+            ("agents", 6),
+            ("canvas", 4),
             ("channels", 16),
             ("dms", 4),
             ("emoji", 5),

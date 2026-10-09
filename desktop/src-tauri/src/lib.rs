@@ -10,6 +10,8 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+#[cfg_attr(not(test), allow(dead_code))]
+mod hpke_key_backup;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -34,6 +36,8 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+mod owner_test_hook;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -206,6 +210,17 @@ pub fn run() {
     // builds; see that module for why.
     let builder = ptt_shortcut::install(builder);
 
+    #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+    let builder = builder.on_page_load(|webview, payload| {
+        let phase = match payload.event() {
+            tauri::webview::PageLoadEvent::Started => owner_test_hook::NativePhase::PageLoadStarted,
+            tauri::webview::PageLoadEvent::Finished => {
+                owner_test_hook::NativePhase::PageLoadFinished
+            }
+        };
+        owner_test_hook::report_native_phase(webview.app_handle(), webview.label(), phase);
+    });
+
     // Register the updater only in configured release builds; omit it locally.
     #[cfg(buzz_updater_enabled)]
     let builder = if cfg!(debug_assertions) {
@@ -236,11 +251,23 @@ pub fn run() {
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::setup(&app_handle)?;
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::SetupEntered,
+            );
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;
                 macos_notifications::init(&app_handle)?;
             }
+
+            // Initialise the no-redirect admin HTTP client singleton before any
+            // admin command can be invoked. Must run before setup completes.
+            commands::admin::client::init_admin_client()?;
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
@@ -268,6 +295,12 @@ pub fn run() {
                 state
                     .reset_failed
                     .store(true, std::sync::atomic::Ordering::Release);
+                #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+                owner_test_hook::report_native_phase(
+                    &app_handle,
+                    "main",
+                    owner_test_hook::NativePhase::SetupCompleted,
+                );
                 return Ok(());
             }
 
@@ -277,6 +310,12 @@ pub fn run() {
             } else {
                 migration::run_boot_migrations(&app_handle);
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::MigrationsReady,
+            );
 
             // Resolve persisted identity key (env var → file → generate+save).
             // This is fatal — the app should not start with an ephemeral identity
@@ -287,6 +326,12 @@ pub fn run() {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::IdentityReady,
+            );
 
             // When the identity is in recovery mode (lost = keyring empty after
             // migration, or keyring-locked = keyring unreachable but marker
@@ -429,6 +474,12 @@ pub fn run() {
             }
 
             try_regenerate_nest(&app_handle);
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::NestReady,
+            );
 
             if let Some(mgr) = huddle::models::global_model_manager() {
                 mgr.start_stt_download(state.http_client.clone());
@@ -518,6 +569,12 @@ pub fn run() {
                     }
                 });
             }
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::report_native_phase(
+                &app_handle,
+                "main",
+                owner_test_hook::NativePhase::SetupCompleted,
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -642,6 +699,7 @@ pub fn run() {
             join_channel,
             leave_channel,
             get_canvas,
+            get_canvas_history,
             set_canvas,
             get_feed,
             search_messages,
@@ -705,6 +763,8 @@ pub fn run() {
             reconcile_managed_agent_runtimes,
             put_managed_agent_runtime_lifecycle,
             create_managed_agent,
+            prepare_external_agent_enrollment,
+            complete_external_agent_enrollment,
             start_managed_agent,
             stop_managed_agent,
             set_agent_managed_profiles,
@@ -729,6 +789,7 @@ pub fn run() {
             mesh_installed_models,
             mesh_model_catalog,
             update_managed_agent,
+            discover_acp_commands,
             discover_backend_providers,
             probe_backend_provider,
             persona_catalog::fetch_persona_catalog,
@@ -834,10 +895,22 @@ pub fn run() {
             confirm_pairing_sas,
             cancel_pairing,
             apply_workspace,
+            remove_community_relay,
+            readd_community_relay,
+            set_agent_avatar_communities,
             validate_repos_dir,
             get_active_workspace,
             fetch_workspace_icon,
             fetch_join_policy,
+            rowvia_get_management_candidates,
+            rowvia_list_management_pending,
+            rowvia_list_management_operations,
+            rowvia_reject_management_local,
+            rowvia_create_management_proposal,
+            rowvia_retry_management_proposal,
+            rowvia_approve_management_proposal,
+            rowvia_retry_management_approval,
+            rowvia_get_management_operation,
             set_prevent_sleep_active,
             get_agent_memory,
             relay_reconnect_hook,
@@ -863,6 +936,10 @@ pub fn run() {
             archive::sync::stop_archive_sync,
             is_auto_update_supported,
             set_window_vibrancy,
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::rowvia_owner_test_reply,
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::rowvia_owner_test_phase,
             #[cfg(target_os = "macos")]
             tray_menu::clear_tray_agent_activity,
             #[cfg(target_os = "macos")]
@@ -871,6 +948,28 @@ pub fn run() {
             tray_menu::take_tray_actions,
             #[cfg(target_os = "macos")]
             tray_menu::update_tray_agent_activity,
+            // ── Desktop admin surface ────────────────────────────────────────
+            admin_probe,
+            admin_list_reports,
+            admin_get_report,
+            admin_list_feedback,
+            admin_get_feedback,
+            admin_fetch_feedback_attachment,
+            admin_save_attachment,
+            admin_resolve_report,
+            admin_reopen_report,
+            admin_cancel_report,
+            admin_patch_feedback,
+            admin_list_operators,
+            admin_put_operator,
+            admin_delete_operator,
+            admin_list_restrictions,
+            admin_lift_ban,
+            admin_lift_timeout,
+            admin_direct_action,
+            get_admin_origin,
+            set_admin_origin,
+            admin_discover_origin,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -922,12 +1021,16 @@ pub fn run() {
             }
         }
         RunEvent::ExitRequested { code, .. } => {
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::stop(app_handle);
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);
             }
             shut_down_app(app_handle, &run_shutdown_done);
         }
         RunEvent::Exit => {
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::stop(app_handle);
             shut_down_app(app_handle, &run_shutdown_done);
             app_handle.state::<ClipboardState>().release();
             #[cfg(all(feature = "mesh-llm", target_os = "macos"))]

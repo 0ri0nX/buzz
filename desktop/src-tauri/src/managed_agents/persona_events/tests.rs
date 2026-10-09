@@ -152,6 +152,7 @@ pub(super) fn sample_persona() -> AgentDefinition {
         display_name: "Test Persona".to_string(),
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "You are a test assistant.".to_string(),
+        acp_command: None,
         runtime: Some("goose".to_string()),
         model: Some("claude-opus-4".to_string()),
         provider: Some("anthropic".to_string()),
@@ -283,7 +284,8 @@ fn shared_persona_event_has_exact_tag_and_round_trips() {
 
 #[test]
 fn round_trip_serialization() {
-    let record = sample_persona();
+    let mut record = sample_persona();
+    record.acp_command = Some("buzz-janet-acp".to_string());
     let builder = build_persona_event(&record).unwrap();
     let keys = nostr::Keys::generate();
     let event = builder.sign_with_keys(&keys).unwrap();
@@ -296,6 +298,7 @@ fn round_trip_serialization() {
         Some("https://example.com/avatar.png".to_string())
     );
     assert_eq!(restored.system_prompt, "You are a test assistant.");
+    assert_eq!(restored.acp_command.as_deref(), Some("buzz-janet-acp"));
     assert_eq!(restored.runtime, Some("goose".to_string()));
     assert_eq!(restored.model, Some("claude-opus-4".to_string()));
     assert_eq!(restored.provider, Some("anthropic".to_string()));
@@ -327,6 +330,7 @@ fn content_matches_nip_ap_vector() {
         description: None,
         display_name: "Test Agent".to_string(),
         system_prompt: Some("You are a test assistant.".to_string()),
+        acp_command: None,
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         runtime: Some("goose".to_string()),
         model: Some("claude-opus-4".to_string()),
@@ -340,6 +344,16 @@ fn content_matches_nip_ap_vector() {
         serde_json::to_string(&content).unwrap(),
         VECTOR,
         "serialized content drifted from the NIP-AP Event 1 vector"
+    );
+
+    let mut with_transport = content.clone();
+    with_transport.acp_command = Some("buzz-janet-acp".into());
+    assert_eq!(
+        serde_json::to_string(&with_transport).unwrap(),
+        VECTOR.replace(
+            "\"avatar_url\":",
+            "\"acp_command\":\"buzz-janet-acp\",\"avatar_url\":"
+        )
     );
 
     // Hash invariance across the unified-model widening: REAL pre-revision
@@ -384,6 +398,7 @@ fn content_matches_nip_ap_vector() {
         display_name: "Test Agent".to_string(),
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "You are a test assistant.".to_string(),
+        acp_command: None,
         runtime: Some("goose".to_string()),
         model: Some("claude-opus-4".to_string()),
         provider: Some("anthropic".to_string()),
@@ -418,6 +433,7 @@ fn round_trip_minimal_persona() {
         display_name: "Minimal".to_string(),
         avatar_url: None,
         system_prompt: "Hello".to_string(),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
@@ -518,6 +534,7 @@ fn quad_absent_definition_hash_stable_across_activation() {
         display_name: "Test".to_string(),
         avatar_url: None,
         system_prompt: "Hello".to_string(),
+        acp_command: None,
         runtime: Some("goose".to_string()),
         model: Some("gpt-oss".to_string()),
         provider: None,
@@ -566,6 +583,7 @@ fn persona_from_event_content_for_test(content: PersonaEventContent) -> AgentDef
         display_name: content.display_name,
         avatar_url: content.avatar_url,
         system_prompt: content.system_prompt.unwrap_or_default(),
+        acp_command: content.acp_command,
         runtime: content.runtime,
         model: content.model,
         provider: content.provider,
@@ -594,6 +612,7 @@ fn persona_content_hash_is_deterministic() {
         display_name: "Test".to_string(),
         avatar_url: None,
         system_prompt: Some("Hello".to_string()),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
@@ -616,6 +635,7 @@ fn persona_content_hash_changes_on_edit() {
         display_name: "Test".to_string(),
         avatar_url: None,
         system_prompt: Some("Hello".to_string()),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
@@ -693,6 +713,7 @@ fn description_change_does_not_change_content_hash() {
         display_name: "Test".to_string(),
         avatar_url: None,
         system_prompt: Some("Hello".to_string()),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
@@ -716,6 +737,34 @@ fn description_change_does_not_change_content_hash() {
         persona_content_hash(&edited),
         "description-only edits must not change the content hash"
     );
+}
+
+#[test]
+fn snapshot_applies_persona_acp_command_to_linked_instance() {
+    let mut record = sample_record();
+    let mut persona = sample_persona();
+    persona.acp_command = Some("buzz-janet-acp".to_string());
+
+    apply_persona_snapshot(&mut record, &persona);
+
+    assert_eq!(record.acp_command, "buzz-janet-acp");
+
+    // Saving stock transport round-trips through the unified store as None.
+    persona.acp_command = Some("buzz-acp".to_string());
+    let restored = persona
+        .clone()
+        .into_agent_record()
+        .to_definition_view()
+        .unwrap();
+    assert_eq!(restored.acp_command, None);
+    apply_persona_snapshot(&mut record, &restored);
+    assert_eq!(record.acp_command, "buzz-acp");
+
+    // Owner-controlled legacy custom commands remain definition state.
+    persona.acp_command = Some("/opt/custom-acp".to_string());
+    let restored = persona.into_agent_record().to_definition_view().unwrap();
+    apply_persona_snapshot(&mut record, &restored);
+    assert_eq!(record.acp_command, "/opt/custom-acp");
 }
 
 // ── PersonaSnapshot.runtime ───────────────────────────────────────────────
@@ -946,6 +995,131 @@ mod flush_barrier {
             },
         )
         .expect("retain test event");
+    }
+
+    #[tokio::test]
+    async fn external_announcement_is_refreshed_after_outage_and_restart() {
+        use sha2::Digest;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let route_calls = calls.clone();
+        let route_seen = seen.clone();
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let calls = route_calls.clone();
+                let seen = route_seen.clone();
+                async move {
+                    let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    seen.lock().unwrap().push(event.clone());
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    let created_at = event["created_at"].as_i64().unwrap();
+                    let now = nostr::Timestamp::now().as_secs() as i64;
+                    if created_at.abs_diff(now) > 900 {
+                        return (StatusCode::BAD_REQUEST, String::new());
+                    }
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "event_id": event["id"],
+                            "accepted": true,
+                            "message": ""
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let content = serde_json::json!({
+            "name": "Remote",
+            "parallelism": 1,
+            "respond_to": "owner-only",
+            "external_enrollment": {
+                "version": 1,
+                "challenge_hash": "a".repeat(64),
+                "proof_event_id": "b".repeat(64),
+                "issued_at": 1,
+                "relay_url_hash": hex::encode(sha2::Sha256::digest(relay_url.as_bytes()))
+            }
+        })
+        .to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        {
+            let conn = open_retention_db(&db_path).unwrap();
+            let event = EventBuilder::new(Kind::Custom(30177), content)
+                .tags([Tag::parse(["d", agent.as_str()]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1))
+                .sign_with_keys(&keys)
+                .unwrap();
+            retain_event(
+                &conn,
+                &RetainedEvent {
+                    kind: 30177,
+                    pubkey: owner.clone(),
+                    d_tag: agent.clone(),
+                    content: event.content.clone(),
+                    created_at: 1,
+                    raw_event: event.as_json(),
+                    pending_sync: true,
+                },
+            )
+            .unwrap();
+        }
+
+        let first_state = build_app_state();
+        *first_state.keys.lock().unwrap() = keys.clone();
+        *first_state.relay_url_override.lock().unwrap() = Some(relay_url.clone());
+        assert_eq!(
+            flush_pending_events(&db_path, &first_state).await.unwrap(),
+            0
+        );
+        assert!(
+            get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
+                .unwrap()
+                .unwrap()
+                .pending_sync
+        );
+
+        // A new AppState has no memory of the enrollment challenge. The
+        // retained, owner-signed marker is enough to re-sign for relay TTL.
+        let restarted_state = build_app_state();
+        *restarted_state.keys.lock().unwrap() = keys;
+        *restarted_state.relay_url_override.lock().unwrap() = Some(relay_url);
+        assert_eq!(
+            flush_pending_events(&db_path, &restarted_state)
+                .await
+                .unwrap(),
+            1
+        );
+        let row = get_retained_event(&open_retention_db(&db_path).unwrap(), 30177, &owner, &agent)
+            .unwrap()
+            .unwrap();
+        assert!(!row.pending_sync);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["content"], seen[1]["content"]);
+        assert_eq!(seen[0]["tags"], seen[1]["tags"]);
+        assert_eq!(seen[1]["pubkey"], owner);
+        assert!(seen[1]["created_at"].as_i64().unwrap() > 1);
     }
 
     #[test]

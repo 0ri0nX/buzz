@@ -21,19 +21,26 @@ use buzz_core::{CommunityId, StoredEvent};
 
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// This pool-owning wrapper propagates failures to its caller. Replacement writes
-/// use the transaction-bound helper below so event storage and mention indexing
-/// commit or roll back together. Duplicate inserts are silently skipped with
-/// `INSERT ... ON CONFLICT DO NOTHING`.
+/// This pool-owning wrapper indexes mentions in its own admitted transaction,
+/// after the event has already committed. Writes that need event storage and
+/// mention indexing to commit or roll back together should open
+/// `begin_community_event_write_transaction` and call
+/// `insert_mentions_in_transaction` instead.
+///
+/// Duplicate inserts are silently skipped with `INSERT ... ON CONFLICT DO
+/// NOTHING`.
 pub async fn insert_mentions(
     pool: &PgPool,
     community_id: CommunityId,
     event: &nostr::Event,
     channel_id: Option<Uuid>,
 ) -> Result<()> {
-    let connection =
-        observability::acquire_writer(pool, observability::WriterOperation::EventWrite).await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    let mut tx = begin_community_event_write_transaction(
+        pool,
+        community_id,
+        observability::WriterOperation::EventWrite,
+    )
+    .await?;
     insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
     tx.commit().await?;
     Ok(())
@@ -121,6 +128,63 @@ pub(crate) async fn insert_mentions_in_transaction(
     Ok(())
 }
 
+/// Start a tenant-local event-write transaction and take the shared community
+/// deletion lock before any serving mutation.
+async fn begin_community_event_write_transaction_with_metric_population(
+    pool: &PgPool,
+    community: CommunityId,
+    operation: observability::WriterOperation,
+    metric_population: CommunityEventWriteMetricPopulation,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let connection = match metric_population {
+        CommunityEventWriteMetricPopulation::TypedOnly => {
+            observability::acquire_writer(pool, operation).await?
+        }
+        CommunityEventWriteMetricPopulation::LegacyCompatibility => {
+            observability::acquire_writer_with_legacy_metrics(pool, operation).await?
+        }
+    };
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    deletion::DeletionStore::new(pool.clone())
+        .guard_transaction(&mut tx, community)
+        .await?;
+    Ok(tx)
+}
+
+#[derive(Clone, Copy)]
+enum CommunityEventWriteMetricPopulation {
+    TypedOnly,
+    LegacyCompatibility,
+}
+
+pub(crate) async fn begin_community_event_write_transaction(
+    pool: &PgPool,
+    community: CommunityId,
+    operation: observability::WriterOperation,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    begin_community_event_write_transaction_with_metric_population(
+        pool,
+        community,
+        operation,
+        CommunityEventWriteMetricPopulation::TypedOnly,
+    )
+    .await
+}
+
+pub(crate) async fn begin_community_event_write_transaction_with_legacy_metrics(
+    pool: &PgPool,
+    community: CommunityId,
+    operation: observability::WriterOperation,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    begin_community_event_write_transaction_with_metric_population(
+        pool,
+        community,
+        operation,
+        CommunityEventWriteMetricPopulation::LegacyCompatibility,
+    )
+    .await
+}
+
 /// Database handle. Clone is cheap (Arc-backed pool).
 #[derive(Clone, Debug)]
 pub struct Db {
@@ -201,6 +265,8 @@ impl ReadSession {
     ///
     /// If the proved replica transaction fails mid-request, the session
     /// permanently degrades to the writer and the query is re-run there.
+    /// Exception: a statement cancelled by `statement_timeout` (57014) is
+    /// returned as-is, since the writer would run the same slow statement.
     /// The writer is always at or ahead of any replica replay position, so
     /// the degraded follow-up can only observe *more* than the proof-time
     /// snapshot, never less — fresher aux rows, the same failure semantics
@@ -211,6 +277,9 @@ impl ReadSession {
             ReadSessionInner::Replica { tx, writer } => {
                 match event::query_events_on(tx, q).await {
                     Ok(rows) => return Ok(rows),
+                    // A cancelled statement (timeout) would be just as slow on
+                    // the writer; surface it instead of doubling the cost.
+                    Err(e) if e.is_statement_cancelled() => return Err(e),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -539,6 +608,9 @@ pub struct DbConfig {
     /// (env `BUZZ_DB_STATEMENT_TIMEOUT_MS`). `0` disables it and is the
     /// default because migrations and backfills may legitimately run long.
     pub statement_timeout_ms: u64,
+    /// Whether every new writer-pool connection defaults all transactions to
+    /// read-only. Intended for operator audit commands, never the relay pool.
+    pub default_transaction_read_only: bool,
 }
 
 impl Default for DbConfig {
@@ -559,6 +631,7 @@ impl Default for DbConfig {
             lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
             idle_txn_timeout_ms: DEFAULT_IDLE_TXN_TIMEOUT_MS,
             statement_timeout_ms: 0,
+            default_transaction_read_only: false,
         }
     }
 }
@@ -644,6 +717,7 @@ impl Db {
         let lock_timeout_ms = config.lock_timeout_ms;
         let idle_txn_timeout_ms = config.idle_txn_timeout_ms;
         let statement_timeout_ms = config.statement_timeout_ms;
+        let default_transaction_read_only = config.default_transaction_read_only;
         let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
@@ -688,11 +762,17 @@ impl Db {
                     if let Err(error) = sqlx::query(
                         "SELECT set_config('lock_timeout', $1, false), \
                                 set_config('idle_in_transaction_session_timeout', $2, false), \
-                                set_config('statement_timeout', $3, false)",
+                                set_config('statement_timeout', $3, false), \
+                                set_config('default_transaction_read_only', $4, false)",
                     )
                     .bind(lock_timeout_ms.to_string())
                     .bind(idle_txn_timeout_ms.to_string())
                     .bind(statement_timeout_ms.to_string())
+                    .bind(if default_transaction_read_only {
+                        "on"
+                    } else {
+                        "off"
+                    })
                     .execute(&mut *conn)
                     .await
                     {
@@ -1169,6 +1249,16 @@ impl Db {
         }
     }
 
+    /// Return a reference to the writer pool.
+    ///
+    /// Callers that need a pool handle for standalone free functions (e.g.,
+    /// `buzz_db::insert_mentions`) can use this. Prefer the `Db` method
+    /// equivalents when they exist; use `pool()` only for functions that have
+    /// no `Db` wrapper yet.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Refresh all expected operation-specific waiter gauges, including zero.
     ///
     /// The relay pool sampler calls this periodically so an exporter idle
@@ -1194,31 +1284,29 @@ impl Db {
         })
     }
 
-    /// Begin a database transaction for atomic multi-statement operations.
+    /// Begin an event-write transaction admitted for `community`.
+    ///
+    /// This is the only `Db` constructor for event-write transactions. It takes
+    /// the shared community admission lock before returning, so callers that use
+    /// it cannot take domain or row locks ahead of tenant admission, and a
+    /// quiescing community rejects the write at entry rather than at its first
+    /// fenced statement. The compiler does not enforce this: a transaction
+    /// opened from [`Db::pool`] can still reach the public `*_in_transaction`
+    /// helpers, and only the source-policy tests and the commit-time database
+    /// fences, which remain the authoritative backstop, catch it.
     ///
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_event_write_transaction(
         &self,
+        community: CommunityId,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        let connection = observability::acquire_writer_with_legacy_metrics(
+        begin_community_event_write_transaction_with_legacy_metrics(
             &self.pool,
+            community,
             observability::WriterOperation::EventWrite,
         )
-        .await?;
-        sqlx::Transaction::begin(connection, None)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Begin an event-write transaction through the pre-operation API name.
-    ///
-    /// New callers should use [`Self::begin_event_write_transaction`] so the
-    /// semantic intent is explicit. This alias preserves the crate's public
-    /// API while emitting the same operation-aware and compatibility metrics.
-    #[deprecated(note = "use Db::begin_event_write_transaction")]
-    pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        self.begin_event_write_transaction().await
+        .await
     }
 
     /// Insert an event while holding and validating an admitted serving-write
@@ -1249,6 +1337,8 @@ impl Db {
         let mut tx = sqlx::Transaction::begin(connection, None).await?;
         self.deletion_store()
             .guard_transaction_with_serving_lease(&mut tx, lease)
+            .await?;
+        event::acquire_canvas_event_write_lock_if_needed(&mut tx, community_id, event, channel_id)
             .await?;
         let result = event::insert_event_with_thread_metadata_tx(
             &mut tx,

@@ -8,8 +8,11 @@ import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { decryptObserverEvent } from "@/shared/api/tauriObserver";
 import {
+  AGENT_MANAGEMENT_REQUEST,
   parseAgentManagementRequest,
+  parseConnectorDraftRequest,
   type AgentManagementRequest,
+  type ConnectorDraftRequest,
 } from "./agentManagement";
 import {
   parseProjectChannelRequest,
@@ -137,6 +140,17 @@ const controlResultListeners = new Map<
 
 const agentManagementListeners = new Set<
   (agentPubkey: string, request: AgentManagementRequest) => void
+>();
+export type ConnectorRequestEvidence = {
+  /** Signed relay frame, verified by native decryption before dispatch. */
+  relayEvent: RelayEvent;
+  agentPubkey: string;
+  observerChannelId: string;
+  sessionId: string | null;
+  turnId: string | null;
+};
+const connectorRequestListeners = new Set<
+  (request: ConnectorDraftRequest, evidence: ConnectorRequestEvidence) => void
 >();
 const projectChannelRequestListeners = new Set<
   (agentPubkey: string, request: ProjectChannelRequest) => void
@@ -470,6 +484,7 @@ function unwrapObserverBatch(parsed: ObserverEvent): ObserverEvent[] {
 function processLiveObserverEvents(
   agentPubkey: string,
   events: readonly ObserverEvent[],
+  signedRelayEvent?: RelayEvent,
 ) {
   // Commit the full envelope before dispatching synchronous specialized
   // callbacks. Those callbacks historically observed their triggering frame
@@ -520,8 +535,10 @@ function processLiveObserverEvents(
       }
     }
     if (parsed.kind === "session_config_captured") {
-      void putAgentSessionConfig(agentPubkey, parsed.payload);
-      onSessionConfigCaptured?.(agentPubkey);
+      // Refresh only after the store settles, so readers see the new options.
+      void putAgentSessionConfig(agentPubkey, parsed.payload)
+        .catch((error) => console.warn("Session config not stored:", error))
+        .then(() => onSessionConfigCaptured?.(agentPubkey));
     } else if (parsed.kind === "control_result") {
       // Thread the envelope's channelId into the frame so the ModelPicker can
       // count a terminal switch result once per distinct channel.
@@ -535,6 +552,33 @@ function processLiveObserverEvents(
     }
   }
 
+  // CLI proposals use seq=0 and can share a timestamp. The transcript journal
+  // deduplicates on (timestamp, seq), which could suppress a different signed
+  // proposal. Deliver every valid live proposal to the native journal; that
+  // journal owns durable ID deduplication and queueing while review is busy.
+  if (signedRelayEvent) {
+    for (const parsed of events) {
+      if (parsed.kind !== AGENT_MANAGEMENT_REQUEST || !parsed.channelId)
+        continue;
+      const connectorRequest = parseConnectorDraftRequest(parsed.payload);
+      if (
+        !connectorRequest ||
+        connectorRequest.request.channelId !== parsed.channelId
+      )
+        continue;
+      const evidence: ConnectorRequestEvidence = {
+        relayEvent: signedRelayEvent,
+        agentPubkey,
+        observerChannelId: parsed.channelId,
+        sessionId: parsed.sessionId,
+        turnId: parsed.turnId,
+      };
+      for (const listener of connectorRequestListeners) {
+        listener(connectorRequest, evidence);
+      }
+    }
+  }
+
   // Preserve the harness's envelope backpressure: retained state was committed
   // before specialized callbacks, but external-store subscribers publish once.
   if (accepted) {
@@ -545,6 +589,7 @@ function processLiveObserverEvents(
 async function handleRelayObserverEvent(
   event: RelayEvent,
   activeGeneration: number,
+  decryptFn: (event: RelayEvent) => Promise<unknown> = decryptObserverEvent,
 ) {
   const agentPubkey = observerTag(event, "agent");
   const frame = observerTag(event, "frame");
@@ -572,11 +617,11 @@ async function handleRelayObserverEvent(
   }
 
   try {
-    const parsed = (await decryptObserverEvent(event)) as ObserverEvent;
+    const parsed = (await decryptFn(event)) as ObserverEvent;
     if (activeGeneration !== generation) {
       return;
     }
-    processLiveObserverEvents(agentPubkey, unwrapObserverBatch(parsed));
+    processLiveObserverEvents(agentPubkey, unwrapObserverBatch(parsed), event);
   } catch (error) {
     if (activeGeneration !== generation) {
       return;
@@ -698,6 +743,17 @@ export function subscribeAgentManagementRequests(
   return () => {
     agentManagementListeners.delete(listener);
   };
+}
+
+/** Subscribe to unhandled connector proposals with their verified relay origin. */
+export function subscribeConnectorRequests(
+  listener: (
+    request: ConnectorDraftRequest,
+    evidence: ConnectorRequestEvidence,
+  ) => void,
+) {
+  connectorRequestListeners.add(listener);
+  return () => connectorRequestListeners.delete(listener);
 }
 
 export function subscribeProjectChannelRequests(
@@ -941,6 +997,7 @@ export function resetAgentObserverStore() {
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
+  connectorRequestListeners.clear();
   projectChannelRequestListeners.clear();
   onSessionConfigCaptured = null;
   connectionState = "idle";
@@ -967,6 +1024,14 @@ export function _testProcessLiveObserverEvents(
   events: readonly ObserverEvent[],
 ): void {
   processLiveObserverEvents(agentPubkey, events);
+}
+
+/** Test-only: exercise the real live relay gates with an injected decryptor. */
+export async function _testHandleRelayObserverEvent(
+  event: RelayEvent,
+  decryptFn: (event: RelayEvent) => Promise<unknown>,
+): Promise<void> {
+  await handleRelayObserverEvent(event, generation, decryptFn);
 }
 
 /**

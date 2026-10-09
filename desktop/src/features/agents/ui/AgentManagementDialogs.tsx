@@ -1,4 +1,5 @@
 import { useAgentManagement } from "@/features/agents/useAgentManagement";
+import { RowviaManagementDialog } from "@/features/agents/rowvia-management/RowviaManagementDialog";
 import { ProjectChannelRequestDialog } from "@/features/projects/ui/ProjectChannelRequestDialog";
 import { AgentCardDialogs } from "./AgentCardViewerDialog";
 import { AgentDialog } from "./AgentDialog";
@@ -44,6 +45,7 @@ export function AgentManagementDialogs() {
         />
       ) : null}
       <ProjectChannelRequestDialog />
+      <RowviaManagementDialog />
       <AgentCardDialogs />
     </>
   );
