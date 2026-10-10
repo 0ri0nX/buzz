@@ -229,7 +229,12 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
         || !valid_id(&request.request_id)
         || !matches!(
             request.operation.as_str(),
-            "status" | "create_private_stream" | "add_architect" | "send_message" | "read_channel"
+            "status"
+                | "create_private_stream"
+                | "add_architect"
+                | "send_message"
+                | "read_channel"
+                | "inspect_managed_agent_runtime"
         )
     {
         return Err(Code::InvalidRequest);
@@ -706,6 +711,65 @@ mod tests {
         r.operation = "status".into();
         r.expected.relay_url = "https://foreign.example".into();
         assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+    }
+
+    #[test]
+    fn runtime_inspection_passes_native_validator_without_opening_other_operations() {
+        let mut r = request();
+        r.operation = "inspect_managed_agent_runtime".into();
+        r.arguments = serde_json::json!({
+            "pubkey": "c".repeat(64),
+            "relayUrl": "wss://buzz.rowvia.ai:8443"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let validated = validate_request(&serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(validated, r);
+        for operation in [
+            "eval",
+            "export_keys",
+            "list_managed_agent_runtimes",
+            "start_managed_agent_runtime",
+            "stop_managed_agent_runtime",
+            "restart_managed_agent_runtime",
+            "inspect_managed_agent_runtime_extra",
+        ] {
+            r.operation = operation.into();
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&r).unwrap()),
+                Err(Code::InvalidRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_inspection_preserves_native_envelope_size_schema_and_scope_guards() {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value["operation"] = Value::String("inspect_managed_agent_runtime".into());
+        for (field, replacement) in [
+            ("schema", Value::String("other/v1".into())),
+            ("requestId", Value::String("invalid".into())),
+            ("extra", Value::Bool(true)),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = replacement;
+            let result = validate_request(&serde_json::to_vec(&invalid).unwrap());
+            assert!(matches!(result, Err(Code::InvalidRequest)));
+        }
+        for field in ["ownerPubkey", "architectPubkey", "relayUrl"] {
+            let mut invalid = value.clone();
+            invalid["expected"][field] = Value::String("foreign".into());
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Code::ScopeMismatch)
+            ));
+        }
+        value["arguments"]["padding"] = Value::String("x".repeat(MAX_REQUEST));
+        assert!(matches!(
+            validate_request(&serde_json::to_vec(&value).unwrap()),
+            Err(Code::InvalidRequest)
+        ));
     }
 
     #[test]

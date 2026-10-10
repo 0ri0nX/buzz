@@ -9,6 +9,7 @@ import {
 } from "@/shared/api/tauri";
 import { createChannel } from "@/shared/api/tauriChannels";
 import { getIdentity } from "@/shared/api/tauriIdentity";
+import { listManagedAgentRuntimes } from "@/shared/api/tauriManagedAgents";
 import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import type { Channel } from "@/shared/api/types";
 import {
@@ -18,6 +19,7 @@ import {
 import {
   OWNER_TEST_SCHEMA,
   ownerTestRequestSchema,
+  ownerTestRuntimeProjectionSchema,
   type OwnerTestCode,
   type OwnerTestRequest,
   type OwnerTestResponse,
@@ -103,6 +105,31 @@ export function createOwnerTestHandler(
       };
     if (relayClient.getConnectionState() !== "connected")
       throw new HookFailure("not_ready");
+    if (request.operation === "inspect_managed_agent_runtime") {
+      const target = request.arguments;
+      if (target.relayUrl !== request.expected.relayUrl)
+        throw new HookFailure("scope_mismatch");
+      // This is not read-only or target-only cleanup: the native list tries
+      // wait/reap for ALL exited pairs, removes their receipts/cache and
+      // persists the registry. It never kills running pairs. Failure after
+      // invoke must remain Unknown, even if cleanup already took effect.
+      markMutation();
+      const runtimes = await listManagedAgentRuntimes();
+      await assertScope(request);
+      if (!Array.isArray(runtimes)) throw new HookFailure("operation_failed");
+      const matches = runtimes.filter(
+        (runtime) =>
+          runtime.pubkey === target.pubkey &&
+          runtime.relayUrl === target.relayUrl,
+      );
+      if (matches.length > 1) throw new HookFailure("operation_failed");
+      if (matches.length === 0)
+        // Absence from this registry is not proof that a process stopped.
+        return { ...target, lifecycle: "not_tracked", pid: null };
+      const projected = ownerTestRuntimeProjectionSchema.safeParse(matches[0]);
+      if (!projected.success) throw new HookFailure("operation_failed");
+      return projected.data;
+    }
     if (request.expected.ownerPubkey === request.expected.architectPubkey)
       throw new HookFailure("invalid_request");
     if (request.operation === "create_private_stream") {

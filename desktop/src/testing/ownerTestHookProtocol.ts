@@ -6,18 +6,19 @@ export const OWNER_TEST_SCHEMA = "rowvia.buzz.owner-test/v1";
 const pubkey = z.string().regex(/^[0-9a-f]{64}$/);
 const eventId = z.string().regex(/^[0-9a-f]{64}$/);
 const channelId = z.string().uuid();
+const relayUrl = z
+  .string()
+  .max(2048)
+  .url()
+  .refine((url) => /^(?:https?|wss?):\/\//.test(url))
+  .transform((url) => normalizeRelayUrl(url) ?? url);
 const base = {
   schema: z.literal(OWNER_TEST_SCHEMA),
   requestId: z.string().uuid(),
   expected: z.strictObject({
     ownerPubkey: pubkey,
     architectPubkey: pubkey,
-    relayUrl: z
-      .string()
-      .max(2048)
-      .url()
-      .refine((url) => /^(?:https?|wss?):\/\//.test(url))
-      .transform((url) => normalizeRelayUrl(url) ?? url),
+    relayUrl,
   }),
 };
 
@@ -27,6 +28,11 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
     ...base,
     operation: z.literal("status"),
     arguments: z.strictObject({}),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("inspect_managed_agent_runtime"),
+    arguments: z.strictObject({ pubkey, relayUrl }),
   }),
   z.strictObject({
     ...base,
@@ -73,6 +79,22 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
     }),
   }),
 ]);
+
+/** Safe runtime projection; native errors, log paths and setup are omitted. */
+export const ownerTestRuntimeProjectionSchema = z.object({
+  pubkey,
+  // The native registry owns canonical pair identity: never normalize results.
+  relayUrl: z.string().max(2048),
+  lifecycle: z.enum([
+    "starting",
+    "listening",
+    "waking",
+    "ready",
+    "failed",
+    "stopped",
+  ]),
+  pid: z.number().int().min(1).max(4_294_967_295).nullable(),
+});
 
 export type OwnerTestRequest = z.infer<typeof ownerTestRequestSchema>;
 export type OwnerTestCode =
