@@ -324,6 +324,52 @@ def _v2_checks(root: Path) -> None:
     assert {path: path.read_bytes() for path in retained} == originals
 
 
+def _launcher_parent_checks(root: Path) -> None:
+    """Preserve the fixed default launcher contract with writable workspace parents."""
+
+    desktop, sidecars, pin_path, layout, backups = _v2_fixture(root)
+    workspace = root / "workspace"
+    launcher = workspace / "launcher"
+    payload = layout.launcher.read_bytes()
+    _put(launcher, payload)
+    workspace.chmod(0o775)
+    layout = installer.replace(layout, launcher=launcher)
+    actions = []
+    launch = lambda _layout, action: actions.append(action)
+    pin = installer._pin(pin_path)
+
+    def refused() -> None:
+        """Reject a launcher before executing lifecycle actions."""
+
+        actions.clear()
+        _reject(lambda: installer.install(desktop, sidecars, pin_path, layout, launch, backups))
+        assert not actions
+
+    refused()  # Custom launchers still require safe workspace ancestors.
+    default, accepted_hash = native.LAUNCHER, native.LAUNCHER_SHA256
+    native.LAUNCHER, native.LAUNCHER_SHA256 = launcher, _hash(launcher)
+    try:
+        installer.preflight(desktop, sidecars, pin_path, layout)
+        backup = installer.install(desktop, sidecars, pin_path, layout, launch, backups)
+        installer.rollback(backup, sidecars, pin_path, layout, launch, backups)
+        assert actions == ["stop", "start", "stop", "start"]
+        launcher.write_bytes(payload + b"changed")
+        changed = dict(pin, launcher_sha256=_hash(launcher))
+        _put(pin_path, json.dumps(changed).encode(), 0o600)
+        refused()
+        launcher.write_bytes(payload)
+        _put(pin_path, json.dumps(pin).encode(), 0o600)
+        for mode in (0o775, 0o700):
+            launcher.chmod(mode)
+            refused()
+        launcher.chmod(0o755)
+        launcher.unlink()
+        launcher.symlink_to(root / "launcher")
+        refused()
+    finally:
+        native.LAUNCHER, native.LAUNCHER_SHA256 = default, accepted_hash
+
+
 def main() -> None:
     """Prove Desktop-only switch, recovery, rollback, and pre-stop refusals."""
 
@@ -344,6 +390,7 @@ def main() -> None:
         assert target.read_bytes() == (desktop / "buzz-desktop").read_bytes()
         assert tuple(path.read_bytes() for path in layout.targets[1:]) == old_sidecars
         _v2_checks(root / "v2")
+        _launcher_parent_checks(root / "launcher-parents")
         assert set(path.name for path in backup.iterdir()) == {"buzz-desktop", "manifest.json"}
 
         inverse = installer.rollback(backup, sidecars, pin_path, layout, launch, backup_root)

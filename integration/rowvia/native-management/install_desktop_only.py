@@ -90,7 +90,8 @@ def _layout(pin: dict, layout: native.Layout) -> native.Layout:
 def _bindings(pin: dict, layout: native.Layout) -> None:
     """Verify exact retained launcher, CLI selection, wrappers and configs."""
 
-    native._safe_directory(layout.launcher.parent)
+    if layout.launcher != native.LAUNCHER:
+        native._safe_directory(layout.launcher.parent)
     native._require(stat.S_IMODE(native._regular_owned(layout.launcher).st_mode) == 0o755, "launcher mode mismatch")
     native._require(native._sha256(layout.launcher) == pin["launcher_sha256"], "launcher hash changed")
     if layout.launcher == native.LAUNCHER:

@@ -46,6 +46,12 @@ The exact v2 JSON fields are:
 
 Replace placeholders with lowercase exact hashes/commits. The wrapper/config
 arrays follow the existing Desktop then mail-reader order in `install_native.py`.
+The fixed default launcher inherits the existing trusted-workspace assumption:
+its parent may be group writable, while the launcher itself must remain a
+UID-owned regular non-symlink file with exact mode 0755 and both the reviewed
+and compiled acceptance hashes. Execution retains the existing descriptor-based
+`O_NOFOLLOW` verification. Custom launcher paths still require safe ancestors.
+Hardening the default workspace parents is deferred until after the MVP.
 The baseline commit is an operator assertion; the installed baseline is checked
 against its exact hash. The candidate commit must differ from it. The retained
 source directory passed as `--sidecars` must contain all six named binaries and
