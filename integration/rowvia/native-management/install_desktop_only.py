@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from dataclasses import replace
 import fcntl
 import json
 import os
@@ -32,50 +33,117 @@ PIN_FIELDS = {
     "buzz_acp_sha256",
     "custom_acp_sha256",
 }
+V2_FIELDS = PIN_FIELDS | {
+    "native_root", "baseline_desktop_source_commit", "sidecar_source_commit", "image_id",
+    "helper_sha256", "launcher_sha256", "wrapper_sha256", "bridge_config_sha256",
+}
 
 
-def _pin(path: Path) -> dict[str, str | int]:
+def _pin(path: Path) -> dict:
     """Load an operator-reviewed, private exact-artifact pin."""
 
     native._safe_directory(path.parent, private=True)
     info = native._regular_owned(path, executable=False)
     native._require(stat.S_IMODE(info.st_mode) == 0o600, "pin must be mode 0600")
     data = json.loads(path.read_text(encoding="utf-8"))
-    native._require(isinstance(data, dict) and set(data) == PIN_FIELDS, "invalid pin fields")
-    native._require(data["version"] == 1, "unsupported pin version")
+    native._require(isinstance(data, dict) and type(data.get("version")) is int and data["version"] in (1, 2), "unsupported pin version")
+    native._require(set(data) == (PIN_FIELDS if data["version"] == 1 else V2_FIELDS), "invalid pin fields")
     native._require(
         isinstance(data["desktop_source_commit"], str)
         and HEX40.fullmatch(data["desktop_source_commit"])
-        and data["desktop_source_commit"] != native.SOURCE_COMMIT,
+        and (data["version"] == 2 or data["desktop_source_commit"] != native.SOURCE_COMMIT),
         "invalid new Desktop commit pin",
     )
     for field in PIN_FIELDS - {"version", "desktop_source_commit"}:
         native._require(isinstance(data[field], str) and HEX64.fullmatch(data[field]), f"invalid {field}")
+    if data["version"] == 2:
+        for field in ("baseline_desktop_source_commit", "sidecar_source_commit"):
+            native._require(isinstance(data[field], str) and HEX40.fullmatch(data[field]), f"invalid {field}")
+        native._require(data["desktop_source_commit"] != data["baseline_desktop_source_commit"], "Desktop commit must change")
+        native._require(data["image_id"] == native.IMAGE_ID, "build image pin mismatch")
+        root = data["native_root"]
+        native._require(isinstance(root, str) and str(Path(root)) == root and Path(root).is_absolute(), "invalid native root")
+        native._safe_directory(Path(root), private=True)
+        helpers = data["helper_sha256"]
+        native._require(isinstance(helpers, dict) and set(helpers) == set(native.ROOT_HELPERS), "invalid helper pins")
+        hashes = [data["launcher_sha256"], *helpers.values()]
+        for field in ("wrapper_sha256", "bridge_config_sha256"):
+            native._require(isinstance(data[field], list) and len(data[field]) == 2, f"invalid {field}")
+            hashes.extend(data[field])
+        native._require(all(isinstance(value, str) and HEX64.fullmatch(value) for value in hashes), "invalid binding hash")
     return data
 
 
-def _sidecars_unchanged(pin: dict[str, str | int], sidecars: Path, layout: native.Layout) -> None:
-    """Require old sidecar provenance and all three installed sidecar hashes."""
+def _layout(pin: dict, layout: native.Layout) -> native.Layout:
+    """Resolve v2 replacement paths exclusively from the reviewed root."""
+
+    if pin["version"] == 1:
+        return layout
+    root = Path(pin["native_root"])
+    native._safe_directory(root, private=True)
+    native._safe_directory(root / "usr/bin", private=True)
+    native._require(layout.native_root is None or layout.native_root == root, "native root binding changed")
+    targets = tuple(root / "usr/bin" / name for name in ("buzz-desktop", "buzz", "buzz-acp")) + (layout.targets[3],)
+    return replace(layout, targets=targets, native_root=root, pin=pin)
+
+
+def _bindings(pin: dict, layout: native.Layout) -> None:
+    """Verify exact retained launcher, CLI selection, wrappers and configs."""
+
+    if layout.launcher != native.LAUNCHER:
+        native._safe_directory(layout.launcher.parent)
+    native._require(stat.S_IMODE(native._regular_owned(layout.launcher).st_mode) == 0o755, "launcher mode mismatch")
+    native._require(native._sha256(layout.launcher) == pin["launcher_sha256"], "launcher hash changed")
+    if layout.launcher == native.LAUNCHER:
+        native._require(pin["launcher_sha256"] == native.LAUNCHER_SHA256, "launcher acceptance pin mismatch")
+    native._safe_directory(layout.cli_link.parent)
+    native._require(layout.cli_link.is_symlink() and os.readlink(layout.cli_link) == str(layout.targets[1]), "CLI link changed")
+    for paths, field, mode in ((layout.wrappers, "wrapper_sha256", 0o700), (layout.bridge_configs, "bridge_config_sha256", 0o600)):
+        for path, digest in zip(paths, pin[field], strict=True):
+            native._safe_directory(path.parent)
+            native._require(stat.S_IMODE(native._regular_owned(path, executable=mode == 0o700).st_mode) == mode, "binding mode changed")
+            native._require(native._sha256(path) == digest, f"{field} changed")
+    for config in layout.bridge_configs:
+        native._require(native.tomllib.loads(config.read_text(encoding="utf-8")).get("stock_buzz", {}).get("executable") == str(layout.targets[3]), "bridge config custom ACP path changed")
+
+
+def _retained(pin: dict, sidecars: Path, layout: native.Layout, *, installing: bool) -> None:
+    """Recheck root, retained seams and permitted Desktop before switching."""
+
+    layout = _layout(pin, layout)
+    _sidecars_unchanged(pin, sidecars, layout)
+    expected = {pin["baseline_desktop_sha256"]}
+    if not installing:
+        expected.add(pin["desktop_sha256"])
+    native._require(native._sha256(layout.targets[0]) in expected, "installed Desktop changed before switch")
+
+
+def _sidecars_unchanged(pin: dict, sidecars: Path, layout: native.Layout) -> None:
+    """Require retained sidecar provenance, source hashes and installed hashes."""
 
     native._safe_directory(sidecars, private=True)
     provenance = native._json(sidecars / "provenance.json")
     native._require(
-        provenance.get("source_commit") == native.SOURCE_COMMIT
-        and provenance.get("image_id") == native.IMAGE_ID,
+        provenance.get("source_commit") == pin.get("sidecar_source_commit", native.SOURCE_COMMIT)
+        and provenance.get("image_id") == pin.get("image_id", native.IMAGE_ID),
         "sidecar source or image provenance mismatch",
     )
     artifacts = provenance.get("artifacts")
-    native._require(isinstance(artifacts, dict) and set(artifacts) == {"buzz", "buzz-acp"}, "invalid sidecar provenance")
+    v2 = pin["version"] == 2
+    names = {"buzz", "buzz-acp"} | (set(native.ROOT_HELPERS) if v2 else set())
+    native._require(isinstance(artifacts, dict) and set(artifacts) == names, "invalid sidecar provenance")
     checks = (
         ("buzz", "buzz_sha256", layout.targets[1], "draft-connector"),
         ("buzz-acp", "buzz_acp_sha256", layout.targets[2], "buzz.trusted-turn-context/v1"),
     )
+    checks += tuple((name, name, layout.native_root / "usr/bin" / name, None) for name in native.ROOT_HELPERS) if v2 else ()
     for name, field, target, marker in checks:
+        digest = pin["helper_sha256"][field] if name in native.ROOT_HELPERS else pin[field]
         record = artifacts[name]
         native._require(isinstance(record, dict), f"invalid {name} provenance")
         native._require(
-            record.get("sha256") == pin[field]
-            and record.get("patch_marker") == marker
+            record.get("sha256") == digest
+            and (marker is None or record.get("patch_marker") == marker)
             and record.get("host_ldd_r") == "pass",
             f"{name} provenance mismatch",
         )
@@ -83,21 +151,31 @@ def _sidecars_unchanged(pin: dict[str, str | int], sidecars: Path, layout: nativ
         native._regular_owned(source)
         native._regular_owned(target)
         native._safe_directory(target.parent)
-        native._require(native._sha256(source) == pin[field], f"{name} source hash mismatch")
-        native._require(native._sha256(target) == pin[field], f"{name} installed hash changed")
+        native._require(native._sha256(source) == digest, f"{name} source hash mismatch")
+        native._require(native._sha256(target) == digest, f"{name} installed hash changed")
+        if v2:
+            native._require(stat.S_IMODE(source.stat().st_mode) == 0o755 and stat.S_IMODE(target.stat().st_mode) == 0o755, "sidecar mode changed")
+            if marker:
+                native._require(native._contains(source, marker), "sidecar patch marker missing")
+            native._loader(source)
+            native._loader(target)
     custom = layout.targets[3]
     native._regular_owned(custom)
     native._safe_directory(custom.parent)
     native._require(native._sha256(custom) == pin["custom_acp_sha256"], "custom ACP hash changed")
+    if v2:
+        native._require(stat.S_IMODE(custom.stat().st_mode) == 0o700, "custom ACP mode changed")
+        _bindings(pin, layout)
 
 
 def preflight(
     desktop: Path, sidecars: Path, pin_path: Path, layout: native.Layout = native.Layout()
-) -> dict[str, str | int]:
+) -> dict:
     """Validate committed-source provenance, live ELF, and unchanged host seams."""
 
     native._require(os.getuid() == 1000, "installer requires host UID 1000")
     pin = _pin(pin_path)
+    layout = _layout(pin, layout)
     native._safe_directory(desktop, private=True)
     provenance = native._json(desktop / "provenance.json")
     native._require(provenance.get("source_commit") == pin["desktop_source_commit"], "Desktop source commit mismatch")
@@ -115,6 +193,10 @@ def preflight(
     source = desktop / "buzz-desktop"
     native._require(stat.S_IMODE(native._regular_owned(source).st_mode) == 0o755, "Desktop source mode mismatch")
     native._require(native._sha256(source) == pin["desktop_sha256"], "Desktop ELF hash mismatch")
+    if pin["version"] == 2:
+        native._require(provenance.get("owner_test_hook") is True, "Desktop owner hook missing")
+        with source.open("rb") as payload:
+            native._require(payload.read(4) == b"\x7fELF", "Desktop is not ELF")
     native._require(native._contains(source, "xyz.block.buzz.app"), "Desktop app marker missing")
     native._require(native._contains(source, "buzz:external-agent-enrollment:v1"), "enrollment marker missing")
     native._loader(source)
@@ -142,7 +224,7 @@ def preflight(
     return pin
 
 
-def _backup(target: Path, backup_root: Path) -> Path:
+def _backup(target: Path, backup_root: Path, pin: dict | None = None) -> Path:
     """Durably preserve only the running Desktop before a switch."""
 
     native._ensure_private_directory(backup_root)
@@ -155,7 +237,10 @@ def _backup(target: Path, backup_root: Path) -> Path:
         os.fsync(payload.fileno())
     manifest = backup / "manifest.json"
     with manifest.open("x", encoding="utf-8") as output:
-        json.dump({"version": 1, "target": str(target), "sha256": digest, "mode": 0o755}, output)
+        data = {"version": 1, "target": str(target), "sha256": digest, "mode": 0o755}
+        if pin and pin["version"] == 2:
+            data.update(version=2, pin=pin)
+        json.dump(data, output)
         output.write("\n")
         output.flush()
         os.fsync(output.fileno())
@@ -175,8 +260,12 @@ def _backup_source(backup: Path, layout: native.Layout, backup_root: Path) -> tu
     native._require(backup.parent == backup_root and not backup.is_symlink(), "backup must be a direct child")
     native._safe_directory(backup, private=True)
     data = native._json(backup / "manifest.json")
-    native._require(set(data) == {"version", "target", "sha256", "mode"}, "invalid backup manifest")
-    native._require(data["version"] == 1 and data["target"] == str(layout.targets[0]) and data["mode"] == 0o755, "backup target mismatch")
+    v2 = layout.pin is not None and layout.pin["version"] == 2
+    fields = {"version", "target", "sha256", "mode"} | ({"pin"} if v2 else set())
+    native._require(set(data) == fields, "invalid backup manifest")
+    native._require(data["version"] == (2 if v2 else 1) and data["target"] == str(layout.targets[0]) and data["mode"] == 0o755, "backup target mismatch")
+    if v2:
+        native._require(data["pin"] == layout.pin, "backup pin binding changed")
     digest = data["sha256"]
     native._require(isinstance(digest, str) and HEX64.fullmatch(digest), "invalid backup hash")
     source = backup / "buzz-desktop"
@@ -191,16 +280,21 @@ def _switch(
     layout: native.Layout,
     backup_root: Path,
     launch: Callable[[native.Layout, str], None],
+    retained: Callable[[], None] | None = None,
 ) -> Path:
     """Back up, stop, replace, start, and restore on any switch failure."""
 
     target = layout.targets[0]
     native._require(stat.S_IMODE(native._regular_owned(target).st_mode) == 0o755, "installed Desktop mode changed")
     native._safe_directory(target.parent)
-    backup = _backup(target, backup_root)
+    if retained:
+        retained()
+    backup = _backup(target, backup_root, layout.pin)
     old_source, old_digest = _backup_source(backup, layout, backup_root)
     try:
         launch(layout, "stop")
+        if retained:
+            retained()
         native._require(native._sha256(source) == digest, "Desktop source changed after preflight")
         native._atomic_copy(source, target, 0o755)
         native._require(native._sha256(target) == digest, "installed Desktop hash mismatch")
@@ -211,6 +305,8 @@ def _switch(
             native._require(native._sha256(old_source) == old_digest, "recovery backup hash mismatch")
             native._atomic_copy(old_source, target, 0o755)
             native._require(native._sha256(target) == old_digest, "recovery Desktop hash mismatch")
+            if retained:
+                retained()
             launch(layout, "start")
         except Exception as error:
             raise native.InstallError(f"automatic recovery failed; intact backup: {backup}: {error}") from error
@@ -229,8 +325,10 @@ def install(
     """Install a reviewed Desktop artifact without replacing any sidecar."""
 
     pin = preflight(desktop, sidecars, pin_path, layout)
+    layout = _layout(pin, layout)
     source = desktop / "buzz-desktop"
-    return _switch(source, str(pin["desktop_sha256"]), layout, backup_root, launch)
+    retained = (lambda: _retained(pin, sidecars, layout, installing=True)) if pin["version"] == 2 else None
+    return _switch(source, str(pin["desktop_sha256"]), layout, backup_root, launch, retained)
 
 
 def rollback(
@@ -245,6 +343,7 @@ def rollback(
 
     native._require(os.getuid() == 1000, "installer requires host UID 1000")
     pin = _pin(pin_path)
+    layout = _layout(pin, layout)
     _sidecars_unchanged(pin, sidecars, layout)
     source, digest = _backup_source(backup, layout, backup_root)
     native._require(digest == pin["baseline_desktop_sha256"], "rollback backup differs from pinned baseline")
@@ -252,7 +351,8 @@ def rollback(
     native._safe_directory(layout.targets[0].parent)
     current = native._sha256(layout.targets[0])
     native._require(current in (pin["desktop_sha256"], pin["baseline_desktop_sha256"]), "current Desktop is not pinned")
-    return _switch(source, digest, layout, backup_root, launch)
+    retained = (lambda: _retained(pin, sidecars, layout, installing=False)) if pin["version"] == 2 else None
+    return _switch(source, digest, layout, backup_root, launch, retained)
 
 
 def _interrupt(_signum: int, _frame: FrameType | None) -> None:
