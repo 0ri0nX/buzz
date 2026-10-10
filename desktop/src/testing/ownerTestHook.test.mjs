@@ -101,7 +101,9 @@ const { activateRateLimit, resetRateLimitGate } = await import(
 const { createOwnerTestHandler, installOwnerTestHook } = await import(
   "./ownerTestHook.ts"
 );
-const { OWNER_TEST_SCHEMA } = await import("./ownerTestHookProtocol.ts");
+const { OWNER_TEST_SCHEMA, OWNER_TEST_ENSURE_TARGET_PUBKEYS } = await import(
+  "./ownerTestHookProtocol.ts"
+);
 const { createOwnerTestPhaseReporter } = await import(
   "./ownerTestHookPhases.ts"
 );
@@ -442,6 +444,245 @@ test("runtime inspection ambiguity, malformed response, scope drift and invoke f
       1,
     );
   }
+});
+
+test("installed runtime ensure calls the stock start wrapper once for each pilot and projects observed status", async () => {
+  assert.deepEqual(OWNER_TEST_ENSURE_TARGET_PUBKEYS, [
+    "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+    "fa17b69969fa097c40b105bfd85b383101b2e918827ce0f67958f7c7197da2dc",
+  ]);
+  for (const pubkey of OWNER_TEST_ENSURE_TARGET_PUBKEYS) {
+    for (const lifecycle of ["starting", "listening", "ready", "failed"]) {
+      reset();
+      const payload = nativeStatusRequest();
+      payload.operation = "ensure_managed_agent_runtime";
+      payload.arguments = { pubkey, relayUrl: "https://buzz.rowvia.ai:8443/" };
+      setNativeScope(payload);
+      // The same returned PID/status may describe an already-running pair.
+      const observed = {
+        pubkey,
+        relayUrl: relay,
+        lifecycle,
+        pid: lifecycle === "failed" ? null : 123,
+      };
+      nativeOverrides.set("start_managed_agent_runtime", () => ({
+        ...observed,
+        error: "private failure",
+        logPath: "/private/log",
+        config: { privateKey: "secret", model: "private" },
+      }));
+      const dispose = await installOwnerTestHook();
+      try {
+        await dispatchNativeRequest(payload);
+        assert.deepEqual(replies()[0].args.response, {
+          schema: OWNER_TEST_SCHEMA,
+          requestId: payload.requestId,
+          status: "ok",
+          result: observed,
+        });
+        const beforeDuplicate = calls.length;
+        await dispatchNativeRequest(payload);
+        assert.equal(replies()[1].args.response.code, "duplicate_request");
+        assert.equal(calls.length, beforeDuplicate + 1); // Only the duplicate reply.
+        assert.deepEqual(
+          calls.filter((call) => /managed_agent_runtime/.test(call.command)),
+          [
+            {
+              command: "start_managed_agent_runtime",
+              args: { pubkey, relayUrl: relay },
+            },
+          ],
+        );
+        assert.equal(
+          calls.some((call) => call.command === "publish"),
+          false,
+        );
+      } finally {
+        dispose();
+      }
+    }
+  }
+});
+
+test("runtime ensure rejects non-pilot keys, malformed relays, missing fields and setup arguments before IPC", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const args = { pubkey: OWNER_TEST_ENSURE_TARGET_PUBKEYS[0], relayUrl };
+  for (const value of [
+    ...[
+      ownerPubkey,
+      architectPubkey,
+      "c".repeat(64),
+      "",
+      "A".repeat(64),
+      null,
+    ].map((pubkey) => ({ ...args, pubkey })),
+    ...[
+      "",
+      "localhost:3000",
+      "ftp://localhost",
+      "ws://",
+      null,
+      `ws://localhost/${"x".repeat(2048)}`,
+    ].map((relayUrl) => ({ ...args, relayUrl })),
+    {},
+    { pubkey: args.pubkey },
+    { relayUrl },
+    ...[
+      "privateKey",
+      "definition",
+      "model",
+      "path",
+      "provider",
+      "autoRestart",
+    ].map((field) => ({ ...args, [field]: "secret" })),
+  ]) {
+    const result = await handler(
+      request("ensure_managed_agent_runtime", value),
+    );
+    assert.equal(result.status, "error");
+    assert.equal(result.code, "invalid_request");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("runtime ensure preserves owner, exact relay, unlock and connected gates before start", async (t) => {
+  for (const failure of [
+    "owner",
+    "relay",
+    "target",
+    "locked",
+    "lost",
+    "resetFailed",
+    "disconnected",
+  ]) {
+    reset();
+    const handler = createOwnerTestHandler();
+    t.after(handler.dispose);
+    if (failure === "owner") identity = "f".repeat(64);
+    if (failure === "relay") relay = "ws://localhost:9999";
+    if (["locked", "lost", "resetFailed"].includes(failure))
+      nativeOverrides.set("get_identity", () => ({
+        pubkey: ownerPubkey,
+        [failure === "resetFailed" ? "reset_failed" : failure]: true,
+      }));
+    if (failure === "disconnected")
+      relayClient.connectionStateEmitter.set("disconnected");
+    const result = await handler(
+      request("ensure_managed_agent_runtime", {
+        pubkey: OWNER_TEST_ENSURE_TARGET_PUBKEYS[0],
+        relayUrl: failure === "target" ? "ws://localhost:9999" : relayUrl,
+      }),
+    );
+    assert.equal(result.status, "error");
+    assert.equal(
+      result.code,
+      ["owner", "relay", "target"].includes(failure)
+        ? "scope_mismatch"
+        : "not_ready",
+    );
+    assert.equal(
+      calls.some((call) => /managed_agent_runtime/.test(call.command)),
+      false,
+    );
+  }
+});
+
+test("runtime ensure failure, wrong pair, invalid projection and post-start scope drift stay Unknown without retry", async (t) => {
+  for (const failure of [
+    "throw",
+    "response",
+    "pubkey",
+    "resultRelay",
+    "lifecycle",
+    "pid",
+    "owner",
+    "relay",
+    "disconnect",
+    "locked",
+  ]) {
+    reset();
+    const handler = createOwnerTestHandler();
+    t.after(handler.dispose);
+    const args = { pubkey: OWNER_TEST_ENSURE_TARGET_PUBKEYS[0], relayUrl };
+    nativeOverrides.set("start_managed_agent_runtime", () => {
+      const runtime = { ...args, lifecycle: "listening", pid: 123 };
+      if (failure === "throw") throw new Error("private start failure");
+      if (failure === "response") return null;
+      if (failure === "pubkey")
+        runtime.pubkey = OWNER_TEST_ENSURE_TARGET_PUBKEYS[1];
+      if (failure === "resultRelay") runtime.relayUrl = `${relayUrl}/`;
+      if (failure === "lifecycle") runtime.lifecycle = "secret value";
+      if (failure === "pid") runtime.pid = -1;
+      if (failure === "owner") identity = "f".repeat(64);
+      if (failure === "relay") relay = "ws://localhost:9999";
+      if (failure === "disconnect")
+        relayClient.connectionStateEmitter.set("disconnected");
+      if (failure === "locked")
+        nativeOverrides.set("get_identity", () => ({
+          pubkey: ownerPubkey,
+          locked: true,
+        }));
+      return runtime;
+    });
+    const payload = request("ensure_managed_agent_runtime", args);
+    assert.deepEqual(await handler(payload), {
+      schema: OWNER_TEST_SCHEMA,
+      requestId: payload.requestId,
+      status: "unknown",
+      code:
+        failure === "locked"
+          ? "not_ready"
+          : ["owner", "relay", "disconnect"].includes(failure)
+            ? "scope_mismatch"
+            : "operation_failed",
+    });
+    const before = calls.length;
+    assert.equal((await handler(payload)).code, "duplicate_request");
+    assert.equal(calls.length, before);
+    assert.deepEqual(
+      calls.filter((call) => /managed_agent_runtime/.test(call.command)),
+      [{ command: "start_managed_agent_runtime", args }],
+    );
+  }
+});
+
+test("stalled runtime ensure sends no success and does not start a duplicate request", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler();
+  t.after(handler.dispose);
+  const args = { pubkey: OWNER_TEST_ENSURE_TARGET_PUBKEYS[0], relayUrl };
+  const started = Promise.withResolvers();
+  const completion = Promise.withResolvers();
+  nativeOverrides.set("start_managed_agent_runtime", () => {
+    started.resolve();
+    return completion.promise;
+  });
+  const payload = request("ensure_managed_agent_runtime", args);
+  let settled = false;
+  const pending = handler(payload).finally(() => {
+    settled = true;
+  });
+  await started.promise;
+  const duplicate = handler(payload);
+  try {
+    await new Promise(setImmediate);
+    assert.equal(settled, false);
+    assert.equal(
+      calls.filter((call) => call.command === "start_managed_agent_runtime")
+        .length,
+      1,
+    );
+  } finally {
+    completion.reject(new Error("timeout after possible start"));
+  }
+  assert.equal((await pending).status, "unknown");
+  assert.equal((await duplicate).code, "duplicate_request");
+  assert.equal(
+    calls.filter((call) => /managed_agent_runtime/.test(call.command)).length,
+    1,
+  );
 });
 
 test("installation propagates listener rejection and releases its relay subscription", async (t) => {

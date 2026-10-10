@@ -3,6 +3,11 @@ import { normalizeRelayUrl } from "@/features/communities/relayProbe";
 
 /** Versioned, deliberately narrow temporary owner workflow protocol. */
 export const OWNER_TEST_SCHEMA = "rowvia.buzz.owner-test/v1";
+/** Public identities of the two existing pilot runtimes; test-only, not setup. */
+export const OWNER_TEST_ENSURE_TARGET_PUBKEYS = [
+  "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+  "fa17b69969fa097c40b105bfd85b383101b2e918827ce0f67958f7c7197da2dc",
+] as const;
 const pubkey = z.string().regex(/^[0-9a-f]{64}$/);
 const eventId = z.string().regex(/^[0-9a-f]{64}$/);
 const channelId = z.string().uuid();
@@ -33,6 +38,14 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
     ...base,
     operation: z.literal("inspect_managed_agent_runtime"),
     arguments: z.strictObject({ pubkey, relayUrl }),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("ensure_managed_agent_runtime"),
+    arguments: z.strictObject({
+      pubkey: z.enum(OWNER_TEST_ENSURE_TARGET_PUBKEYS),
+      relayUrl,
+    }),
   }),
   z.strictObject({
     ...base,

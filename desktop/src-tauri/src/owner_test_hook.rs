@@ -235,6 +235,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "send_message"
                 | "read_channel"
                 | "inspect_managed_agent_runtime"
+                | "ensure_managed_agent_runtime"
         )
     {
         return Err(Code::InvalidRequest);
@@ -770,6 +771,35 @@ mod tests {
             validate_request(&serde_json::to_vec(&value).unwrap()),
             Err(Code::InvalidRequest)
         ));
+    }
+
+    #[test]
+    fn runtime_ensure_passes_native_validator_without_opening_direct_lifecycle_operations() {
+        let mut r = request();
+        r.operation = "ensure_managed_agent_runtime".into();
+        r.arguments = serde_json::json!({
+            "pubkey": "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+            "relayUrl": "wss://buzz.rowvia.ai:8443"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            validate_request(&serde_json::to_vec(&r).unwrap()).unwrap(),
+            r
+        );
+        for operation in [
+            "start_managed_agent_runtime",
+            "stop_managed_agent_runtime",
+            "restart_managed_agent_runtime",
+            "ensure_managed_agent_runtime_extra",
+        ] {
+            r.operation = operation.into();
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&r).unwrap()),
+                Err(Code::InvalidRequest)
+            ));
+        }
     }
 
     #[test]

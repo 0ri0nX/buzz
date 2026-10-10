@@ -9,7 +9,10 @@ import {
 } from "@/shared/api/tauri";
 import { createChannel } from "@/shared/api/tauriChannels";
 import { getIdentity } from "@/shared/api/tauriIdentity";
-import { listManagedAgentRuntimes } from "@/shared/api/tauriManagedAgents";
+import {
+  listManagedAgentRuntimes,
+  startManagedAgentRuntime,
+} from "@/shared/api/tauriManagedAgents";
 import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import type { Channel } from "@/shared/api/types";
 import {
@@ -128,6 +131,29 @@ export function createOwnerTestHandler(
         return { ...target, lifecycle: "not_tracked", pid: null };
       const projected = ownerTestRuntimeProjectionSchema.safeParse(matches[0]);
       if (!projected.success) throw new HookFailure("operation_failed");
+      return projected.data;
+    }
+    if (request.operation === "ensure_managed_agent_runtime") {
+      const target = request.arguments;
+      if (target.relayUrl !== request.expected.relayUrl)
+        throw new HookFailure("scope_mismatch");
+      // Native resolves an existing registered local agent, returning its
+      // current runtime if already running. One call, no pre-inspection or
+      // retry: failure after start is Unknown. A returned lifecycle is an
+      // observation, not proof of a new spawn or conversational readiness.
+      markMutation();
+      const runtime = await startManagedAgentRuntime(
+        target.pubkey,
+        target.relayUrl,
+      );
+      await assertScope(request);
+      const projected = ownerTestRuntimeProjectionSchema.safeParse(runtime);
+      if (
+        !projected.success ||
+        projected.data.pubkey !== target.pubkey ||
+        projected.data.relayUrl !== target.relayUrl
+      )
+        throw new HookFailure("operation_failed");
       return projected.data;
     }
     if (request.expected.ownerPubkey === request.expected.architectPubkey)
