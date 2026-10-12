@@ -2905,7 +2905,7 @@ async fn run_harness(
     let presence_keys = config.keys.clone();
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
-    let resolved_owner = resolve_agent_owner(&config);
+    let resolved_owner = resolve_agent_owner(config);
     let startup_owner: Option<String> = resolved_owner.as_ref().map(|owner| owner.pubkey.clone());
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
