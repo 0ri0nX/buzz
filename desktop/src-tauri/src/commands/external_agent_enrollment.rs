@@ -206,8 +206,7 @@ fn authorize_public_agent(
     name: &str,
     challenge: &str,
     proof: &Event,
-    issued_at: u64,
-    relay_url: &str,
+    enrollment: &ExternalAgentEnrollment,
 ) -> Result<String, String> {
     let owner_pubkey = owner_keys.public_key().to_hex();
     if get_retained_event(conn, AGENT_KIND, &owner_pubkey, agent_pubkey)?.is_some() {
@@ -223,8 +222,8 @@ fn authorize_public_agent(
             version: 1,
             challenge_hash: challenge_hash(challenge),
             proof_event_id: proof.id.to_hex(),
-            issued_at,
-            relay_url_hash: challenge_hash(relay_url),
+            issued_at: enrollment.issued_at,
+            relay_url_hash: challenge_hash(&enrollment.relay_url),
         },
     })
     .map_err(|e| format!("failed to serialize agent announcement: {e}"))?;
@@ -332,8 +331,7 @@ fn complete_external_agent_enrollment_at(
             name,
             &input.challenge,
             &proof,
-            pending.issued_at,
-            relay_url,
+            &pending,
         )?
     };
     Ok(ExternalAgentAuthorization {

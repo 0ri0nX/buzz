@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, State};
 
-use super::rowvia_management_journal::{self as journal, Candidate, Entry, Scope};
 use super::identity_archive::fetch_relay_self_at;
+use super::rowvia_management_journal::{self as journal, Candidate, Entry, Scope};
 use crate::{
     app_state::AppState,
     managed_agents::{managed_agents_base_dir, retention::active_retention_scope},
@@ -350,6 +350,7 @@ impl ManagementClient {
         Ok(result)
     }
 
+    #[cfg(test)]
     async fn create_proposal(
         &self,
         keys: &Keys,
@@ -392,13 +393,15 @@ impl ManagementClient {
         Ok(receipt)
     }
 
+    #[cfg(test)]
     async fn approve(
         &self,
         keys: &Keys,
         approval: &ManagementApprovalRequest,
     ) -> Result<serde_json::Value, String> {
         let body = approval_body(approval, true)?;
-        self.post_approval_body(keys, &approval.proposal_id, body).await
+        self.post_approval_body(keys, &approval.proposal_id, body)
+            .await
     }
 
     async fn post_approval_body(
@@ -417,6 +420,7 @@ impl ManagementClient {
         .await
     }
 
+    #[cfg(test)]
     async fn operation(
         &self,
         keys: &Keys,
@@ -432,29 +436,30 @@ fn approval_body(
     approval: &ManagementApprovalRequest,
     require_fresh: bool,
 ) -> Result<Vec<u8>, String> {
-        validate_id(&approval.proposal_id)?;
-        validate_id(&approval.operation_id)?;
-        let canonical_expiry = verify_canonical_proposal_with_freshness(
-            &approval.proposal_bytes_b64,
-            &approval.proposal_digest,
-            &approval.proposal_id,
-            &approval.operation_id,
-            require_fresh,
-        )?;
-        if approval.expires_at != canonical_expiry {
-            return Err("Rowvia proposal expiry mismatch".to_string());
-        }
-        let wire = ApprovalWire {
-            version: "rowvia.buzz-management-approval/v1",
-            proposal_id: &approval.proposal_id,
-            operation_id: &approval.operation_id,
-            proposal_digest: &approval.proposal_digest,
-            decision: "approve",
-            expires_at: &canonical_expiry,
-        };
-        serde_json::to_vec(&wire).map_err(|_| "invalid Rowvia approval".to_string())
+    validate_id(&approval.proposal_id)?;
+    validate_id(&approval.operation_id)?;
+    let canonical_expiry = verify_canonical_proposal_with_freshness(
+        &approval.proposal_bytes_b64,
+        &approval.proposal_digest,
+        &approval.proposal_id,
+        &approval.operation_id,
+        require_fresh,
+    )?;
+    if approval.expires_at != canonical_expiry {
+        return Err("Rowvia proposal expiry mismatch".to_string());
+    }
+    let wire = ApprovalWire {
+        version: "rowvia.buzz-management-approval/v1",
+        proposal_id: &approval.proposal_id,
+        operation_id: &approval.operation_id,
+        proposal_digest: &approval.proposal_digest,
+        decision: "approve",
+        expires_at: &canonical_expiry,
+    };
+    serde_json::to_vec(&wire).map_err(|_| "invalid Rowvia approval".to_string())
 }
 
+#[cfg(test)]
 fn verify_canonical_proposal(
     encoded: &str,
     digest: &str,
@@ -661,8 +666,7 @@ fn frozen_approval_body(
         return Err("Rowvia approval was not requested".to_string());
     }
     let (receipt, expires_at) = decode_entry_receipt_with_freshness(entry, scope, false)?;
-    let (Some(encoded), Some(digest)) =
-        (&entry.approval_body_b64, &entry.approval_body_digest)
+    let (Some(encoded), Some(digest)) = (&entry.approval_body_b64, &entry.approval_body_digest)
     else {
         return Err("Rowvia approval recovery body is unavailable".to_string());
     };
@@ -801,10 +805,10 @@ async fn admit_connector_event(
     client: &ManagementClient,
     scope: &Scope,
     keys: &Keys,
-    event_json: &str,
-    action: &ManagementAction,
+    selection: &CreateSelection,
     selected: &Candidate,
 ) -> Result<(String, String, String, bool), String> {
+    let event_json = &selection.relay_event_json;
     if event_json.len() > 96 * 1024 {
         return Err("Cerberus event is too large".to_string());
     }
@@ -845,7 +849,7 @@ async fn admit_connector_event(
         .map_err(|_| "cannot decrypt Cerberus event")?;
     let payload = &frame.payload;
     let request = &payload.request;
-    let action_value = match action {
+    let action_value = match selection.action {
         ManagementAction::ConnectorGrant => "connector.grant",
         ManagementAction::ConnectorRevoke => "connector.revoke",
     };
@@ -909,9 +913,7 @@ async fn admit_connector_event(
                 .is_some_and(|items| items.len() >= 2 && items[0] == "d" && items[1] == channel)
         })
     });
-    if !roster_signer_matches_relay(roster, &relay_self)
-        || !correct_channel
-    {
+    if !roster_signer_matches_relay(roster, &relay_self) || !correct_channel {
         return Err("invalid Cerberus channel roster".to_string());
     }
     let members = nostr_convert::channel_members_from_event(roster)?;
@@ -1015,17 +1017,8 @@ pub async fn rowvia_create_management_proposal(
     {
         return Err("Cerberus cannot be a management target".to_string());
     }
-    let (logical_request_id, draft_digest, source_event_id, stale_event) = admit_connector_event(
-        &app,
-        &state,
-        &client,
-        &scope,
-        &keys,
-        &selection.relay_event_json,
-        &selection.action,
-        &selected,
-    )
-    .await?;
+    let (logical_request_id, draft_digest, source_event_id, stale_event) =
+        admit_connector_event(&app, &state, &client, &scope, &keys, &selection, &selected).await?;
     let fresh = client.candidates(&keys).await?;
     assert_scope(&app, &state, &client, &scope)?;
     if !fresh.candidates.iter().any(|candidate| {
@@ -1176,7 +1169,9 @@ pub async fn rowvia_approve_management_proposal(
             return Err("Rowvia proposal was refused locally".to_string());
         }
         if entry.approval_intent {
-            return Err("Rowvia approval was already requested; check operation status".to_string());
+            return Err(
+                "Rowvia approval was already requested; check operation status".to_string(),
+            );
         }
         let (receipt, expires_at) = decode_entry_receipt(entry, &scope)?;
         let body = approval_body(
@@ -1228,16 +1223,23 @@ async fn retry_frozen_approval(
     receipt_handle: &str,
     check_scope: impl Fn() -> Result<(), String>,
 ) -> Result<serde_json::Value, String> {
-    let (receipt, body) = journal::transact(&path, &scope, |stored| {
+    let (receipt, body) = journal::transact(path, scope, |stored| {
         let entry = stored
             .entries
             .iter()
             .find(|entry| entry.receipt_handle == receipt_handle)
             .ok_or("unknown Rowvia receipt handle")?;
-        Ok((frozen_approval_body(entry, &scope)?, false))
+        Ok((frozen_approval_body(entry, scope)?, false))
     })?;
-    let status = fetch_and_store_operation(client, keys, path, scope, &receipt.operation_id, &check_scope)
-        .await?;
+    let status = fetch_and_store_operation(
+        client,
+        keys,
+        path,
+        scope,
+        &receipt.operation_id,
+        &check_scope,
+    )
+    .await?;
     match status["state"].as_str() {
         Some("proposed") => {}
         Some("accepted" | "running" | "succeeded" | "failed" | "expired") => {
@@ -1247,16 +1249,18 @@ async fn retry_frozen_approval(
     }
     // A stale proposal cannot be newly approved; keep the intent for status
     // reconciliation and require a new proposal for a different decision.
-    let (_, expires_at) = journal::transact(&path, &scope, |stored| {
+    let (_, expires_at) = journal::transact(path, scope, |stored| {
         let entry = stored
             .entries
             .iter()
             .find(|entry| entry.receipt_handle == receipt_handle)
             .ok_or("unknown Rowvia receipt handle")?;
-        Ok((decode_entry_receipt_with_freshness(entry, &scope, false)?, false))
+        Ok((
+            decode_entry_receipt_with_freshness(entry, scope, false)?,
+            false,
+        ))
     })?;
-    if DateTime::parse_from_rfc3339(&expires_at)
-        .map_err(|_| "invalid Rowvia proposal expiry")?
+    if DateTime::parse_from_rfc3339(&expires_at).map_err(|_| "invalid Rowvia proposal expiry")?
         <= Utc::now()
     {
         return Err("Rowvia proposal has expired".to_string());
