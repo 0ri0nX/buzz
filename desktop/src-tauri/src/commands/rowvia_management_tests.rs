@@ -458,8 +458,7 @@ async fn serve(State(fixture): State<Arc<Fixture>>, request: Request) -> impl In
         return Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                serde_json::json!({"operation_id": "operation-1", "state": "accepted"})
-                    .to_string(),
+                serde_json::json!({"operation_id": "operation-1", "state": "accepted"}).to_string(),
             ))
             .unwrap();
     }
@@ -669,9 +668,7 @@ async fn approval_timeout_recovers_exact_body_with_fresh_proof_after_status_chec
         .post_approval_body(&keys, "proposal-1", body.clone())
         .await
         .is_err());
-    fixture
-        .mode
-        .store(6, std::sync::atomic::Ordering::Relaxed);
+    fixture.mode.store(6, std::sync::atomic::Ordering::Relaxed);
     let result = retry_frozen_approval(&client, &keys, &path, &scope, "receipt-1", || Ok(()))
         .await
         .unwrap();
