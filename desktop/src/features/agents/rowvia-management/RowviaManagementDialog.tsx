@@ -210,10 +210,10 @@ export function RowviaManagementDialog() {
               <p role="status">
                 {item.phase === "policy-applied"
                   ? item.operation?.action === "connector.revoke"
-                    ? "Access revoked. Runtime update may still be in progress."
+                    ? "Access revoked."
                     : item.operation?.runtime_ready
                       ? "Access granted and runtime ready."
-                      : "Access granted, runtime updating."
+                      : "Access granted. Runtime readiness is unverified."
                   : item.phase === "unconfirmed"
                     ? "Decision unconfirmed. Check the operation, then explicitly retry the same approval if it is still pending."
                     : item.phase === "retrying-approval"

@@ -312,6 +312,9 @@ pub enum AgentsCmd {
         /// Proposed instructions; use '-' to read from stdin
         #[arg(long)]
         system_prompt: String,
+        /// Persisted UUIDv4 for retrying this exact draft; grants no approval
+        #[arg(long)]
+        request_id: Option<String>,
     },
     /// Open a prefilled edit-agent form in the owner's Buzz Desktop
     DraftUpdate {
@@ -2283,6 +2286,37 @@ mod tests {
             "{\"auth\":1}",
         ] {
             assert_eq!(normalize_auth_tag_input(garbage), garbage.trim());
+        }
+    }
+
+    #[test]
+    fn create_draft_cli_accepts_retry_id_and_rejects_runtime_authority() {
+        let base = [
+            "buzz",
+            "agents",
+            "draft-create",
+            "--channel",
+            "7c07e659-3610-42f4-9a5e-1e9973c09da9",
+            "--display-name",
+            "Scout",
+            "--system-prompt",
+            "Find sources.",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        let mut retry = base.to_vec();
+        retry.extend(["--request-id", "550e8400-e29b-41d4-a716-446655440000"]);
+        assert!(Cli::try_parse_from(retry).is_ok());
+        for field in [
+            "--model",
+            "--runtime",
+            "--provider",
+            "--owner",
+            "--credentials",
+            "--policy",
+        ] {
+            let mut invalid = base.to_vec();
+            invalid.extend([field, "forbidden"]);
+            assert!(Cli::try_parse_from(invalid).is_err(), "{field}");
         }
     }
 

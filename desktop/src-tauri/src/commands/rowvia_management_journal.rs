@@ -379,7 +379,9 @@ mod tests {
         .unwrap();
         for index in MAX_ENTRIES..MAX_ENTRIES + 2 {
             transact(&file, &scope, |stored| {
-                stored.entries.push(entry(index, Utc::now().timestamp(), false, false));
+                stored
+                    .entries
+                    .push(entry(index, Utc::now().timestamp(), false, false));
                 Ok(((), true))
             })
             .unwrap();
@@ -401,7 +403,9 @@ mod tests {
         assert!(ids.contains(&"logical-2".to_string()));
         assert!(ids.contains(&format!("logical-{}", MAX_ENTRIES + 1)));
         assert!(transact(&file, &scope, |stored| {
-            stored.entries.push(entry(MAX_ENTRIES + 2, Utc::now().timestamp(), false, false));
+            stored
+                .entries
+                .push(entry(MAX_ENTRIES + 2, Utc::now().timestamp(), false, false));
             Ok(((), true))
         })
         .is_err());
@@ -424,7 +428,9 @@ mod tests {
         })
         .unwrap();
         transact(&file, &scope, |stored| {
-            stored.entries.push(entry(MAX_ENTRIES, Utc::now().timestamp(), false, false));
+            stored
+                .entries
+                .push(entry(MAX_ENTRIES, Utc::now().timestamp(), false, false));
             Ok(((), true))
         })
         .unwrap();

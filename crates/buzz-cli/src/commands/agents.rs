@@ -4,8 +4,8 @@ use nostr::PublicKey;
 use serde_json::json;
 
 use crate::agent_management::{
-    build_connector_with_request_id, build_create, build_update, ConnectorDraft, CreateAgentDraft,
-    UpdateAgentDraft,
+    build_connector_with_request_id, build_create_with_request_id, build_update, ConnectorDraft,
+    CreateAgentDraft, UpdateAgentDraft,
 };
 use crate::client::BuzzClient;
 use crate::error::CliError;
@@ -18,9 +18,10 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             channel,
             display_name,
             system_prompt,
+            request_id,
         } => {
             let owner = require_owner(client)?;
-            let built = build_create(
+            let built = build_create_with_request_id(
                 client.keys(),
                 &owner,
                 CreateAgentDraft {
@@ -28,6 +29,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     display_name,
                     system_prompt: read_or_stdin(&system_prompt)?,
                 },
+                request_id,
             )?;
             let response = client.publish_ephemeral_event(built.event).await?;
             let mut output: serde_json::Value = serde_json::from_str(&response)

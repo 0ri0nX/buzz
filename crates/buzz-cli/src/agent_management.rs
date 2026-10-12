@@ -197,6 +197,17 @@ pub fn build_create(
     owner: &PublicKey,
     draft: CreateAgentDraft,
 ) -> Result<BuiltDraftRequest, CliError> {
+    build_create_with_request_id(keys, owner, draft, None)
+}
+
+/// Build an owner-reviewed create draft with an optional persisted retry ID.
+pub fn build_create_with_request_id(
+    keys: &Keys,
+    owner: &PublicKey,
+    draft: CreateAgentDraft,
+    request_id: Option<String>,
+) -> Result<BuiltDraftRequest, CliError> {
+    let request_id = validate_request_id(request_id)?;
     let channel_id = required(draft.channel_id, "channel", 128)?;
     uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| CliError::Usage(format!("invalid channel UUID: {channel_id}")))?;
@@ -205,14 +216,13 @@ pub fn build_create(
         display_name: required(draft.display_name, "display name", MAX_NAME_CHARS)?,
         system_prompt: required(draft.system_prompt, "system prompt", MAX_PROMPT_CHARS)?,
     };
-    build(
+    build_with_request_id(
         keys,
         owner,
         channel_id,
-        AGENT_REQUEST_KIND,
-        None,
-        "create",
+        (AGENT_REQUEST_KIND, None, "create"),
         request,
+        request_id,
     )
 }
 
@@ -287,16 +297,7 @@ pub fn build_connector_with_request_id(
     draft: ConnectorDraft,
     request_id: Option<String>,
 ) -> Result<BuiltDraftRequest, CliError> {
-    let request_id = request_id
-        .map(|value| {
-            let parsed = uuid::Uuid::parse_str(&value)
-                .map_err(|_| CliError::Usage("request ID must be a UUIDv4".into()))?;
-            if parsed.get_version_num() != 4 || parsed.get_variant() != uuid::Variant::RFC4122 {
-                return Err(CliError::Usage("request ID must be a UUIDv4".into()));
-            }
-            Ok(parsed.to_string())
-        })
-        .transpose()?;
+    let request_id = validate_request_id(request_id)?;
     let supplied_channel_id = required(draft.channel_id, "channel", 128)?;
     let channel_id = uuid::Uuid::parse_str(&supplied_channel_id)
         .map_err(|_| CliError::Usage(format!("invalid channel UUID: {supplied_channel_id}")))?
@@ -324,6 +325,19 @@ pub fn build_connector_with_request_id(
         },
         request_id,
     )
+}
+
+fn validate_request_id(request_id: Option<String>) -> Result<Option<String>, CliError> {
+    request_id
+        .map(|value| {
+            let parsed = uuid::Uuid::parse_str(&value)
+                .map_err(|_| CliError::Usage("request ID must be a UUIDv4".into()))?;
+            if parsed.get_version_num() != 4 || parsed.get_variant() != uuid::Variant::RFC4122 {
+                return Err(CliError::Usage("request ID must be a UUIDv4".into()));
+            }
+            Ok(parsed.to_string())
+        })
+        .transpose()
 }
 
 fn selection_hint(value: String, label: &str, max: usize) -> Result<String, CliError> {
@@ -450,6 +464,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("at least one field"));
+    }
+
+    #[test]
+    fn create_retry_id_preserves_desktop_payload_and_owner_encryption() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let request_id = "550e8400-e29b-41d4-a716-446655440000";
+        for _ in 0..2 {
+            let built = build_create_with_request_id(
+                &agent,
+                &owner.public_key(),
+                CreateAgentDraft {
+                    channel_id: CHANNEL.into(),
+                    display_name: " Scout ".into(),
+                    system_prompt: " Find sources. ".into(),
+                },
+                Some(request_id.into()),
+            )
+            .unwrap();
+            assert_eq!(built.request_id, request_id);
+            built.event.verify().unwrap();
+            assert_eq!(built.event.pubkey, agent.public_key());
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner, &built.event).unwrap();
+            assert_eq!(payload["payload"]["requestId"], request_id);
+            assert_eq!(payload["payload"]["action"], "create");
+            assert_eq!(
+                payload["payload"]["request"],
+                serde_json::json!({
+                    "channelId":CHANNEL, "displayName":"Scout", "systemPrompt":"Find sources."
+                })
+            );
+            assert!(
+                decrypt_observer_payload::<serde_json::Value>(&Keys::generate(), &built.event)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn create_rejects_invalid_persisted_ids() {
+        for id in [
+            "",
+            "not-a-uuid",
+            "550e8400-e29b-11d4-a716-446655440000",
+            "550e8400-e29b-41d4-0716-446655440000",
+        ] {
+            assert!(build_create_with_request_id(
+                &Keys::generate(),
+                &Keys::generate().public_key(),
+                CreateAgentDraft {
+                    channel_id: CHANNEL.into(),
+                    display_name: "Scout".into(),
+                    system_prompt: "Help".into(),
+                },
+                Some(id.into())
+            )
+            .is_err());
+        }
     }
 
     #[test]
