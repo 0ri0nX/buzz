@@ -230,6 +230,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
         || !matches!(
             request.operation.as_str(),
             "status"
+                | "inspect_cerberus_proposal_ui"
                 | "create_private_stream"
                 | "add_architect"
                 | "send_message"
@@ -238,6 +239,9 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "ensure_managed_agent_runtime"
         )
     {
+        return Err(Code::InvalidRequest);
+    }
+    if request.operation == "inspect_cerberus_proposal_ui" && !request.arguments.is_empty() {
         return Err(Code::InvalidRequest);
     }
     if request.expected.owner_pubkey != OWNER
@@ -712,6 +716,35 @@ mod tests {
         r.operation = "status".into();
         r.expected.relay_url = "https://foreign.example".into();
         assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+    }
+
+    #[test]
+    fn proposal_ui_inspection_is_zero_argument_and_preserves_all_scope_guards() {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value["operation"] = Value::String("inspect_cerberus_proposal_ui".into());
+        value["arguments"] = serde_json::json!({});
+        assert!(validate_request(&serde_json::to_vec(&value).unwrap()).is_ok());
+        for field in ["ownerPubkey", "architectPubkey", "relayUrl"] {
+            let mut invalid = value.clone();
+            invalid["expected"][field] = Value::String("foreign".into());
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Code::ScopeMismatch)
+            ));
+        }
+        for argument in ["channelId", "pubkey", "selector", "eval"] {
+            let mut invalid = value.clone();
+            invalid["arguments"][argument] = Value::String("foreign".into());
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Code::InvalidRequest)
+            ));
+        }
+        value["operation"] = Value::String("inspect_cerberus_proposal_ui_extra".into());
+        assert!(matches!(
+            validate_request(&serde_json::to_vec(&value).unwrap()),
+            Err(Code::InvalidRequest)
+        ));
     }
 
     #[test]

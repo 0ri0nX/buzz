@@ -8,6 +8,7 @@ import {
   invokeTauri,
 } from "@/shared/api/tauri";
 import { createChannel } from "@/shared/api/tauriChannels";
+import { inspectCerberusProposalUi } from "./cerberusProposalUiDiagnostic";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import {
   listManagedAgentRuntimes,
@@ -108,6 +109,11 @@ export function createOwnerTestHandler(
       };
     if (relayClient.getConnectionState() !== "connected")
       throw new HookFailure("not_ready");
+    if (request.operation === "inspect_cerberus_proposal_ui") {
+      const snapshot = inspectCerberusProposalUi(request.expected);
+      if (!snapshot) throw new HookFailure("not_ready");
+      return snapshot;
+    }
     if (request.operation === "inspect_managed_agent_runtime") {
       const target = request.arguments;
       if (target.relayUrl !== request.expected.relayUrl)

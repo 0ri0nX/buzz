@@ -176,3 +176,31 @@ for (const failingUpdate of [0, 1]) {
     assert.equal(pendingTrust.length, failingUpdate + 1);
   });
 }
+
+test("community transition clears the proposal diagnostic before applying the new scope", async (t) => {
+  const { registerCerberusProposalUiDiagnostic, inspectCerberusProposalUi } =
+    await import("@/testing/cerberusProposalUiDiagnostic");
+  t.mock.method(relayClient, "disconnect", () => {});
+  const mounted = renderHook(
+    (community) =>
+      useCommunityInit(community, community.id, false, false, [a, b]),
+    { initialProps: b },
+  );
+  await waitFor(() => assert.equal(mounted.result.current.isReady, true));
+  const expected = { ownerPubkey: "a".repeat(64), relayUrl: b.relayUrl };
+  registerCerberusProposalUiDiagnostic(() => ({
+    ...expected,
+    managedAgents: [],
+    relayAgents: [],
+    channels: [],
+    pending: false,
+    sourceAgentPubkey: null,
+    requestChannelId: undefined,
+    seenCount: 0,
+    bufferedCount: 0,
+  }));
+  assert.equal(inspectCerberusProposalUi(expected).hookMounted, true);
+  mounted.rerender(a);
+  await waitFor(() => assert.equal(inspectCerberusProposalUi(expected), null));
+  await waitFor(() => assert.equal(mounted.result.current.isReady, true));
+});

@@ -10,6 +10,7 @@ import {
 import { subscribeAgentManagementRequests } from "./observerRelayStore";
 import {
   managedAgentsQueryKey,
+  relayAgentsQueryKey,
   personasQueryKey,
   useAcpRuntimesQuery,
   useCreateManagedAgentMutation,
@@ -32,10 +33,15 @@ import { editPersonaDialogState } from "./ui/personaDialogState";
 import type {
   CreatePersonaInput,
   UpdatePersonaInput,
+  Identity,
+  RelayAgent,
 } from "@/shared/api/types";
+import { useCommunities } from "@/features/communities/useCommunities";
+import { registerCerberusProposalUiDiagnostic } from "@/testing/cerberusProposalUiDiagnostic";
 
 export function useAgentManagement() {
   const queryClient = useQueryClient();
+  const { activeCommunity } = useCommunities();
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const channelsQuery = useChannelsQuery();
@@ -56,6 +62,27 @@ export function useAgentManagement() {
   const bufferedRequestsRef = React.useRef<
     Array<{ agentPubkey: string; request: AgentManagementRequest }>
   >([]);
+  const diagnosticRequestRef = React.useRef(request);
+  const diagnosticRelayRef = React.useRef(activeCommunity?.relayUrl);
+  React.useLayoutEffect(() => {
+    diagnosticRequestRef.current = request;
+    diagnosticRelayRef.current = activeCommunity?.relayUrl;
+  }, [activeCommunity?.relayUrl, request]);
+  React.useEffect(() => {
+    if (import.meta.env?.VITE_ROWVIA_OWNER_TEST_HOOK !== "1") return;
+    return registerCerberusProposalUiDiagnostic(() => ({
+      ownerPubkey: queryClient.getQueryData<Identity>(["identity"])?.pubkey,
+      relayUrl: diagnosticRelayRef.current,
+      managedAgents: managedAgentsRef.current,
+      relayAgents: queryClient.getQueryData<RelayAgent[]>(relayAgentsQueryKey),
+      channels: channelsRef.current,
+      pending: pendingRequestId.current !== null,
+      sourceAgentPubkey: sourceAgentPubkey.current,
+      requestChannelId: diagnosticRequestRef.current?.request.channelId,
+      seenCount: seenRequestIds.current.size,
+      bufferedCount: bufferedRequestsRef.current.length,
+    }));
+  }, [queryClient]);
 
   const acceptOwnedRequest = React.useEffectEvent(
     (agentPubkey: string, next: AgentManagementRequest) => {

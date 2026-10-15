@@ -36,6 +36,11 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
   }),
   z.strictObject({
     ...base,
+    operation: z.literal("inspect_cerberus_proposal_ui"),
+    arguments: z.strictObject({}),
+  }),
+  z.strictObject({
+    ...base,
     operation: z.literal("inspect_managed_agent_runtime"),
     arguments: z.strictObject({ pubkey, relayUrl }),
   }),
@@ -110,6 +115,23 @@ export const ownerTestRuntimeProjectionSchema = z.object({
 });
 
 export type OwnerTestRequest = z.infer<typeof ownerTestRequestSchema>;
+/** Bounded current cache/ref observations, never a past rejection diagnosis. */
+export const cerberusProposalUiSnapshotSchema = z.strictObject({
+  hookMounted: z.literal(true),
+  knownAgentCached: z.boolean().nullable(),
+  locallyManagedCached: z.boolean().nullable(),
+  relayOwnedCached: z.boolean().nullable(),
+  channelCached: z.boolean().nullable(),
+  ownerMemberCached: z.boolean().nullable(),
+  agentMemberCached: z.boolean().nullable(),
+  dialogRequested: z.boolean(),
+  pendingSameTarget: z.boolean().nullable(),
+  managementSeenCount: z.number().int().min(0).max(100),
+  managementBufferedCount: z.number().int().min(0).max(100),
+});
+export type CerberusProposalUiSnapshot = z.infer<
+  typeof cerberusProposalUiSnapshotSchema
+>;
 export type OwnerTestCode =
   | "invalid_request"
   | "duplicate_request"

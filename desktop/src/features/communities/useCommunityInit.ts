@@ -3,6 +3,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { isMacPlatform } from "@/shared/lib/platform";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { resetCerberusProposalUiDiagnostic } from "@/testing/cerberusProposalUiDiagnostic";
 import { resetChannelMembershipWrites } from "@/shared/api/channelMembershipWrites";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
 import { readmitRelay } from "@/features/agents/managedAgentRelayCleanup";
@@ -67,6 +68,7 @@ async function resetCommunityState({
 }: {
   resetAvatarState: boolean;
 }): Promise<void> {
+  resetCerberusProposalUiDiagnostic();
   relayClient.disconnect();
   await resetNavigationDeepLinkDrain();
   resetRateLimitGate();

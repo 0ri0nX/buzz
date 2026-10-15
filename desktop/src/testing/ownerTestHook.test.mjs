@@ -107,6 +107,95 @@ const { OWNER_TEST_SCHEMA, OWNER_TEST_ENSURE_TARGET_PUBKEYS } = await import(
 const { createOwnerTestPhaseReporter } = await import(
   "./ownerTestHookPhases.ts"
 );
+const {
+  registerCerberusProposalUiDiagnostic,
+  resetCerberusProposalUiDiagnostic,
+} = await import("./cerberusProposalUiDiagnostic.ts");
+
+test("proposal UI operation reads registered refs with only the existing scope RPCs", async () => {
+  reset();
+  const handler = createOwnerTestHandler(() => {});
+  const data = {
+    ownerPubkey,
+    relayUrl,
+    managedAgents: [],
+    relayAgents: [],
+    channels: [],
+    pending: false,
+    sourceAgentPubkey: null,
+    requestChannelId: undefined,
+    seenCount: 0,
+    bufferedCount: 0,
+  };
+  const unregister = registerCerberusProposalUiDiagnostic(() => data);
+  try {
+    const result = await handler(request("inspect_cerberus_proposal_ui"));
+    assert.equal(result.status, "ok");
+    assert.equal(result.result.hookMounted, true);
+    assert.equal(result.result.dialogRequested, false);
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ["get_identity", "get_relay_ws_url"],
+    );
+    for (const args of [
+      { channelId },
+      { pubkey: ownerPubkey },
+      { eval: "private" },
+    ]) {
+      calls.length = 0;
+      const denied = await handler(
+        request("inspect_cerberus_proposal_ui", args),
+      );
+      assert.equal(denied.code, "invalid_request");
+      assert.equal(calls.length, 0);
+    }
+    relayClient.connectionStateEmitter.set("disconnected");
+    assert.equal(
+      (await handler(request("inspect_cerberus_proposal_ui"))).code,
+      "scope_mismatch",
+    );
+  } finally {
+    unregister();
+    handler.dispose();
+  }
+});
+
+test("proposal UI operation rejects unregistered/unknown scope and wrong native scope", async () => {
+  for (const change of [
+    null,
+    { ownerPubkey: undefined },
+    { relayUrl: "wss://foreign.test" },
+    { ownerPubkey: "c".repeat(64) },
+  ]) {
+    reset();
+    resetCerberusProposalUiDiagnostic();
+    const handler = createOwnerTestHandler(() => {});
+    if (change)
+      registerCerberusProposalUiDiagnostic(() => ({
+        ownerPubkey,
+        relayUrl,
+        ...change,
+      }));
+    assert.equal(
+      (await handler(request("inspect_cerberus_proposal_ui"))).code,
+      "not_ready",
+    );
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ["get_identity", "get_relay_ws_url"],
+    );
+    handler.dispose();
+  }
+  reset();
+  resetCerberusProposalUiDiagnostic();
+  const handler = createOwnerTestHandler(() => {});
+  identity = "c".repeat(64);
+  assert.equal(
+    (await handler(request("inspect_cerberus_proposal_ui"))).code,
+    "scope_mismatch",
+  );
+  handler.dispose();
+});
 
 // Mock native invoke and the session/transport boundary; retain the stock
 // native send wrapper, independent JS publisher, reads and mention handling.
