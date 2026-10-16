@@ -469,6 +469,16 @@ pub(crate) fn spawn_with_effort_proof(
     cmd.spawn()
 }
 
+/// Apply the resolved descriptor at the final user-environment spawn boundary.
+pub(crate) fn apply_harness_descriptor_env(
+    command: &mut std::process::Command,
+    descriptor: &super::readiness::EffectiveHarnessDescriptor,
+) {
+    for (key, value) in &descriptor.env {
+        command.env(key, value);
+    }
+}
+
 /// Spawn an agent process without holding any locks on records or runtimes.
 /// Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
@@ -494,7 +504,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
-    let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
+    ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
     // Resolve the effective harness (agent command) from the linked persona, so
     // persona harness edits propagate on the next spawn; an explicit per-agent
     // override wins. `agent_args` and `mcp_command` are pure derivations of the
@@ -505,6 +515,40 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
     // and for the env-var merge at spawn time.
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+
+    spawn_agent_child_with_context(
+        app,
+        record,
+        relay_url,
+        admitted,
+        lazy,
+        owner_hex,
+        replay_floor_unix,
+        &personas,
+        &teams,
+        &global,
+    )
+}
+
+/// Spawn using an already captured context, without write-on-load catalog merges.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_agent_child_with_context<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &ManagedAgentRecord,
+    relay_url: &str,
+    admitted: &super::Admitted<'_>,
+    lazy: bool,
+    owner_hex: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    personas: &[super::AgentDefinition],
+    teams: &[super::TeamRecord],
+    global: &super::GlobalAgentConfig,
+) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
+    admitted.covers(relay_url)?;
+    if let Some(error) = spawn_key_refusal(record) {
+        return Err(error);
+    }
+    let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
 
     // Resolve model/provider/prompt ONCE, here, at the shared spawn boundary —
     // the single source both the env writes below and the spawn-config snapshot
@@ -517,10 +561,9 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // inherits it — no caller can bypass this by reaching `spawn_agent_child`
     // directly. Checked before any side effect (log marker, log file, process
     // spawn) so a refused spawn leaves no trace.
-    let effective_cfg = crate::managed_agents::effective_config::resolve_effective_config(
-        record, &personas, &global,
-    )
-    .require_resolved()?;
+    let effective_cfg =
+        crate::managed_agents::effective_config::resolve_effective_config(record, personas, global)
+            .require_resolved()?;
 
     // Single typed resolver: validates runtime id (dangling harness → Err), resolves
     // command, args (instance wins over definition default), and the full env layer stack.
@@ -530,7 +573,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // Like the orphan refusal above, this runs before any side effect so a refused
     // spawn leaves no trace.
     let descriptor =
-        crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
+        crate::managed_agents::resolve_effective_harness_descriptor(record, personas, global)
             .map_err(|e| {
                 format!(
                     "cannot spawn agent {}: {}",
@@ -662,7 +705,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
             }
         }
     }
-    let team_instructions = super::spawn_snapshot::effective_team_instructions(record, &teams);
+    let team_instructions = super::spawn_snapshot::effective_team_instructions(record, teams);
     if let Some(instructions) = &team_instructions {
         command.env("BUZZ_ACP_TEAM_INSTRUCTIONS", instructions);
     } else {
@@ -723,7 +766,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
         &mut command,
         record,
         runtime_meta,
-        &personas,
+        personas,
         record.persona_id.as_deref(),
         &global.env_vars,
         &super::agent_env::baked_build_env(),
@@ -778,11 +821,9 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
-    for (key, value) in &descriptor.env {
-        command.env(key, value);
-    }
+    apply_harness_descriptor_env(&mut command, &descriptor);
     // Resolve once and stamp the same value onto the environment and snapshot.
-    let acp_session_policy = super::effective_acp_session_policy(record, &personas);
+    let acp_session_policy = super::effective_acp_session_policy(record, personas);
     super::apply_acp_session_policy_env(&mut command, acp_session_policy);
 
     crate::build_identity::apply_demo_config_home(&mut command)?;

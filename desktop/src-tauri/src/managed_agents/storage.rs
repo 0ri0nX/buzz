@@ -330,6 +330,21 @@ fn hydrate_keys(records: &mut [ManagedAgentRecord]) {
     hydrate_keys_with(store, records);
 }
 
+/// Read only this target's existing key, without opportunistic key migration.
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(super) fn owner_test_target_key(record: &mut ManagedAgentRecord) -> Result<(), String> {
+    if record.private_key_nsec.is_empty() {
+        record.private_key_nsec = agent_secret_store()
+            .ok_or("target key unavailable")?
+            .load(&agent_keyring_name(&record.pubkey))?
+            .ok_or("target key unavailable")?;
+    }
+    if let Some(error) = spawn_key_refusal(record) {
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Testable core of [`hydrate_keys`], generic over the [`KeyStore`] seam.
 ///
 /// A keyring LOAD error (`Err`) is an OUTAGE — distinct from `Ok(None)`
@@ -825,7 +840,8 @@ fn agent_pids_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, Stri
 
 /// Persist a pair-scoped runtime receipt atomically. Callers must register the
 /// process in memory in the same runtime transition; on write failure they must
-/// terminate the child before releasing that transition.
+/// retain ownership for reconciliation or terminate the child before releasing
+/// that transition.
 pub fn write_agent_runtime_receipt<R: tauri::Runtime>(
     app: &AppHandle<R>,
     receipt: &ManagedAgentRuntimeReceipt,

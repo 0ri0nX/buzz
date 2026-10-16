@@ -31,6 +31,26 @@ const base = {
 export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
   z.strictObject({
     ...base,
+    operation: z.literal("inspect_saved_connector"),
+    arguments: z.strictObject({}),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("prepare_saved_connector"),
+    arguments: z.strictObject({}),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("approve_saved_connector"),
+    arguments: z.strictObject({ fingerprint: eventId }),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("inspect_saved_connector_operation"),
+    arguments: z.strictObject({ fingerprint: eventId }),
+  }),
+  z.strictObject({
+    ...base,
     operation: z.literal("status"),
     arguments: z.strictObject({}),
   }),

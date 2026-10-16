@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, State};
 
 use super::rowvia_management_journal::{self as journal, Candidate, Entry, Scope};
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+#[path = "saved-connector-owner-test.rs"]
+pub(crate) mod owner_test_saved_connector;
 use super::identity_archive::fetch_relay_self_at;
 use crate::{
     app_state::AppState,

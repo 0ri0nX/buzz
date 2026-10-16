@@ -11,6 +11,10 @@ import { createChannel } from "@/shared/api/tauriChannels";
 import { inspectCerberusProposalUi } from "./cerberusProposalUiDiagnostic";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import {
+  executeSavedConnectorOwnerTest,
+  SavedConnectorOwnerTestFailure,
+} from "./saved-connector-owner-test";
+import {
   listManagedAgentRuntimes,
   startManagedAgentRuntime,
 } from "@/shared/api/tauriManagedAgents";
@@ -56,16 +60,22 @@ export function createOwnerTestHandler(
   let fenced = false;
   let queue = Promise.resolve();
   let queued = 0;
+  const connectorLifetime = new AbortController();
   const fence = () => {
     fenced = true;
+    connectorLifetime.abort();
     channels.clear();
     sentEvents.clear();
   };
-  const dispose = relayClient.subscribeToConnectionState((state) => {
+  const unsubscribe = relayClient.subscribeToConnectionState((state) => {
     if (boundScope !== null && (state === "idle" || state === "disconnected")) {
       fence();
     }
   });
+  const dispose = () => {
+    connectorLifetime.abort();
+    unsubscribe();
+  };
 
   async function assertScope(request: OwnerTestRequest) {
     const scope = JSON.stringify(request.expected);
@@ -109,6 +119,24 @@ export function createOwnerTestHandler(
       };
     if (relayClient.getConnectionState() !== "connected")
       throw new HookFailure("not_ready");
+    if (
+      request.operation === "inspect_saved_connector" ||
+      request.operation === "prepare_saved_connector" ||
+      request.operation === "approve_saved_connector" ||
+      request.operation === "inspect_saved_connector_operation"
+    ) {
+      try {
+        return await executeSavedConnectorOwnerTest(
+          request,
+          markMutation,
+          connectorLifetime.signal,
+        );
+      } catch (error) {
+        if (error instanceof SavedConnectorOwnerTestFailure)
+          throw new HookFailure(error.code);
+        throw error;
+      }
+    }
     if (request.operation === "inspect_cerberus_proposal_ui") {
       const snapshot = inspectCerberusProposalUi(request.expected);
       if (!snapshot) throw new HookFailure("not_ready");

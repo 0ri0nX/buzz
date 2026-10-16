@@ -8,11 +8,46 @@ import {
 } from "@/shared/ui/dialog";
 import { RowviaConnectorProposalReview } from "./RowviaConnectorProposalReview";
 import { useRowviaManagement } from "./useRowviaManagement";
+import { useLayoutEffect, useRef } from "react";
+import { useCommunities } from "@/features/communities/useCommunities";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import {
+  registerSavedConnectorOwnerTest,
+  type SavedConnectorDialogState,
+} from "@/testing/saved-connector-owner-test";
 
 /** Owner-facing review; only a native-journaled receipt reaches the verifier. */
 export function RowviaManagementDialog() {
   const management = useRowviaManagement();
   const item = management.current;
+  const { activeCommunity } = useCommunities();
+  const identity = useIdentityQuery();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const committed = useRef<SavedConnectorDialogState | null>(null);
+  useLayoutEffect(() => {
+    committed.current = {
+      ownerPubkey: identity.data?.pubkey,
+      relayUrl: activeCommunity?.relayUrl,
+      open: management.open,
+      phase: item?.phase,
+      itemId: item?.id,
+      request: item?.request ?? null,
+      evidence: item?.evidence ?? null,
+      receipt: item?.receipt ?? null,
+      candidates: management.candidates,
+      selectionHandle: item?.selectionHandle ?? null,
+      dialog: dialogRef.current,
+    };
+  });
+  useLayoutEffect(
+    () =>
+      registerSavedConnectorOwnerTest(() => {
+        if (!committed.current)
+          throw new Error("saved connector dialog unavailable");
+        return { ...committed.current, dialog: dialogRef.current };
+      }),
+    [],
+  );
   const status =
     item?.phase === "submitting"
       ? "loading"
@@ -40,7 +75,7 @@ export function RowviaManagementDialog() {
         onOpenChange={(open) => management.setOpen(open)}
         open={Boolean(item && management.open)}
       >
-        <DialogContent className="max-h-[90vh] overflow-y-auto">
+        <DialogContent ref={dialogRef} className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Cerberus Gmail access request</DialogTitle>
             <DialogDescription>
@@ -196,7 +231,12 @@ export function RowviaManagementDialog() {
             <RowviaConnectorProposalReview
               onApprove={() => void management.approve()}
               onReject={() => void management.reject()}
-              proposal={item.receipt}
+              proposal={{
+                proposal_id: item.receipt.proposal_id,
+                operation_id: item.receipt.operation_id,
+                proposal_digest: item.receipt.proposal_digest,
+                proposal_bytes_b64: item.receipt.proposal_bytes_b64,
+              }}
               status={status}
             />
           ) : null}

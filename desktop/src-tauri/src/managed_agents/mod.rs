@@ -25,6 +25,8 @@ pub(crate) mod git_bash;
 pub(crate) mod global_config;
 mod managed_node_paths;
 mod nest;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(crate) mod owner_test_saved_developer;
 mod pair_admission;
 pub(crate) mod parallelism;
 mod persona_avatars;

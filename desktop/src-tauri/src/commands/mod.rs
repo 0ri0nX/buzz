@@ -70,6 +70,8 @@ mod relay_members;
 mod relay_reconnect;
 mod rowvia_management;
 mod rowvia_management_journal;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(crate) use rowvia_management::owner_test_saved_connector;
 mod social;
 mod team_snapshot;
 mod teams;
