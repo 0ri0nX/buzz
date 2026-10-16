@@ -2876,10 +2876,19 @@ async fn run_harness(
         .filter(|s| !s.is_empty())
         .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
-    let mut relay =
-        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
-            .await
-            .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+    let mut relay = if config.startup_live_only_channel.is_some() {
+        HarnessRelay::connect_with_startup_gate(
+            &config.relay_url,
+            &config.keys,
+            &pubkey_hex,
+            relay_auth_tag,
+            config.startup_live_only_channel,
+        )
+        .await
+    } else {
+        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag).await
+    }
+    .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -2895,11 +2904,13 @@ async fn run_harness(
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
 
-    relay
-        .subscribe_membership_notifications()
-        .await
-        .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
-    tracing::info!("subscribed to membership notifications");
+    if config.startup_live_only_channel.is_none() {
+        relay
+            .subscribe_membership_notifications()
+            .await
+            .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
+        tracing::info!("subscribed to membership notifications");
+    }
 
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
@@ -2980,6 +2991,12 @@ async fn run_harness(
     let rules = startup_subscription_rules(config)?;
 
     let channel_filters = config::resolve_channel_filters(config, &channel_ids, &rules);
+    if let Some(channel) = config.startup_live_only_channel {
+        anyhow::ensure!(
+            channel_filters.len() == 1 && channel_filters.contains_key(&channel),
+            "startup-live-only must resolve exactly the selected channel"
+        );
+    }
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
@@ -2992,6 +3009,10 @@ async fn run_harness(
             tracing::info!("subscribed to channel {channel_id}");
         }
     }
+
+    // A command-channel enqueue is not proof that REQ was written, nor that
+    // history has drained. Keep online/listening readiness behind the witness.
+    relay.wait_startup_live().await?;
 
     if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
         relay_observer_publisher.take()
@@ -3014,6 +3035,7 @@ async fn run_harness(
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
     // a durable readiness boundary before they send a startup mention.
+    relay.check_startup_live()?;
     if config.presence_enabled {
         match publish_presence(&presence_publisher, &presence_keys, "online").await {
             Ok(_) => tracing::info!("presence set to online"),
@@ -3021,6 +3043,7 @@ async fn run_harness(
         }
     }
 
+    relay.check_startup_live()?;
     if config.lazy_pool {
         emit_runtime_lifecycle(
             observer.as_ref(),
@@ -3141,6 +3164,7 @@ async fn run_harness(
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
     // Startup is complete; the main loop now owns graceful shutdown.
+    relay.check_startup_live()?;
     let _ = startup_ready.send(());
 
     // Track the newest membership notification timestamp per channel.
@@ -3201,7 +3225,15 @@ async fn run_harness(
         Recovery(recovery_wake::RecoveryWake),
     }
 
+    let startup_failure = relay.startup_failure();
+    tokio::pin!(startup_failure);
+    let mut live_only_failed = false;
     loop {
+        if let Err(error) = relay.check_startup_live() {
+            tracing::error!(%error, "live-only relay failed; shutting down harness");
+            live_only_failed = true;
+            break;
+        }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3311,6 +3343,11 @@ async fn run_harness(
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = &mut startup_failure => {
+                    tracing::error!("live-only relay failed; shutting down harness");
+                    live_only_failed = true;
+                    break;
+                }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutting down");
                     break;
@@ -3376,6 +3413,11 @@ async fn run_harness(
                                 Some(&message),
                             );
                         }
+                    }
+                    if config.startup_live_only_channel.is_some() {
+                        tracing::error!("live-only worker startup task failed; automatic wake retry disabled");
+                        live_only_failed = true;
+                        break;
                     }
                     None
                 }
@@ -3743,38 +3785,50 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(
-                                &mut queue,
-                                session_scope,
-                                channel_is_dm,
-                                trusted_channel_type,
-                            );
-                            // 👀 — immediate "seen" reaction, only if the event
-                            // was actually queued (not dropped by DedupMode::Drop).
-                            // Fire-and-forget: on rare fast-failure paths the
-                            // guard's cleanup may race with this add, leaving a
-                            // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            queued.mark_seen(&ctx.rest_client);
-                            // Event is already queued. The authorized ingress
-                            // retains its verified author, resolved scope, and
-                            // event data through the optional steer/interrupt
-                            // decision.
-                            queued.steer_or_interrupt(
-                                config.multiple_event_handling,
-                                owner_cache.get(),
-                                &mut pool,
-                                &mut queue,
-                                &steer_ack_tx,
-                            );
-                            if pool_ready {
-                                for (scope, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
-                                {
-                                    typing_channels.insert(scope, thread_tags);
+                            let admitted = relay.with_live_ingress(|| {
+                                let queued = ingress.push(
+                                    &mut queue,
+                                    session_scope,
+                                    channel_is_dm,
+                                    trusted_channel_type,
+                                );
+                                // 👀 — immediate "seen" reaction, only if the event
+                                // was actually queued (not dropped by DedupMode::Drop).
+                                // Fire-and-forget: on rare fast-failure paths the
+                                // guard's cleanup may race with this add, leaving a
+                                // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
+                                queued.mark_seen(&ctx.rest_client);
+                                // Event is already queued. The authorized ingress
+                                // retains its verified author, resolved scope, and
+                                // event data through the optional steer/interrupt
+                                // decision.
+                                queued.steer_or_interrupt(
+                                    config.multiple_event_handling,
+                                    owner_cache.get(),
+                                    &mut pool,
+                                    &mut queue,
+                                    &steer_ack_tx,
+                                );
+                                if pool_ready {
+                                    for (scope, thread_tags) in
+                                        dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
+                                    {
+                                        typing_channels.insert(scope, thread_tags);
+                                    }
                                 }
+                            });
+                            if let Err(error) = admitted {
+                                tracing::error!(%error, "live-only relay failed during ingress authorization");
+                                live_only_failed = true;
+                                break;
                             }
                         }
                         None => {
+                            if config.startup_live_only_channel.is_some() {
+                                tracing::error!("startup-live-only relay terminated; explicit restart required");
+                                live_only_failed = true;
+                                break;
+                            }
                             tracing::warn!("relay event stream ended — requesting reconnect");
                             if let Err(e) = relay.reconnect().await {
                                 tracing::error!("relay background task is gone: {e} — exiting");
@@ -3994,6 +4048,7 @@ async fn run_harness(
                     Some(&ctx.rest_client),
                 ) == LoopAction::Exit
                 {
+                    live_only_failed = config.startup_live_only_channel.is_some();
                     break;
                 }
                 if drain_ready_join_results(
@@ -4009,6 +4064,7 @@ async fn run_harness(
                     observer.clone(),
                 ) == LoopAction::Exit
                 {
+                    live_only_failed = config.startup_live_only_channel.is_some();
                     break;
                 }
                 for (scope, thread_tags) in dispatch_pending(
@@ -4023,6 +4079,11 @@ async fn run_harness(
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
+                if config.startup_live_only_channel.is_some() {
+                    tracing::error!("live-only task panic is terminal; batch recovery disabled");
+                    live_only_failed = true;
+                    break;
+                }
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
@@ -4250,6 +4311,13 @@ async fn run_harness(
                             "failed",
                             Some(&error),
                         );
+                        if config.startup_live_only_channel.is_some() {
+                            tracing::error!(
+                                "live-only worker startup failed; automatic wake retry disabled"
+                            );
+                            live_only_failed = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -4393,6 +4461,10 @@ async fn run_harness(
     relay.shutdown().await;
 
     tracing::info!("buzz-acp stopped");
+    anyhow::ensure!(
+        !live_only_failed,
+        "live-only harness failed closed; explicit restart required"
+    );
     Ok(())
 }
 
@@ -5239,6 +5311,51 @@ fn handle_prompt_result(
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
 ) -> LoopAction {
+    let outcome_label = match &result.outcome {
+        PromptOutcome::Ok(_) => "ok",
+        PromptOutcome::Error(_) => "error",
+        PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+        PromptOutcome::AgentExited => "exited",
+        PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+    };
+    let agent_index = result.agent.index;
+    let channel_id = result.source.channel_id();
+    let turn_id = result.turn_id.clone();
+    let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
+        if let Some(ref observer) = observer {
+            let mut payload = serde_json::json!({
+                "outcome": outcome_label,
+                "error": error_msg,
+            });
+            if let Some(code) = error_code {
+                payload["code"] = serde_json::json!(code);
+            }
+            observer.emit(
+                "turn_error",
+                Some(agent_index),
+                &observer::context_for(channel_id, None, Some(turn_id.clone())),
+                payload,
+            );
+        }
+    };
+    // The dedicated live-only policy cannot know whether a failed turn had
+    // external effects. Exit before taking its batch, requeueing, or respawning.
+    if config.startup_live_only_channel.is_some() && !matches!(result.outcome, PromptOutcome::Ok(_))
+    {
+        tracing::error!(agent = result.agent.index, outcome = outcome_label,
+            "live-only turn did not complete; explicit restart required; automatic batch retry disabled");
+        emit_turn_error(
+            "live-only turn did not complete; automatic retry disabled",
+            None,
+        );
+        // Keep the client owned until the outer loop's awaited shutdown. The
+        // caller exits before this slot can be claimed for another dispatch.
+        pool.return_agent(result.agent);
+        return LoopAction::Exit;
+    }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -5414,17 +5531,6 @@ fn handle_prompt_result(
         result.agent.state.invalidate_channel(ch);
     }
 
-    let outcome_label = match &result.outcome {
-        PromptOutcome::Ok(_) => "ok",
-        PromptOutcome::Error(_) => "error",
-        PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
-        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
-        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
-        PromptOutcome::AgentExited => "exited",
-        PromptOutcome::Cancelled => "cancelled",
-        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
-    };
-    let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
     // moved into match arms below. `desired_model` reflects the config/persona
     // model at spawn time — it does NOT reflect `session/set_model` overrides,
@@ -5438,26 +5544,6 @@ fn handle_prompt_result(
         .unwrap_or("<none>")
         .to_string();
     let harness_pid = std::process::id();
-
-    let channel_id = result.source.channel_id();
-    let turn_id = result.turn_id.clone();
-    let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
-        if let Some(ref observer) = observer {
-            let mut payload = serde_json::json!({
-                "outcome": outcome_label,
-                "error": error_msg,
-            });
-            if let Some(code) = error_code {
-                payload["code"] = serde_json::json!(code);
-            }
-            observer.emit(
-                "turn_error",
-                Some(agent_index),
-                &observer::context_for(channel_id, None, Some(turn_id.clone())),
-                payload,
-            );
-        }
-    };
 
     match result.outcome {
         // Successful prompt — return agent to pool.
@@ -5771,6 +5857,10 @@ fn drain_ready_join_results(
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
+            if config.startup_live_only_channel.is_some() {
+                tracing::error!("live-only task panic is terminal; batch recovery disabled");
+                return LoopAction::Exit;
+            }
             recover_panicked_agent(
                 pool,
                 queue,
@@ -9755,6 +9845,7 @@ mod build_mcp_servers_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            startup_live_only_channel: None,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
             agent_owner: None,
@@ -10772,6 +10863,7 @@ mod error_outcome_emission_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            startup_live_only_channel: None,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
             agent_owner: None,
@@ -11461,6 +11553,177 @@ mod error_outcome_emission_tests {
             "cancel_drain_timeout",
         )
         .await;
+    }
+
+    /// Dedicated mode exits before uncertain batches can be retried or respawned.
+    #[tokio::test]
+    async fn startup_live_only_uncertain_results_exit_before_batch_retry_or_respawn() {
+        for outcome in [
+            PromptOutcome::AgentExited,
+            PromptOutcome::Timeout(TimeoutKind::Idle),
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            PromptOutcome::Error(AcpError::Protocol("synthetic protocol failure".into())),
+            PromptOutcome::Cancelled,
+            PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            PromptOutcome::ProjectContextIndeterminate("synthetic uncertainty".into()),
+        ] {
+            let channel_id = Uuid::new_v4();
+            let batch = live_only_failure_batch(channel_id);
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(std::future::pending::<()>()).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    scope: Some(batch.scope.clone()),
+                    turn_id: "live-only-failure".into(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let result = PromptResult {
+                agent: dummy_agent(0).await,
+                source: PromptSource::Channel(batch.scope.clone()),
+                turn_id: "live-only-failure".into(),
+                outcome,
+                batch: Some(batch),
+            };
+            let mut config = test_config();
+            config.startup_live_only_channel = Some(channel_id);
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let (respawn_tx, mut respawn_rx) = mpsc::channel(4);
+            let mut respawns = tokio::task::JoinSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: vec![],
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let observer = ObserverHandle::in_process();
+            assert!(matches!(
+                handle_prompt_result(
+                    &mut pool,
+                    &mut queue,
+                    &config,
+                    result,
+                    &mut false,
+                    &HashSet::new(),
+                    &mut crash_history,
+                    &respawn_tx,
+                    &mut respawns,
+                    Some(observer.clone()),
+                    None
+                ),
+                LoopAction::Exit
+            ));
+            assert_eq!(queue.queued_event_count(channel_id), 0);
+            assert!(!queue.has_undispatched_work());
+            assert!(
+                pool.task_map().contains_key(&task_id),
+                "must exit before result/batch bookkeeping"
+            );
+            assert!(respawns.is_empty());
+            assert!(respawn_rx.try_recv().is_err());
+            assert!(crash_history[0].crash_times.is_empty());
+            assert_eq!(
+                observer
+                    .snapshot()
+                    .iter()
+                    .filter(|event| event.kind == "turn_error")
+                    .count(),
+                1
+            );
+            // The main caller breaks on Exit; its existing cleanup drains/aborts
+            // pending tasks rather than passing them back through recovery.
+            pool.join_set.shutdown().await;
+            assert!(pool.join_set.is_empty());
+            let mut retained = pool.agents_mut()[0]
+                .take()
+                .expect("failed worker retained for awaited cleanup");
+            retained.acp.shutdown().await;
+        }
+    }
+
+    fn live_only_failure_batch(channel_id: Uuid) -> FlushBatch {
+        FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: EventBuilder::new(Kind::Custom(9), "synthetic uncertain request")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+                trusted_facts: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_live_only_ready_panic_exits_before_recoverable_batch_retry() {
+        let channel_id = Uuid::new_v4();
+        let batch = live_only_failure_batch(channel_id);
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task = pool
+            .join_set
+            .spawn(async { panic!("synthetic worker panic") });
+        let task_id = task.id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(batch.scope.clone()),
+                turn_id: "live-only-panic".into(),
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut config = test_config();
+        config.startup_live_only_channel = Some(channel_id);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let (respawn_tx, _) = mpsc::channel(4);
+        let mut respawns = tokio::task::JoinSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        assert!(matches!(
+            drain_ready_join_results(
+                &mut pool,
+                &mut queue,
+                &config,
+                &mut false,
+                &HashSet::new(),
+                &mut HashMap::new(),
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawns,
+                None
+            ),
+            LoopAction::Exit
+        ));
+        assert!(pool.task_map()[&task_id].recoverable_batch.is_some());
+        assert!(!queue.has_undispatched_work());
+        assert!(respawns.is_empty());
+        assert!(pool.join_set.is_empty());
     }
 
     /// hard-cap timeout dead-letters immediately (no requeue); idle timeout is requeued.

@@ -515,6 +515,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
 
+    /// Ignore channel delivery until the first successful REQ reaches EOSE.
+    /// Requires a lazy pool and exactly one explicit canonical channel UUID.
+    /// Relay/worker failures are terminal; automatic replay/retry is disabled.
+    #[arg(long, env = "BUZZ_ACP_STARTUP_LIVE_ONLY", default_value_t = false)]
+    pub startup_live_only: bool,
+
     /// Tear the woken pool back down to the lazy empty-slot state after this
     /// many seconds with no dispatched turn in flight and an empty queue,
     /// releasing worker subprocesses until the next accepted event re-wakes.
@@ -615,6 +621,8 @@ pub struct Config {
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
+    /// Selected channel for the opt-in delivery gate and terminal failure policy.
+    pub startup_live_only_channel: Option<Uuid>,
     /// Seconds with no dispatched turn in flight and an empty queue before a
     /// woken lazy pool is torn back down to the empty-slot state. 0 = disabled.
     /// Only meaningful when `lazy_pool` is true.
@@ -935,6 +943,29 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        let startup_live_only_channel = if args.startup_live_only {
+            let channel = args
+                .channels
+                .as_deref()
+                .filter(|channels| channels.len() == 1)
+                .and_then(|channels| {
+                    Uuid::parse_str(&channels[0])
+                        .ok()
+                        .filter(|id| id.to_string() == channels[0])
+                });
+            if !args.lazy_pool
+                || channel.is_none()
+                || args.initial_message.is_some()
+                || args.heartbeat_interval != 0
+            {
+                return Err(ConfigError::ConfigFile(
+                    "startup-live-only requires --lazy-pool, exactly one canonical --channels UUID, no initial message, and heartbeat disabled".into(),
+                ));
+            }
+            channel
+        } else {
+            None
+        };
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -1204,6 +1235,7 @@ impl Config {
             relay_observer: args.relay_observer,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
+            startup_live_only_channel,
             idle_pool_sleep_secs: args.idle_pool_sleep,
             replay_floor_unix: args.replay_floor,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
@@ -1582,6 +1614,7 @@ mod tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            startup_live_only_channel: None,
             idle_pool_sleep_secs: 0,
             replay_floor_unix: None,
             agent_owner: None,
@@ -2319,6 +2352,64 @@ channels = "ALL"
     fn lazy_pool_defaults_off() {
         let key = "0".repeat(64);
         assert!(!CliArgs::parse_from(["buzz-acp", "--private-key", &key]).lazy_pool);
+    }
+
+    #[test]
+    fn startup_live_only_defaults_off_and_rejects_invalid_configuration() {
+        let key = Keys::generate().secret_key().to_secret_hex();
+        let defaults = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert!(!defaults.startup_live_only);
+        let channel = "11111111-1111-4111-8111-111111111111";
+        for extra in [
+            vec![],
+            vec!["--lazy-pool"],
+            vec!["--channels", channel],
+            vec!["--lazy-pool", "--channels", "invalid"],
+            vec![
+                "--lazy-pool",
+                "--channels",
+                "11111111111141118111111111111111",
+            ],
+            vec![
+                "--lazy-pool",
+                "--channels",
+                channel,
+                "--initial-message",
+                "probe",
+            ],
+            vec![
+                "--lazy-pool",
+                "--channels",
+                channel,
+                "--heartbeat-interval",
+                "10",
+            ],
+            vec![
+                "--lazy-pool",
+                "--channels",
+                "11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222",
+            ],
+        ] {
+            let mut argv = vec!["buzz-acp", "--private-key", &key, "--startup-live-only"];
+            argv.extend(extra);
+            let error = Config::from_args(CliArgs::parse_from(argv)).unwrap_err();
+            assert!(error.to_string().contains("startup-live-only"));
+        }
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--startup-live-only",
+            "--lazy-pool",
+            "--channels",
+            channel,
+            "--no-base-prompt",
+        ]);
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.startup_live_only_channel,
+            Some(Uuid::parse_str(channel).unwrap())
+        );
     }
 
     #[test]

@@ -131,6 +131,8 @@ use uuid::Uuid;
 
 use crate::config::ChannelFilter;
 
+mod startup_live_only;
+
 /// Metadata about a channel, populated at discovery time.
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
@@ -712,6 +714,7 @@ pub struct HarnessRelay {
     /// Wrapped in `Option` so `shutdown()` can take ownership without conflicting
     /// with `Drop` (which only has `&mut self`).
     bg_handle: Option<tokio::task::JoinHandle<()>>,
+    startup_gate: Option<tokio::sync::watch::Receiver<startup_live_only::Status>>,
 }
 
 /// Cloneable publisher handle for signed events on the relay background socket.
@@ -761,13 +764,28 @@ impl HarnessRelay {
         agent_pubkey_hex: &str,
         auth_tag: Option<nostr::Tag>,
     ) -> Result<Self, RelayError> {
+        Self::connect_with_startup_gate(relay_url, keys, agent_pubkey_hex, auth_tag, None).await
+    }
+
+    /// Connect once with a terminal gate for the selected channel, or preserve
+    /// ordinary retry/replay behavior when no channel is supplied.
+    pub(crate) async fn connect_with_startup_gate(
+        relay_url: &str,
+        keys: &Keys,
+        agent_pubkey_hex: &str,
+        auth_tag: Option<nostr::Tag>,
+        live_only_channel: Option<Uuid>,
+    ) -> Result<Self, RelayError> {
         // Perform the initial connection and auth handshake, retrying
         // transient failures (dropped handshake, timeout) with bounded
         // jittered backoff. A terminal error (bad URL, bad auth tag,
         // rejected/invalid signing key) fails immediately — see
         // `is_terminal_connect_error`.
-        let (ws, handshake_buffer) =
-            retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?;
+        let (ws, handshake_buffer) = if live_only_channel.is_some() {
+            do_connect(relay_url, keys, auth_tag.as_ref()).await?
+        } else {
+            retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?
+        };
 
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
@@ -778,8 +796,31 @@ impl HarnessRelay {
         let bg_relay_url = relay_url.to_string();
         let bg_agent_pubkey_hex = agent_pubkey_hex.to_string();
         let bg_auth_tag = auth_tag.clone();
+        let (gate, startup_gate) = match live_only_channel {
+            Some(channel) => {
+                let (gate, receiver) = startup_live_only::Gate::new(channel);
+                (Some(gate), Some(receiver))
+            }
+            None => (None, None),
+        };
 
         let bg_handle = tokio::spawn(async move {
+            if let Some(gate) = gate {
+                startup_live_only::run(
+                    ws,
+                    handshake_buffer,
+                    event_tx,
+                    observer_control_tx,
+                    cmd_rx,
+                    bg_keys,
+                    bg_relay_url,
+                    bg_agent_pubkey_hex,
+                    bg_auth_tag,
+                    gate,
+                )
+                .await;
+                return;
+            }
             run_background_task(
                 ws,
                 handshake_buffer,
@@ -807,7 +848,61 @@ impl HarnessRelay {
             keys: keys.clone(),
             auth_tag,
             bg_handle: Some(bg_handle),
+            startup_gate,
         })
+    }
+
+    /// Wait for the actual selected-channel REQ/EOSE witness, when enabled.
+    pub(crate) async fn wait_startup_live(&mut self) -> Result<(), RelayError> {
+        if let Some(receiver) = self.startup_gate.as_mut() {
+            startup_live_only::wait_live(receiver).await?;
+        }
+        Ok(())
+    }
+
+    /// Fail closed before dispatching more work if the opt-in socket has died.
+    pub(crate) fn check_startup_live(&self) -> Result<(), RelayError> {
+        if let Some(receiver) = &self.startup_gate {
+            if let startup_live_only::Status::Failed(reason) = &*receiver.borrow() {
+                return Err(RelayError::UnexpectedMessage(reason.clone()));
+            }
+            if receiver.has_changed().is_err() {
+                return Err(RelayError::ConnectionClosed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fence synchronous ingress effects after asynchronous authorization and
+    /// metadata resolution, which may have outlived the gated connection.
+    pub(crate) fn with_live_ingress<T>(
+        &self,
+        effects: impl FnOnce() -> T,
+    ) -> Result<T, RelayError> {
+        self.check_startup_live()?;
+        Ok(effects())
+    }
+
+    /// Watch terminal failure independently of the event receiver's backlog.
+    /// The owned future permits concurrent mutable polling of `next_event`.
+    pub(crate) fn startup_failure(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let receiver = self.startup_gate.clone();
+        async move {
+            let Some(mut receiver) = receiver else {
+                return std::future::pending().await;
+            };
+            loop {
+                if matches!(
+                    *receiver.borrow_and_update(),
+                    startup_live_only::Status::Failed(_)
+                ) {
+                    return;
+                }
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     /// Discover channels the agent is a member of.
@@ -972,7 +1067,11 @@ impl HarnessRelay {
     /// connection loss — the caller should call [`reconnect`](Self::reconnect).
     pub async fn next_event(&mut self) -> Option<BuzzEvent> {
         // The background task sends `None` to signal connection loss.
-        self.event_rx.recv().await.flatten()
+        let event = self.event_rx.recv().await.flatten();
+        if self.check_startup_live().is_err() {
+            return None;
+        }
+        event
     }
 
     /// Publish a signed event to the relay via the background WebSocket task.
@@ -1136,6 +1235,7 @@ impl TwoGenDedup {
 
 /// State maintained by the background WebSocket task.
 struct BgState {
+    startup_gate: Option<startup_live_only::Gate>,
     /// Active subscriptions: channel_id → subscription_id string.
     active_subscriptions: HashMap<Uuid, String>,
     /// Most recent `created_at` timestamp seen per channel (for `since` filter).
@@ -1226,6 +1326,7 @@ struct BgState {
 impl BgState {
     fn new() -> Self {
         Self {
+            startup_gate: None,
             active_subscriptions: HashMap::new(),
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
@@ -1557,6 +1658,16 @@ async fn execute_connected_command(
             filter,
             replay_since,
         } => {
+            if let Some(gate) = state.startup_gate.as_mut() {
+                if !gate.allow_request(channel_id) {
+                    gate.fail("second or unselected channel REQ refused");
+                    return false;
+                }
+                if state.rate_limit_gate.is_some() {
+                    gate.fail("REQ blocked by relay rate limit");
+                    return false;
+                }
+            }
             // Rate-gated: defer this REQ to prevent flooding a saturated relay.
             // The gate holds until the relay's retry hint expires.
             if let Some(retry_after) = state.check_rate_gate() {
@@ -1591,9 +1702,18 @@ async fn execute_connected_command(
             let sent =
                 send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
             if sent {
-                state
-                    .active_subscriptions
-                    .insert(channel_id, channel_sub_id(channel_id));
+                if let Some(gate) = state.startup_gate.as_mut() {
+                    let subscription = gate.subscription().to_string();
+                    gate.request_sent(channel_id, &subscription, state.connection_generation);
+                }
+                state.active_subscriptions.insert(
+                    channel_id,
+                    state
+                        .startup_gate
+                        .as_ref()
+                        .map(|gate| gate.subscription().to_string())
+                        .unwrap_or_else(|| channel_sub_id(channel_id)),
+                );
                 state.active_filters.insert(channel_id, filter);
                 // Evict stale drain entries so the drain loop can't send a
                 // duplicate REQ for this now-live subscription.
@@ -1601,6 +1721,10 @@ async fn execute_connected_command(
                 state.resubscribe_retry.remove(&channel_id);
                 true
             } else {
+                if let Some(gate) = state.startup_gate.as_mut() {
+                    gate.fail("selected channel REQ send failed");
+                    return false;
+                }
                 // Send failed — record intent so reconnect restores it.
                 warn!("subscribe REQ failed for channel {channel_id} — recording intent for reconnect");
                 apply_command_to_state(
@@ -1704,8 +1828,14 @@ async fn execute_connected_command(
                 if is_observer {
                     state.track_observer_in_flight(event);
                 }
-            } else if is_observer {
-                state.park_gated_observer_frame(event);
+            } else {
+                if let Some(gate) = state.startup_gate.as_mut() {
+                    gate.fail("live-only WebSocket publish send failed");
+                    return false;
+                }
+                if is_observer {
+                    state.park_gated_observer_frame(event);
+                }
             }
             true
         }
@@ -2196,6 +2326,19 @@ async fn handle_ws_message(
                     subscription_id,
                     event,
                 } => {
+                    if let Some(gate) = state
+                        .startup_gate
+                        .as_mut()
+                        .filter(|_| subscription_id != OBSERVER_CONTROL_SUB_ID)
+                    {
+                        if !gate.admit(
+                            &subscription_id,
+                            state.connection_generation,
+                            extract_h_tag_uuid(&event),
+                        ) {
+                            return true;
+                        }
+                    }
                     // Relay and storage responses are untrusted. Verify before
                     // any event field can affect routing, replay state, or the
                     // harness queues.
@@ -2295,7 +2438,12 @@ async fn handle_ws_message(
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
-                    } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                    } else if let Some(channel_id) = state
+                        .startup_gate
+                        .as_ref()
+                        .map(startup_live_only::Gate::channel)
+                        .or_else(|| channel_id_from_sub_id(&subscription_id))
+                    {
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
@@ -2317,6 +2465,10 @@ async fn handle_ws_message(
                             match event_tx.try_send(Some(buzz_event)) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
+                                    if let Some(gate) = state.startup_gate.as_mut() {
+                                        gate.fail("selected channel event buffer overflow");
+                                        return false;
+                                    }
                                     // Remove from dedup set so the replayed event
                                     // won't be rejected as a duplicate after reconnect.
                                     state.seen_ids.remove(&event_id_hex);
@@ -2346,6 +2498,9 @@ async fn handle_ws_message(
                     }
                 }
                 RelayMessage::Eose { subscription_id } => {
+                    if let Some(gate) = state.startup_gate.as_mut() {
+                        gate.eose(&subscription_id, state.connection_generation);
+                    }
                     debug!("EOSE for subscription {subscription_id}");
                 }
                 RelayMessage::Notice { message } => {
@@ -2372,6 +2527,10 @@ async fn handle_ws_message(
                     subscription_id,
                     message,
                 } => {
+                    if let Some(gate) = state.startup_gate.as_mut() {
+                        gate.fail("relay CLOSED in startup-live-only mode");
+                        return false;
+                    }
                     // A per-channel membership denial means THIS channel is
                     // forbidden, not the whole connection. Drop just this
                     // channel's subscription and keep the socket — otherwise the
@@ -3341,13 +3500,17 @@ async fn wait_for_reconnect(
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
-    _state: &BgState,
+    state: &BgState,
     channel_id: Uuid,
     agent_pubkey_hex: &str,
     since: Option<u64>,
     filter: &ChannelFilter,
 ) -> bool {
-    let sub_id = channel_sub_id(channel_id);
+    let sub_id = state
+        .startup_gate
+        .as_ref()
+        .map(|gate| gate.subscription().to_string())
+        .unwrap_or_else(|| channel_sub_id(channel_id));
 
     let mut req_filter = serde_json::Map::new();
 
