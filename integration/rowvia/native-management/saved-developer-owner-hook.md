@@ -74,6 +74,49 @@ the existing worker retains full provenance/pin/config verification. No capsule
 file is manufactured or repaired. The helper does not inspect authentication
 files or the bootstrap capsule's private contents.
 
+### Dedicated ACP activation
+
+Only the existing literal `buzz-acp` or the exact fixed path
+`/home/orionx/.local/state/rowvia-saved-developer-codex/developer-acp/buzz-acp`
+is eligible. Configure changes only this target's outer `acp_command` to that
+path, pins `BUZZ_ACP_STARTUP_LIVE_ONLY=true` and heartbeat interval zero, and
+retains the fixed lazy/channel/mentions controls. The normal native primitive
+starts that executable with no outer CLI arguments: this is the continuing ACP
+service, never `run --task`. The Python worker command/arguments are unchanged.
+The final descriptor and the actual Desktop environment must contain no
+`BUZZ_ACP_INITIAL_MESSAGE`, including an empty value. No private value is logged.
+
+The root and its parent must be canonical same-UID 0700 directories. Both files
+are regular single-link owned files: `buzz-acp` 0700 and `activation.json` 0600.
+The activation is bounded and has exactly this closed nested schema:
+
+```json
+{"schema":"io.rowvia.saved-developer-acp.activation/v1","agentPubkey":"<fixed target>","executable":{"path":"<fixed path>","sha256":"<Root-qualified ELF SHA-256>"},"provenance":{"sourceRepo":"/home/orionx/project/RowviaContext/repos/buzz-cerberus-ui-diagnostic-20261015","sourceCommit":"0a82f47b90970e2e8d7141812c390f934e338cc1","package":"buzz-acp","profile":"release","requestPolicy":"eose-live-only-fail-closed-v1"}}
+```
+
+Root separately qualifies the supported committed-source build provenance.
+The native helper never adopts authority from self-reported manifest fields:
+it requires the compiled Root activation-byte hash, ELF hash/size and exact
+field values. Root qualified source `0a82f47b90970e2e8d7141812c390f934e338cc1`
+through the supported release builder and supplied the production pins:
+
+- Activation bytes: SHA-256 `a34a52a717f59196e56ce445a45cb1491d1b0d60510eca7e932bdb6fdd3a68cb`.
+- ELF: SHA-256 `d81f022afe686ab068aa7e3190b315510c9e8bf30518cb34ecad0443a6ad52f4`, 19,420,280 bytes.
+
+These are compiled authority, not values discovered from current files. No file
+is created or repaired by verification. Reads use nonblocking no-follow
+descriptors, bounded streaming hashes and descriptor/path/directory metadata
+rechecks; a FIFO substituted after the regular-file check cannot block open.
+
+The compare token binds the whole verified activation/ELF identity and custody
+metadata together with the existing context. Verification repeats before a
+configuration write and immediately before spawn, after key loading. Worker
+metadata and captured global/persona context are also rechecked before spawn.
+This is stable-read/captured-value consistency, not an atomic-exec guarantee
+against a separate same-UID writer after the final check. Actual stop/cutover
+preflight belongs to Root's separately guarded installation; this hook adds no
+stop operation or automatic retry and never replaces the retained global ACP.
+
 Inspect/configure return a compare token. After capsule preparation, inspect
 again before start because capsule metadata participates in that token. Changes
 to target configuration, the original definition/global configuration, named
@@ -88,9 +131,12 @@ not authority or provenance acceptance. `runtimeReady` is always false;
 `startDispatched` confirms only a managed lazy harness spawn, not ACP/provider,
 Memory or reply readiness.
 
-This persona/relay compatibility change does not establish a no-history-replay
-startup barrier. Actual start remains a separate approval gate; no persisted
-queue/cursor is cleared or reset by this helper.
+The dedicated ACP policy suppresses selected-channel delivery before its
+REQ/EOSE witness and fails closed on the qualified policy's terminal errors.
+EOSE is a delivery boundary, not signed-timestamp freshness: old-timestamp work
+delivered after EOSE can still follow normal processing. Unit/source checks do
+not establish actual runtime readiness. Actual start remains a separate approval
+gate; no persisted queue/cursor is cleared or reset by this helper.
 
 Any tracked target pair, saved PID or target receipt causes configure/start
 refusal. There is no reaping, adoption, termination, global status synchronization,

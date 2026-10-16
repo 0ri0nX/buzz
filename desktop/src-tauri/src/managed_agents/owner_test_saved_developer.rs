@@ -6,10 +6,247 @@ pub(crate) use core::{is_operation, validate_arguments};
 
 use super::{custom_harnesses, ManagedAgentRecord, ManagedAgentRuntimeKey};
 use crate::app_state::AppState;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Read, os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use std::{
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::Path,
+    sync::Arc,
+};
 use tauri::{AppHandle, Manager};
+
+const ACP_SOURCE_REPO: &str =
+    "/home/orionx/project/RowviaContext/repos/buzz-cerberus-ui-diagnostic-20261015";
+const ACP_SOURCE_COMMIT: &str = "0a82f47b90970e2e8d7141812c390f934e338cc1";
+
+#[derive(Clone, Copy)]
+struct AcpPin<'a> {
+    activation_sha256: &'a str,
+    executable_sha256: &'a str,
+    executable_bytes: u64,
+}
+
+// Root-qualified exact committed release and activation bytes, not authority
+// adopted from current files or the manifest's own provenance claims.
+const ACP_PIN: Option<AcpPin<'static>> = Some(AcpPin {
+    activation_sha256: "a34a52a717f59196e56ce445a45cb1491d1b0d60510eca7e932bdb6fdd3a68cb",
+    executable_sha256: "d81f022afe686ab068aa7e3190b315510c9e8bf30518cb34ecad0443a6ad52f4",
+    executable_bytes: 19_420_280,
+});
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AcpActivation {
+    schema: String,
+    agent_pubkey: String,
+    executable: AcpExecutable,
+    provenance: AcpProvenance,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpExecutable {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AcpProvenance {
+    source_repo: String,
+    source_commit: String,
+    package: String,
+    profile: String,
+    request_policy: String,
+}
+
+fn activation_metadata(metadata: &fs::Metadata) -> Value {
+    json!([
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    ])
+}
+
+fn activation_directory(path: &Path, uid: u32) -> Result<Value, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "acp_activation_unavailable")?;
+    if !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o700
+        || fs::canonicalize(path).map_err(|_| "acp_activation_invalid")? != path
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    Ok(activation_metadata(&metadata))
+}
+
+/// Open without following a leaf link or waiting for a FIFO peer, then fence
+/// substitutions against the regular-file metadata captured before opening.
+fn open_activation_file(path: &Path, stamp: &Value) -> Result<fs::File, String> {
+    // A pathname can become a FIFO after lstat. Nonblocking open must precede
+    // the descriptor metadata fence, otherwise that fence is never reached.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "acp_activation_unavailable")?;
+    if activation_metadata(&file.metadata().map_err(|_| "acp_activation_invalid")?) != *stamp {
+        return Err("acp_activation_invalid".into());
+    }
+    Ok(file)
+}
+
+/// Hash a bounded regular, single-link file through one no-follow descriptor.
+/// Recheck both that descriptor and its pathname after EOF. For the ELF retain
+/// only its magic bytes, never the executable payload in memory or responses.
+fn activation_file(
+    path: &Path,
+    uid: u32,
+    mode: u32,
+    cap: u64,
+    collect: bool,
+) -> Result<(Vec<u8>, String, Value), String> {
+    let before = fs::symlink_metadata(path).map_err(|_| "acp_activation_unavailable")?;
+    if !before.is_file()
+        || before.uid() != uid
+        || before.mode() & 0o7777 != mode
+        || before.nlink() != 1
+        || before.len() > cap
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    let stamp = activation_metadata(&before);
+    let mut file = open_activation_file(path, &stamp)?;
+    let mut digest = Sha256::new();
+    let mut bytes = Vec::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "acp_activation_unavailable")?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or("acp_activation_invalid")?;
+        if total > cap {
+            return Err("acp_activation_invalid".into());
+        }
+        digest.update(&buffer[..count]);
+        if collect {
+            bytes.extend_from_slice(&buffer[..count]);
+        } else if bytes.len() < 4 {
+            bytes.extend_from_slice(&buffer[..count.min(4 - bytes.len())]);
+        }
+    }
+    if total != before.len()
+        || activation_metadata(&file.metadata().map_err(|_| "acp_activation_invalid")?) != stamp
+        || activation_metadata(&fs::symlink_metadata(path).map_err(|_| "acp_activation_invalid")?)
+            != stamp
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    Ok((bytes, hex::encode(digest.finalize()), stamp))
+}
+
+/// Private layout seam for inert file fixtures; production always supplies the
+/// fixed root and compiled Root pin, never request-selected paths or metadata.
+fn verify_activation(root: &Path, uid: u32, pin: AcpPin<'_>) -> Result<Value, String> {
+    let parent = root.parent().ok_or("acp_activation_invalid")?;
+    let parent_stamp = activation_directory(parent, uid)?;
+    let root_stamp = activation_directory(root, uid)?;
+    let (bytes, activation_hash, activation_stamp) =
+        activation_file(&root.join("activation.json"), uid, 0o600, 16 * 1024, true)?;
+    if activation_hash != pin.activation_sha256 {
+        return Err("acp_activation_invalid".into());
+    }
+    let activation: AcpActivation =
+        serde_json::from_slice(&bytes).map_err(|_| "acp_activation_invalid")?;
+    if activation.schema != "io.rowvia.saved-developer-acp.activation/v1"
+        || activation.agent_pubkey != core::TARGET
+        || activation.executable.path != core::ACP_EXECUTABLE
+        || activation.executable.sha256 != pin.executable_sha256
+        || activation.provenance.source_repo != ACP_SOURCE_REPO
+        || activation.provenance.source_commit != ACP_SOURCE_COMMIT
+        || activation.provenance.package != "buzz-acp"
+        || activation.provenance.profile != "release"
+        || activation.provenance.request_policy != core::ACP_POLICY
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    let (magic, executable_hash, executable_stamp) = activation_file(
+        &root.join("buzz-acp"),
+        uid,
+        0o700,
+        pin.executable_bytes,
+        false,
+    )?;
+    if magic != b"\x7fELF"
+        || executable_hash != pin.executable_sha256
+        || executable_stamp[5] != pin.executable_bytes
+        || activation_directory(root, uid)? != root_stamp
+        || activation_directory(parent, uid)? != parent_stamp
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    // Re-read the small manifest after hashing the ELF, fencing substitutions
+    // between the two reads rather than returning a mixed generation.
+    let (_, current_hash, current_stamp) =
+        activation_file(&root.join("activation.json"), uid, 0o600, 16 * 1024, true)?;
+    if current_hash != activation_hash
+        || current_stamp != activation_stamp
+        || activation_directory(root, uid)? != root_stamp
+        || activation_directory(parent, uid)? != parent_stamp
+        || activation_metadata(
+            &fs::symlink_metadata(root.join("buzz-acp")).map_err(|_| "acp_activation_invalid")?,
+        ) != executable_stamp
+    {
+        return Err("acp_activation_invalid".into());
+    }
+    Ok(json!([
+        ACP_SOURCE_COMMIT,
+        core::ACP_POLICY,
+        activation_hash,
+        executable_hash,
+        parent_stamp,
+        root_stamp,
+        activation_stamp,
+        executable_stamp
+    ]))
+}
+
+fn pinned_activation(uid: u32) -> Result<Value, String> {
+    verify_activation(
+        Path::new(core::ACP_ROOT),
+        uid,
+        ACP_PIN.ok_or("acp_activation_unpinned")?,
+    )
+}
+
+fn bind_activation(context_digest: &str, activation: &Value) -> Result<String, String> {
+    let bytes =
+        serde_json::to_vec(&json!([context_digest, activation])).map_err(|_| "operation_failed")?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn require_no_initial_message(present: bool) -> Result<(), String> {
+    if present {
+        return Err("target_effective_config_mismatch".into());
+    }
+    Ok(())
+}
 
 struct CapturedContext {
     personas: Vec<super::AgentDefinition>,
@@ -24,7 +261,10 @@ fn capture_context(
     record: &ManagedAgentRecord,
     global: super::GlobalAgentConfig,
 ) -> Result<CapturedContext, String> {
-    if record.pubkey != core::TARGET || record.runtime.as_deref() != Some(core::HARNESS_ID) {
+    if record.pubkey != core::TARGET
+        || record.runtime.as_deref() != Some(core::HARNESS_ID)
+        || record.acp_command != core::ACP_EXECUTABLE
+    {
         return Err("target_contract_mismatch".into());
     }
     let raw = serde_json::to_value(record).map_err(|_| "target_contract_mismatch")?;
@@ -67,9 +307,21 @@ fn capture_context(
             .get("BUZZ_ACP_NO_MENTION_FILTER")
             .map(String::as_str)
             != Some("false")
+        || descriptor
+            .env
+            .get("BUZZ_ACP_STARTUP_LIVE_ONLY")
+            .map(String::as_str)
+            != Some("true")
+        || descriptor
+            .env
+            .get("BUZZ_ACP_HEARTBEAT_INTERVAL")
+            .map(String::as_str)
+            != Some("0")
+        || descriptor.env.get("BUZZ_ACP_CHANNELS").map(String::as_str) != Some(core::CHANNEL)
     {
         return Err("target_effective_config_mismatch".into());
     }
+    require_no_initial_message(descriptor.env.contains_key("BUZZ_ACP_INITIAL_MESSAGE"))?;
     let bytes = serde_json::to_vec(&json!([
         "fixed-saved-developer-model-provider/v1",
         original_definition,
@@ -95,6 +347,7 @@ fn load_context<R: tauri::Runtime>(
     rows: &[Value],
     record: &ManagedAgentRecord,
 ) -> Result<CapturedContext, String> {
+    require_no_initial_message(std::env::var_os("BUZZ_ACP_INITIAL_MESSAGE").is_some())?;
     let global = super::load_global_agent_config(app).map_err(|_| "target_context_unavailable")?;
     capture_context(rows, record, global)
 }
@@ -346,6 +599,7 @@ pub(crate) fn execute<R: tauri::Runtime>(
         .and_then(|f| f.metadata())
         .map_err(|_| "operation_failed")?
         .uid();
+    let activation = pinned_activation(uid)?;
     let stamp = capsule_stamp(uid);
     // Derive the prospective fixed record first, then bind normal effective
     // persona/global resolution before admitting any write or start.
@@ -366,6 +620,7 @@ pub(crate) fn execute<R: tauri::Runtime>(
     let mut record: ManagedAgentRecord =
         serde_json::from_value(prospective.record).map_err(|_| "target_contract_mismatch")?;
     let context = load_context(app, &rows, &record)?;
+    let context_digest = bind_activation(&context.digest, &activation)?;
     let plan = core::plan(
         operation,
         args,
@@ -373,7 +628,7 @@ pub(crate) fn execute<R: tauri::Runtime>(
             owner: &owner,
             relay: &relay,
             locked,
-            context_digest: &context.digest,
+            context_digest: &context_digest,
         },
         &rows,
         occupied,
@@ -387,6 +642,9 @@ pub(crate) fn execute<R: tauri::Runtime>(
         "prerequisitesPresent":stamp.is_some(),"runtimeReady":false,"runtimeOccupied":occupied || record.runtime_pid.is_some() || plan.start,
         "startDispatched":plan.start});
     if plan.write {
+        if pinned_activation(uid)? != activation {
+            return Err("fingerprint_mismatch".into());
+        }
         // Unused identical harness is a safe prefix if the target store save fails.
         if existing.is_none() {
             fs::create_dir_all(&harness_dir).map_err(|_| "operation_failed")?;
@@ -407,7 +665,6 @@ pub(crate) fn execute<R: tauri::Runtime>(
         // Global setters have no shared mutex. Re-read before start and refuse
         // drift, then use these exact captured values through the spawn boundary.
         // This is captured-value consistency, not serialization of future edits.
-        let current_context = recheck_context(app, &rows, &record, &context.digest)?;
         let admitted = transition.admit(&admission, core::RELAY)?;
         super::storage::owner_test_target_key(&mut record)?;
         let definition: custom_harnesses::HarnessDefinition =
@@ -429,6 +686,10 @@ pub(crate) fn execute<R: tauri::Runtime>(
             }
         }
         let key = ManagedAgentRuntimeKey::new(core::TARGET, core::RELAY)?;
+        let current_context = recheck_context(app, &rows, &record, &context.digest)?;
+        if pinned_activation(uid)? != activation || capsule_stamp(uid) != stamp {
+            return Err("fingerprint_mismatch".into());
+        }
         let process = super::runtime::spawn_agent_child_with_context(
             app,
             &record,
@@ -454,6 +715,268 @@ pub(crate) fn execute<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    struct ActivationFixture {
+        parent: tempfile::TempDir,
+        root: std::path::PathBuf,
+        executable_sha256: String,
+        activation_sha256: String,
+        executable_bytes: u64,
+        uid: u32,
+    }
+
+    impl ActivationFixture {
+        fn pin(&self) -> AcpPin<'_> {
+            AcpPin {
+                activation_sha256: &self.activation_sha256,
+                executable_sha256: &self.executable_sha256,
+                executable_bytes: self.executable_bytes,
+            }
+        }
+
+        fn write_activation(&mut self, value: &Value) {
+            let bytes = serde_json::to_vec(value).unwrap();
+            fs::write(self.root.join("activation.json"), &bytes).unwrap();
+            fs::set_permissions(
+                self.root.join("activation.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            self.activation_sha256 = hex::encode(Sha256::digest(bytes));
+        }
+    }
+
+    fn activation_value(executable_sha256: &str) -> Value {
+        json!({"schema":"io.rowvia.saved-developer-acp.activation/v1", "agentPubkey":core::TARGET,
+            "executable":{"path":core::ACP_EXECUTABLE,"sha256":executable_sha256},
+            "provenance":{"sourceRepo":ACP_SOURCE_REPO,"sourceCommit":ACP_SOURCE_COMMIT,
+                "package":"buzz-acp","profile":"release","requestPolicy":core::ACP_POLICY}})
+    }
+
+    fn activation_fixture() -> ActivationFixture {
+        let parent = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.path().join("developer-acp");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // Inert bytes: the validator never executes even a fixture ELF.
+        let payload = b"\x7fELFinert-activation-fixture";
+        fs::write(root.join("buzz-acp"), payload).unwrap();
+        fs::set_permissions(root.join("buzz-acp"), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fixture = ActivationFixture {
+            uid: fs::metadata(parent.path()).unwrap().uid(),
+            parent,
+            root,
+            executable_sha256: hex::encode(Sha256::digest(payload)),
+            activation_sha256: String::new(),
+            executable_bytes: payload.len() as u64,
+        };
+        let value = activation_value(&fixture.executable_sha256);
+        fixture.write_activation(&value);
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_ok());
+        fixture
+    }
+
+    #[test]
+    fn actual_activation_open_is_nonblocking_and_refuses_a_deterministic_fifo_swap() {
+        use std::os::fd::AsRawFd;
+        let fixture = activation_fixture();
+        let path = fixture.root.join("activation.json");
+        let stamp = activation_metadata(&fs::symlink_metadata(&path).unwrap());
+        let file = open_activation_file(&path, &stamp).unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        // This assertion fails before the FIFO attempt if O_NONBLOCK is removed,
+        // so the negative qualification cannot hang waiting for a FIFO writer.
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        drop(file);
+        fs::rename(&path, fixture.root.join("original-activation.json")).unwrap();
+        let fifo_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            open_activation_file(&path, &stamp).err().as_deref(),
+            Some("acp_activation_invalid")
+        );
+    }
+
+    #[test]
+    fn actual_activation_validator_binds_exact_pins_and_preserves_inert_artifacts() {
+        let fixture = activation_fixture();
+        let before = fs::read(fixture.root.join("buzz-acp")).unwrap();
+        let stamp = verify_activation(&fixture.root, fixture.uid, fixture.pin()).unwrap();
+        assert_eq!(
+            verify_activation(&fixture.root, fixture.uid, fixture.pin()).unwrap(),
+            stamp
+        );
+        let digest = bind_activation("captured-context", &stamp).unwrap();
+        assert_ne!(bind_activation("changed-context", &stamp).unwrap(), digest);
+        assert_ne!(
+            bind_activation("captured-context", &json!(["changed-artifact"])).unwrap(),
+            digest
+        );
+        assert_eq!(fs::read(fixture.root.join("buzz-acp")).unwrap(), before);
+        let wrong_pin = AcpPin {
+            activation_sha256: "not-the-root-pin",
+            ..fixture.pin()
+        };
+        assert!(verify_activation(&fixture.root, fixture.uid, wrong_pin).is_err());
+        let bytes = fs::read(fixture.root.join("activation.json")).unwrap();
+        let replacement = fixture.root.join("replacement.json");
+        fs::write(&replacement, bytes).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(replacement, fixture.root.join("activation.json")).unwrap();
+        let replaced = verify_activation(&fixture.root, fixture.uid, fixture.pin()).unwrap();
+        assert_ne!(stamp, replaced);
+        assert_ne!(
+            bind_activation("captured-context", &replaced).unwrap(),
+            digest
+        );
+        fs::write(
+            fixture.root.join("buzz-acp"),
+            b"\x7fELFsubstituted-artifact",
+        )
+        .unwrap();
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+    }
+
+    #[test]
+    fn actual_activation_closed_schema_never_adopts_self_reported_provenance() {
+        let mut fixture = activation_fixture();
+        for pointer in [
+            "/schema",
+            "/agentPubkey",
+            "/executable/path",
+            "/executable/sha256",
+            "/provenance/sourceRepo",
+            "/provenance/sourceCommit",
+            "/provenance/package",
+            "/provenance/profile",
+            "/provenance/requestPolicy",
+        ] {
+            let mut value = activation_value(&fixture.executable_sha256);
+            *value.pointer_mut(pointer).unwrap() = json!("foreign-unapproved-value");
+            // A matching outer digest alone must not authorize different fields.
+            fixture.write_activation(&value);
+            assert_eq!(
+                verify_activation(&fixture.root, fixture.uid, fixture.pin())
+                    .err()
+                    .as_deref(),
+                Some("acp_activation_invalid")
+            );
+        }
+        for pointer in ["", "/executable", "/provenance"] {
+            let mut value = activation_value(&fixture.executable_sha256);
+            value
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), json!(true));
+            fixture.write_activation(&value);
+            assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+        }
+        let value = activation_value(&fixture.executable_sha256);
+        fixture.write_activation(&value);
+        fs::write(fixture.root.join("activation.json"), b"invalid-json").unwrap();
+        fixture.activation_sha256 = hex::encode(Sha256::digest(b"invalid-json"));
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+        let duplicate = format!(
+            "{{\"schema\":\"io.rowvia.saved-developer-acp.activation/v1\",{}",
+            &serde_json::to_string(&value).unwrap()[1..]
+        );
+        fs::write(fixture.root.join("activation.json"), duplicate.as_bytes()).unwrap();
+        fixture.activation_sha256 = hex::encode(Sha256::digest(duplicate.as_bytes()));
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+    }
+
+    #[test]
+    fn actual_activation_refuses_missing_links_modes_owner_and_size_changes() {
+        for name in ["activation.json", "buzz-acp"] {
+            let fixture = activation_fixture();
+            fs::remove_file(fixture.root.join(name)).unwrap();
+            assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+            let fixture = activation_fixture();
+            fs::hard_link(fixture.root.join(name), fixture.root.join("extra-hardlink")).unwrap();
+            assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+            let fixture = activation_fixture();
+            fs::rename(fixture.root.join(name), fixture.root.join("original")).unwrap();
+            symlink(fixture.root.join("original"), fixture.root.join(name)).unwrap();
+            assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+        }
+        for (name, mode) in [("activation.json", 0o644), ("buzz-acp", 0o755), ("", 0o755)] {
+            let fixture = activation_fixture();
+            fs::set_permissions(fixture.root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+        }
+        let fixture = activation_fixture();
+        assert!(
+            verify_activation(&fixture.root, fixture.uid.wrapping_add(1), fixture.pin()).is_err()
+        );
+        assert!(activation_file(
+            &fixture.root.join("buzz-acp"),
+            fixture.uid.wrapping_add(1),
+            0o700,
+            fixture.executable_bytes,
+            false
+        )
+        .is_err());
+        let wrong_size = AcpPin {
+            executable_bytes: fixture.executable_bytes - 1,
+            ..fixture.pin()
+        };
+        assert!(verify_activation(&fixture.root, fixture.uid, wrong_size).is_err());
+        let linked_root = fixture.parent.path().join("linked-root");
+        symlink(&fixture.root, &linked_root).unwrap();
+        assert!(verify_activation(&linked_root, fixture.uid, fixture.pin()).is_err());
+        let fixture = activation_fixture();
+        fs::set_permissions(fixture.parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+        let fixture = activation_fixture();
+        fs::write(
+            fixture.root.join("activation.json"),
+            vec![b'x'; 16 * 1024 + 1],
+        )
+        .unwrap();
+        assert!(verify_activation(&fixture.root, fixture.uid, fixture.pin()).is_err());
+    }
+
+    #[test]
+    fn ordinary_service_environment_refuses_initial_message_in_any_layer() {
+        assert!(require_no_initial_message(false).is_ok());
+        assert!(require_no_initial_message(true).is_err());
+        let fixture = super::super::admission_test_support::app_with_keyless_agent();
+        let rows = linked_fixture_rows(
+            super::super::load_managed_agents(fixture.app.handle())
+                .unwrap()
+                .remove(0),
+        );
+        let record = prospective_record(&rows);
+        for value in ["", "private-initial-message"] {
+            let mut global = valid_global();
+            global
+                .env_vars
+                .insert("BUZZ_ACP_INITIAL_MESSAGE".into(), value.into());
+            assert_eq!(
+                capture_context(&rows, &record, global).err().as_deref(),
+                Some("target_effective_config_mismatch")
+            );
+            let mut changed = rows.clone();
+            changed[1]["env_vars"]["BUZZ_ACP_INITIAL_MESSAGE"] = json!(value);
+            assert!(capture_context(&changed, &record, valid_global()).is_err());
+        }
+        let mut task = record.clone();
+        task.acp_command = format!("{} run --task unsupported", core::ACP_EXECUTABLE);
+        assert!(capture_context(&rows, &task, valid_global()).is_err());
+        for (key, value) in [
+            ("BUZZ_ACP_STARTUP_LIVE_ONLY", "false"),
+            ("BUZZ_ACP_HEARTBEAT_INTERVAL", "1"),
+        ] {
+            let mut invalid = record.clone();
+            invalid.env_vars.insert(key.into(), value.into());
+            assert!(capture_context(&rows, &invalid, valid_global()).is_err());
+        }
+    }
 
     fn linked_fixture_rows(mut record: ManagedAgentRecord) -> Vec<Value> {
         record.pubkey = core::TARGET.into();

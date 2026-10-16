@@ -10,6 +10,11 @@ pub(super) const CAPSULE: &str =
     "/home/orionx/.local/state/rowvia-saved-developer-codex/buzz-worker";
 pub(super) const PYTHON: &str = "/usr/bin/python3.13";
 pub(super) const HARNESS_ID: &str = "rowvia-saved-developer-codex";
+pub(super) const ACP_ROOT: &str =
+    "/home/orionx/.local/state/rowvia-saved-developer-codex/developer-acp";
+pub(super) const ACP_EXECUTABLE: &str =
+    "/home/orionx/.local/state/rowvia-saved-developer-codex/developer-acp/buzz-acp";
+pub(super) const ACP_POLICY: &str = "eose-live-only-fail-closed-v1";
 
 pub(crate) fn is_operation(operation: &str) -> bool {
     matches!(
@@ -123,7 +128,10 @@ pub(super) fn plan(
             .get("persona_pack_path")
             .is_some_and(|v| !v.is_null())
         || original["backend"]["type"] != "local"
-        || original["acp_command"] != "buzz-acp"
+        || !matches!(
+            original["acp_command"].as_str(),
+            Some("buzz-acp" | ACP_EXECUTABLE)
+        )
         || !original["relay_url"].is_string()
     {
         return Err("target_contract_mismatch");
@@ -136,6 +144,7 @@ pub(super) fn plan(
     let mut record = original.clone();
     let object = record.as_object_mut().ok_or("target_contract_mismatch")?;
     for (key, value) in [
+        ("acp_command", json!(ACP_EXECUTABLE)),
         ("agent_command", json!(PYTHON)),
         ("agent_command_override", json!(PYTHON)),
         ("runtime", json!(HARNESS_ID)),
@@ -160,6 +169,8 @@ pub(super) fn plan(
     env.insert("BUZZ_ACP_SUBSCRIBE".into(), json!("mentions"));
     env.insert("BUZZ_ACP_LAZY_POOL".into(), json!("true"));
     env.insert("BUZZ_ACP_NO_MENTION_FILTER".into(), json!("false"));
+    env.insert("BUZZ_ACP_STARTUP_LIVE_ONLY".into(), json!("true"));
+    env.insert("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), json!("0"));
     let configured = &record == original && existing_harness.is_some();
     // Never return saved fields. The token covers configuration (including env)
     // without exposing raw values; private signing material is excluded.
@@ -233,6 +244,9 @@ mod tests {
         assert_eq!(p.index, 1);
         assert_eq!(p.record["env_vars"]["PRIVATE"], "do-not-export");
         assert_eq!(p.record["private_key_nsec"], "do-not-hash");
+        assert_eq!(p.record["acp_command"], ACP_EXECUTABLE);
+        assert_eq!(p.record["env_vars"]["BUZZ_ACP_STARTUP_LIVE_ONLY"], "true");
+        assert_eq!(p.record["env_vars"]["BUZZ_ACP_HEARTBEAT_INTERVAL"], "0");
         rows[p.index] = p.record;
         assert_eq!(rows[0], unrelated);
         let h = harness_bytes().unwrap();
@@ -537,6 +551,11 @@ mod tests {
             ("persona_pack_path", json!("/legacy/team")),
             ("backend", json!({"type":"provider"})),
             ("acp_command", json!("arbitrary-executable")),
+            ("acp_command", json!("buzz-acp run --task unsupported")),
+            (
+                "acp_command",
+                json!(format!("{ACP_EXECUTABLE} run --task unsupported")),
+            ),
             ("relay_url", Value::Null),
         ] {
             let mut value_row = row();
