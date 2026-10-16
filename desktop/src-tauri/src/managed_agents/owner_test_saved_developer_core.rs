@@ -32,6 +32,29 @@ pub(super) struct Scope<'a> {
     pub owner: &'a str,
     pub relay: &'a str,
     pub locked: bool,
+    pub context_digest: &'a str,
+}
+
+/// Resolve only the linked keyless definition from the same bounded store read.
+pub(super) fn linked_definition<'a>(
+    rows: &'a [Value],
+    record: &Value,
+) -> Result<Option<&'a Value>, &'static str> {
+    let Some(id) = record.get("persona_id").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let id = id
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("target_contract_mismatch")?;
+    let mut definitions = rows
+        .iter()
+        .filter(|row| row["pubkey"] == "" && row["slug"] == id);
+    let definition = definitions.next().ok_or("target_definition_missing")?;
+    if definitions.next().is_some() {
+        return Err("target_definition_ambiguous");
+    }
+    Ok(Some(definition))
 }
 
 pub(super) struct Plan {
@@ -92,8 +115,7 @@ pub(super) fn plan(
     if matches.next().is_some() {
         return Err("target_ambiguous");
     }
-    if original.get("persona_id").is_some_and(|v| !v.is_null())
-        || original.get("team_id").is_some_and(|v| !v.is_null())
+    if original.get("team_id").is_some_and(|v| !v.is_null())
         || original
             .get("persona_team_dir")
             .is_some_and(|v| !v.is_null())
@@ -102,13 +124,11 @@ pub(super) fn plan(
             .is_some_and(|v| !v.is_null())
         || original["backend"]["type"] != "local"
         || original["acp_command"] != "buzz-acp"
-        || !matches!(
-            original["relay_url"].as_str(),
-            Some("wss://buzz.rowvia.ai:8443" | "https://buzz.rowvia.ai:8443")
-        )
+        || !original["relay_url"].is_string()
     {
         return Err("target_contract_mismatch");
     }
+    linked_definition(rows, original)?;
     let expected_harness = harness_bytes()?;
     if existing_harness.is_some_and(|bytes| bytes != expected_harness) {
         return Err("harness_collision");
@@ -124,7 +144,6 @@ pub(super) fn plan(
         ("provider", json!("codex")),
         ("parallelism", json!(1)),
         ("respond_to", json!("owner-only")),
-        ("relay_url", json!(RELAY)),
         ("start_on_app_launch", json!(false)),
         ("auto_restart_on_config_change", json!(false)),
     ] {
@@ -149,8 +168,13 @@ pub(super) fn plan(
         object.remove("private_key_nsec");
         object.remove("auth_tag");
     }
-    let bytes = serde_json::to_vec(&json!([public_record, harness(), capsule_stamp]))
-        .map_err(|_| "operation_failed")?;
+    let bytes = serde_json::to_vec(&json!([
+        public_record,
+        harness(),
+        capsule_stamp,
+        scope.context_digest
+    ]))
+    .map_err(|_| "operation_failed")?;
     let fingerprint = hex::encode(Sha256::digest(bytes));
     let start = operation == "start_saved_developer";
     if operation != "inspect_saved_developer"
@@ -186,6 +210,7 @@ mod tests {
             owner: OWNER,
             relay: RELAY,
             locked: false,
+            context_digest: "resolved-fixture-context",
         }
     }
     #[test]
@@ -404,15 +429,115 @@ mod tests {
     }
 
     #[test]
+    fn linked_definition_and_workspace_relay_compatibility_stay_closed() {
+        let definition = json!({"pubkey":"", "slug":"saved-role", "model":null,
+            "provider":null,"system_prompt":"definition-private", "future":{"preserve":true}});
+        for relay in ["", "wss://stale.example"] {
+            let mut target = row();
+            target["persona_id"] = json!("saved-role");
+            target["relay_url"] = json!(relay);
+            let rows = vec![target.clone(), definition.clone()];
+            let configured = plan(
+                "configure_saved_developer",
+                &Map::new(),
+                scope(),
+                &rows,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(configured.record["persona_id"], target["persona_id"]);
+            assert_eq!(configured.record["relay_url"], target["relay_url"]);
+            assert_eq!(
+                linked_definition(&rows, &configured.record).unwrap(),
+                Some(&definition)
+            );
+            let h = harness_bytes().unwrap();
+            let stamp = json!(["capsule-fixture"]);
+            let saved = vec![configured.record, definition.clone()];
+            let inspected = plan(
+                "inspect_saved_developer",
+                &Map::new(),
+                scope(),
+                &saved,
+                false,
+                Some(&h),
+                Some(&stamp),
+            )
+            .unwrap();
+            let args = json!({"fingerprint":inspected.fingerprint})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(
+                plan(
+                    "start_saved_developer",
+                    &args,
+                    scope(),
+                    &saved,
+                    false,
+                    Some(&h),
+                    Some(&stamp)
+                )
+                .unwrap()
+                .start
+            );
+            assert_eq!(
+                plan(
+                    "start_saved_developer",
+                    &args,
+                    Scope {
+                        context_digest: "changed-definition-or-global",
+                        ..scope()
+                    },
+                    &saved,
+                    false,
+                    Some(&h),
+                    Some(&stamp)
+                )
+                .err(),
+                Some("fingerprint_mismatch")
+            );
+            assert_eq!(
+                plan(
+                    "configure_saved_developer",
+                    &Map::new(),
+                    scope(),
+                    &[target.clone()],
+                    false,
+                    None,
+                    None
+                )
+                .err(),
+                Some("target_definition_missing")
+            );
+            assert_eq!(
+                plan(
+                    "configure_saved_developer",
+                    &Map::new(),
+                    scope(),
+                    &[target, definition.clone(), definition.clone()],
+                    false,
+                    None,
+                    None
+                )
+                .err(),
+                Some("target_definition_ambiguous")
+            );
+            assert_eq!(rows[1], definition);
+        }
+    }
+
+    #[test]
     fn fixed_launch_rejects_other_targets_links_duplicates_and_process_metadata() {
         for (field, value) in [
-            ("persona_id", json!("shared-definition")),
             ("team_id", json!("shared-team")),
             ("persona_team_dir", json!("/other/team")),
             ("persona_pack_path", json!("/legacy/team")),
             ("backend", json!({"type":"provider"})),
             ("acp_command", json!("arbitrary-executable")),
-            ("relay_url", json!("wss://other")),
+            ("relay_url", Value::Null),
         ] {
             let mut value_row = row();
             value_row[field] = value;

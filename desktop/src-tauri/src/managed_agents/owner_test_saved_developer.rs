@@ -7,8 +7,110 @@ pub(crate) use core::{is_operation, validate_arguments};
 use super::{custom_harnesses, ManagedAgentRecord, ManagedAgentRuntimeKey};
 use crate::app_state::AppState;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::{fs, io::Read, os::unix::fs::MetadataExt, path::Path, sync::Arc};
 use tauri::{AppHandle, Manager};
+
+struct CapturedContext {
+    personas: Vec<super::AgentDefinition>,
+    global: super::GlobalAgentConfig,
+    digest: String,
+}
+
+/// The normal spawn resolvers, without catalog hydration or fallback on errors.
+/// All configuration stays internal: only its digest enters the owner token.
+fn capture_context(
+    rows: &[Value],
+    record: &ManagedAgentRecord,
+    global: super::GlobalAgentConfig,
+) -> Result<CapturedContext, String> {
+    if record.pubkey != core::TARGET || record.runtime.as_deref() != Some(core::HARNESS_ID) {
+        return Err("target_contract_mismatch".into());
+    }
+    let raw = serde_json::to_value(record).map_err(|_| "target_contract_mismatch")?;
+    let mut original_definition = core::linked_definition(rows, &raw)?.cloned();
+    // Signing material is not configuration authority or part of this token.
+    if let Some(object) = original_definition.as_mut().and_then(Value::as_object_mut) {
+        object.remove("private_key_nsec");
+        object.remove("auth_tag");
+    }
+    let personas = core::linked_definition(rows, &raw)?
+        .map(|row| {
+            let mut definition = serde_json::from_value::<ManagedAgentRecord>(row.clone())
+                .map_err(|_| "target_contract_mismatch")?
+                .to_definition_view()
+                .ok_or("target_contract_mismatch")?;
+            // Explicit owner-approved target-only policy, not inherited defaults.
+            // The shared saved definition and its prompt/env/runtime stay intact.
+            definition.model = Some("gpt-6.1-sol".into());
+            definition.provider = Some("codex".into());
+            Ok::<_, &'static str>(definition)
+        })
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let effective = super::effective_config::resolve_effective_config(record, &personas, &global)
+        .require_resolved()
+        .map_err(|_| "target_effective_config_mismatch")?;
+    if effective.model.value.as_deref() != Some("gpt-6.1-sol")
+        || effective.provider.value.as_deref() != Some("codex")
+    {
+        return Err("target_effective_config_mismatch".into());
+    }
+    let descriptor = super::resolve_effective_harness_descriptor(record, &personas, &global)
+        .map_err(|_| "target_effective_config_mismatch")?;
+    if descriptor.command != core::PYTHON
+        || descriptor.args != vec!["-IS".to_owned(), format!("{}/run", core::CAPSULE)]
+        || descriptor.env.get("BUZZ_ACP_LAZY_POOL").map(String::as_str) != Some("true")
+        || descriptor
+            .env
+            .get("BUZZ_ACP_NO_MENTION_FILTER")
+            .map(String::as_str)
+            != Some("false")
+    {
+        return Err("target_effective_config_mismatch".into());
+    }
+    let bytes = serde_json::to_vec(&json!([
+        "fixed-saved-developer-model-provider/v1",
+        original_definition,
+        personas,
+        global,
+        effective.model.value,
+        effective.provider.value,
+        effective.system_prompt.value,
+        descriptor.command,
+        descriptor.args,
+        descriptor.env
+    ]))
+    .map_err(|_| "operation_failed")?;
+    Ok(CapturedContext {
+        personas,
+        global,
+        digest: hex::encode(Sha256::digest(bytes)),
+    })
+}
+
+fn load_context<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    rows: &[Value],
+    record: &ManagedAgentRecord,
+) -> Result<CapturedContext, String> {
+    let global = super::load_global_agent_config(app).map_err(|_| "target_context_unavailable")?;
+    capture_context(rows, record, global)
+}
+
+fn recheck_context<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    rows: &[Value],
+    record: &ManagedAgentRecord,
+    expected: &str,
+) -> Result<CapturedContext, String> {
+    let context = load_context(app, rows, record)?;
+    if context.digest != expected {
+        return Err("fingerprint_mismatch".into());
+    }
+    Ok(context)
+}
 
 fn target_runtime_occupied(
     receipt_dir: &Path,
@@ -245,6 +347,25 @@ pub(crate) fn execute<R: tauri::Runtime>(
         .map_err(|_| "operation_failed")?
         .uid();
     let stamp = capsule_stamp(uid);
+    // Derive the prospective fixed record first, then bind normal effective
+    // persona/global resolution before admitting any write or start.
+    let prospective = core::plan(
+        "inspect_saved_developer",
+        &Map::new(),
+        core::Scope {
+            owner: &owner,
+            relay: &relay,
+            locked,
+            context_digest: "",
+        },
+        &rows,
+        occupied,
+        existing.as_deref(),
+        stamp.as_ref(),
+    )?;
+    let mut record: ManagedAgentRecord =
+        serde_json::from_value(prospective.record).map_err(|_| "target_contract_mismatch")?;
+    let context = load_context(app, &rows, &record)?;
     let plan = core::plan(
         operation,
         args,
@@ -252,6 +373,7 @@ pub(crate) fn execute<R: tauri::Runtime>(
             owner: &owner,
             relay: &relay,
             locked,
+            context_digest: &context.digest,
         },
         &rows,
         occupied,
@@ -260,8 +382,6 @@ pub(crate) fn execute<R: tauri::Runtime>(
     )?;
     // Validate the target's real persisted schema before any write; unrelated
     // rows remain raw JSON and never enter generic key hydration/normalization.
-    let mut record: ManagedAgentRecord =
-        serde_json::from_value(plan.record.clone()).map_err(|_| "target_contract_mismatch")?;
     let result = json!({"pubkey":core::TARGET,"relayUrl":core::RELAY,"channelId":core::CHANNEL,
         "fingerprint":plan.fingerprint,"configured":plan.configured || plan.write,
         "prerequisitesPresent":stamp.is_some(),"runtimeReady":false,"runtimeOccupied":occupied || record.runtime_pid.is_some() || plan.start,
@@ -284,6 +404,10 @@ pub(crate) fn execute<R: tauri::Runtime>(
         )?;
     }
     if plan.start {
+        // Global setters have no shared mutex. Re-read before start and refuse
+        // drift, then use these exact captured values through the spawn boundary.
+        // This is captured-value consistency, not serialization of future edits.
+        let current_context = recheck_context(app, &rows, &record, &context.digest)?;
         let admitted = transition.admit(&admission, core::RELAY)?;
         super::storage::owner_test_target_key(&mut record)?;
         let definition: custom_harnesses::HarnessDefinition =
@@ -313,9 +437,9 @@ pub(crate) fn execute<R: tauri::Runtime>(
             true,
             Some(core::OWNER),
             None,
+            &current_context.personas,
             &[],
-            &[],
-            &super::GlobalAgentConfig::default(),
+            &current_context.global,
         )?;
         // Retain ownership immediately, even if receipt persistence fails. Never
         // orphan a child or claim confirmed failure after a possible spawn.
@@ -330,6 +454,257 @@ pub(crate) fn execute<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linked_fixture_rows(mut record: ManagedAgentRecord) -> Vec<Value> {
+        record.pubkey = core::TARGET.into();
+        record.relay_url = String::new();
+        record.persona_id = Some("saved-role".into());
+        record.acp_command = "buzz-acp".into();
+        let mut definition = record.clone();
+        definition.pubkey.clear();
+        definition.persona_id = None;
+        definition.slug = Some("saved-role".into());
+        definition.model = None;
+        definition.provider = None;
+        definition.system_prompt = Some("private-definition-prompt".into());
+        definition.env_vars = std::collections::BTreeMap::from([
+            ("PRIVATE_PERSONA".into(), "private-persona-env".into()),
+            ("BUZZ_ACP_LAZY_POOL".into(), "false".into()),
+        ]);
+        vec![
+            serde_json::to_value(record).unwrap(),
+            serde_json::to_value(definition).unwrap(),
+        ]
+    }
+
+    fn prospective_record(rows: &[Value]) -> ManagedAgentRecord {
+        let plan = core::plan(
+            "inspect_saved_developer",
+            &Map::new(),
+            core::Scope {
+                owner: core::OWNER,
+                relay: core::RELAY,
+                locked: false,
+                context_digest: "",
+            },
+            rows,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        serde_json::from_value(plan.record).unwrap()
+    }
+
+    fn valid_global() -> super::super::GlobalAgentConfig {
+        super::super::GlobalAgentConfig {
+            model: Some("gpt-6.1-sol".into()),
+            provider: Some("codex".into()),
+            env_vars: std::collections::BTreeMap::from([(
+                "PRIVATE_GLOBAL".into(),
+                "private-global-env".into(),
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn actual_resolvers_bind_target_only_overlay_original_definition_and_global_env() {
+        let fixture = super::super::admission_test_support::app_with_keyless_agent();
+        let rows = linked_fixture_rows(
+            super::super::load_managed_agents(fixture.app.handle())
+                .unwrap()
+                .remove(0),
+        );
+        let preserved = rows.clone();
+        let record = prospective_record(&rows);
+        let context = capture_context(&rows, &record, valid_global()).unwrap();
+        assert_eq!(context.personas.len(), 1);
+        assert_eq!(context.personas[0].model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(context.personas[0].provider.as_deref(), Some("codex"));
+        assert_eq!(rows[1]["model"], Value::Null);
+        assert_eq!(rows[1]["provider"], Value::Null);
+        assert_eq!(record.persona_id.as_deref(), Some("saved-role"));
+        assert_eq!(record.relay_url, "");
+        let effective = super::super::effective_config::resolve_effective_config(
+            &record,
+            &context.personas,
+            &context.global,
+        )
+        .require_resolved()
+        .unwrap();
+        assert_eq!(effective.model.value.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(effective.provider.value.as_deref(), Some("codex"));
+        assert_eq!(
+            effective.system_prompt.value.as_deref(),
+            Some("private-definition-prompt")
+        );
+        let descriptor = super::super::resolve_effective_harness_descriptor(
+            &record,
+            &context.personas,
+            &context.global,
+        )
+        .unwrap();
+        for (key, value) in [
+            ("PRIVATE_GLOBAL", "private-global-env"),
+            ("PRIVATE_PERSONA", "private-persona-env"),
+            ("BUZZ_ACP_LAZY_POOL", "true"),
+        ] {
+            assert_eq!(descriptor.env.get(key).map(String::as_str), Some(value));
+        }
+        let mut changed = rows.clone();
+        changed[1]["system_prompt"] = json!("changed-private-prompt");
+        assert_ne!(
+            capture_context(&changed, &record, valid_global())
+                .unwrap()
+                .digest,
+            context.digest
+        );
+        let mut global = valid_global();
+        global
+            .env_vars
+            .insert("PRIVATE_GLOBAL".into(), "changed-private-env".into());
+        assert_ne!(
+            capture_context(&rows, &record, global).unwrap().digest,
+            context.digest
+        );
+        assert_eq!(rows, preserved);
+        assert!(!context.digest.contains("private"));
+    }
+
+    #[test]
+    fn actual_context_overlay_is_fixed_target_only_and_preserves_original_authority() {
+        let fixture = super::super::admission_test_support::app_with_keyless_agent();
+        let rows = linked_fixture_rows(
+            super::super::load_managed_agents(fixture.app.handle())
+                .unwrap()
+                .remove(0),
+        );
+        let record = prospective_record(&rows);
+        for field in ["model", "provider"] {
+            let mut wrong = valid_global();
+            if field == "model" {
+                wrong.model = Some("private-wrong-model".into());
+            } else {
+                wrong.provider = Some("private-wrong-provider".into());
+            }
+            assert!(capture_context(&rows, &record, wrong).is_ok());
+            let mut changed = rows.clone();
+            changed[1][field] = json!("private-wrong-definition-value");
+            assert_ne!(
+                capture_context(&changed, &record, valid_global())
+                    .unwrap()
+                    .digest,
+                capture_context(&rows, &record, valid_global())
+                    .unwrap()
+                    .digest
+            );
+        }
+        let mut foreign = record.clone();
+        foreign.pubkey = "other-target".into();
+        assert_eq!(
+            capture_context(&rows, &foreign, valid_global())
+                .err()
+                .as_deref(),
+            Some("target_contract_mismatch")
+        );
+        let mut missing_harness = record.clone();
+        missing_harness.runtime = None;
+        assert_eq!(
+            capture_context(&rows, &missing_harness, valid_global())
+                .err()
+                .as_deref(),
+            Some("target_contract_mismatch")
+        );
+        let mut wrong_command = record.clone();
+        wrong_command.agent_command_override = Some("old-definition-command".into());
+        assert_eq!(
+            capture_context(&rows, &wrong_command, valid_global())
+                .err()
+                .as_deref(),
+            Some("target_effective_config_mismatch")
+        );
+        let mut old_runtime = rows.clone();
+        old_runtime[1]["runtime"] = json!("missing-old-definition-runtime");
+        old_runtime[1]["acp_command"] = json!("old-definition-command");
+        let context = capture_context(&old_runtime, &record, valid_global()).unwrap();
+        let descriptor = super::super::resolve_effective_harness_descriptor(
+            &record,
+            &context.personas,
+            &context.global,
+        )
+        .unwrap();
+        assert_eq!(descriptor.command, core::PYTHON);
+        assert_eq!(
+            descriptor.args,
+            vec!["-IS".to_owned(), format!("{}/run", core::CAPSULE)]
+        );
+        assert_eq!(
+            capture_context(&rows[..1], &record, valid_global())
+                .err()
+                .as_deref(),
+            Some("target_definition_missing")
+        );
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[1].clone());
+        assert_eq!(
+            capture_context(&duplicate, &record, valid_global())
+                .err()
+                .as_deref(),
+            Some("target_definition_ambiguous")
+        );
+    }
+
+    #[test]
+    fn actual_global_accessor_allows_missing_and_refuses_invalid_unreadable_or_drift() {
+        let fixture = super::super::admission_test_support::app_with_keyless_agent();
+        let app = fixture.app.handle();
+        let rows = linked_fixture_rows(super::super::load_managed_agents(app).unwrap().remove(0));
+        let record = prospective_record(&rows);
+        let path = app
+            .path()
+            .app_data_dir()
+            .unwrap()
+            .join("agents/global-agent-config.json");
+        assert!(!path.exists());
+        assert!(load_context(app, &rows, &record).is_ok());
+        fs::write(&path, serde_json::to_vec(&valid_global()).unwrap()).unwrap();
+        let context = load_context(app, &rows, &record).unwrap();
+        let current = recheck_context(app, &rows, &record, &context.digest).unwrap();
+        assert_eq!(current.global, context.global);
+        assert_eq!(
+            serde_json::to_value(current.personas).unwrap(),
+            serde_json::to_value(context.personas).unwrap()
+        );
+        let mut drift = valid_global();
+        drift
+            .env_vars
+            .insert("PRIVATE_GLOBAL".into(), "changed-private-global".into());
+        fs::write(&path, serde_json::to_vec(&drift).unwrap()).unwrap();
+        assert_eq!(
+            recheck_context(app, &rows, &record, &context.digest)
+                .err()
+                .as_deref(),
+            Some("fingerprint_mismatch")
+        );
+        fs::write(&path, "private-invalid-global-json").unwrap();
+        assert_eq!(
+            load_context(app, &rows, &record).err().as_deref(),
+            Some("target_context_unavailable")
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            load_context(app, &rows, &record).err().as_deref(),
+            Some("target_context_unavailable")
+        );
+        assert!(app
+            .state::<AppState>()
+            .managed_agent_processes
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 
     fn exited_process(record: &ManagedAgentRecord) -> super::super::ManagedAgentProcess {
         // An inert, already-reaped fixture child; never launches an ACP harness.
@@ -436,6 +811,7 @@ mod tests {
                 owner: core::OWNER,
                 relay: core::RELAY,
                 locked: false,
+                context_digest: "resolved-fixture-context",
             },
             &[raw],
             false,

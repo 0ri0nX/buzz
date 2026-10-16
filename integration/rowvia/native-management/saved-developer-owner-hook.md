@@ -40,12 +40,31 @@ Configure pins the per-instance harness, model/provider, single worker,
 owner-only response gate, fixed channel/mentions subscription, lazy pool,
 enabled mention filtering and no-base-prompt
 flag, and disables automatic start/restart for this target. Other saved fields
-and environment entries are preserved. Persona/team-linked records (including
-the legacy `persona_pack_path` alias) are refused
-instead of editing a shared definition. Nonlocal, nonstandard outer ACP commands,
-foreign relay pins, duplicate target rows and any conflicting harness bytes/ID
+and environment entries are preserved. A linked persona is resolved only from
+the one matching keyless definition in the same bounded store read; the shared
+definition is never edited. Team/pack links (including the legacy
+`persona_pack_path` alias) remain refused. Nonlocal, nonstandard outer ACP commands,
+duplicate target/definition rows and any conflicting harness bytes/ID
 are refused. Exact harness bytes are defined by the production helper's
 `harness_bytes()`; semantically equivalent reserialization is a collision.
+
+Like normal native spawning, relay authority comes from the current canonical
+workspace, not the saved record's legacy relay string. Valid saved relay strings
+(including empty/stale strings) are preserved verbatim, never normalized or
+rewritten; malformed/non-string relay fields remain refused. Actual unlocked
+owner, selected workspace/community relay and runtime admission gates are unchanged.
+
+The helper loads the actual normal global agent configuration, propagating
+load/parse failures without exposing contents. It uses the normal effective
+configuration and harness resolvers with a clone of only the selected definition.
+The explicit fixed-target policy `fixed-saved-developer-model-provider/v1` sets
+that in-memory clone's model/provider to `gpt-6.1-sol`/`codex`; it is not inherited
+fallback. Prompt, environment, runtime provenance and the saved original remain
+intact. No shared definition/global/store write is made for this overlay. The
+final resolved tuple, fixed command/arguments and lazy/mention controls are
+checked again. Missing, ambiguous, malformed or wrong-effective context fails
+closed. An absent global file uses the normal accessor's defaults for other
+fields, never as an invented model/provider source.
 
 Configure can reserve saved configuration before the worker exists. Start
 requires the canonical same-UID 0700 worker directory and its regular single-link
@@ -57,11 +76,21 @@ files or the bootstrap capsule's private contents.
 
 Inspect/configure return a compare token. After capsule preparation, inspect
 again before start because capsule metadata participates in that token. Changes
-to target configuration, environment or capsule metadata invalidate it. Signing
+to target configuration, the original definition/global configuration, named
+fixed-target override policy, resolved
+prompt/environment/harness or capsule metadata invalidate it. Before start the
+helper reloads global context and refuses digest drift, then passes those same
+captured personas/global values to the existing native spawn boundary. Global
+setters have no shared transaction lock: this guarantees captured-value
+consistency, not serialization against future configuration edits. Signing
 material/auth tags are not returned. `prerequisitesPresent` is metadata presence,
 not authority or provenance acceptance. `runtimeReady` is always false;
 `startDispatched` confirms only a managed lazy harness spawn, not ACP/provider,
 Memory or reply readiness.
+
+This persona/relay compatibility change does not establish a no-history-replay
+startup barrier. Actual start remains a separate approval gate; no persisted
+queue/cursor is cleared or reset by this helper.
 
 Any tracked target pair, saved PID or target receipt causes configure/start
 refusal. There is no reaping, adoption, termination, global status synchronization,
