@@ -366,8 +366,10 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = BoundedChild::spawn(command)?;
+    output_for_child_with_timeout(BoundedChild::spawn(command)?, timeout)
+}
 
+fn output_for_child_with_timeout(mut child: BoundedChild, timeout: Duration) -> Option<Output> {
     let stdout_pipe = child.take_stdout();
     let stderr_pipe = child.take_stderr();
 
@@ -659,7 +661,7 @@ mod tests {
 
     // Adversarial (group escape): the leader backgrounds a descendant that
     // calls `setsid()` — leaving the leader's process group while retaining the
-    // inherited stdout — then sleeps 300s; the leader itself loops forever, so
+    // inherited stdout — then holds it until cancellation; the leader loops, so
     // the helper times out. `kill_tree` is a `killpg` on the leader's group and
     // cannot reach the escaped descendant, so its pipe write end stays open and
     // never reaches EOF. The helper must still return within the outer watchdog
@@ -668,49 +670,244 @@ mod tests {
     // primitive Thufir reproduced against the round-8 blocking-read design; with
     // blocking reads the drain join hangs forever and `run_watchdogged` panics.
     //
-    // Non-vacuous: the descendant is asserted *alive* after the helper returns,
-    // proving it genuinely escaped the `killpg` (so it was still holding the
+    // Non-vacuous: the descendant answers a private ping after the helper
+    // returns, and its session/group IDs prove it escaped `killpg` (holding the
     // pipe at join time) — the return therefore came from the stop path, not
-    // from an EOF the kill happened to produce. The test then reaps it.
+    // from an EOF the kill happened to produce. The test then cancels the
+    // writer and checks for exit, retaining custody if settlement is uncertain.
     #[cfg(unix)]
     #[test]
     fn returns_when_escaped_descendant_retains_pipe() {
-        let pid_file = tempfile::NamedTempFile::new().expect("temp file for descendant pid");
-        let pid_path = pid_file
-            .path()
-            .to_str()
-            .expect("utf-8 temp path")
-            .to_string();
-        // The perl descendant `setsid()`s out of the leader's group, records its
-        // PID, writes a few bytes to the retained stdout, then sleeps. The
-        // leader waits until the PID is recorded (so the test can read it) and
-        // then loops forever, forcing the timeout path.
-        let script = format!(
-            "perl -MPOSIX -e 'POSIX::setsid() or die; open(my $f,\">\",$ARGV[0]) or die; \
-             print $f $$; close $f; print \"x\" x 4096; sleep 300;' '{pid_path}' & \
-             until [ -s '{pid_path}' ]; do :; done; while :; do sleep 1; done"
+        let mut control = Command::new("perl");
+        control.args(["-e", "print 'escaped-pipe-control';"]);
+        let output = run_watchdogged(control, Duration::from_secs(2), Duration::from_secs(5))
+            .expect("fixture control must return captured stdout");
+        assert!(output.status.success(), "fixture control must succeed");
+        assert_eq!(output.stdout, b"escaped-pipe-control");
+
+        struct FixtureCleanup {
+            directory: Option<tempfile::TempDir>,
+            child: Option<BoundedChild>,
+            leader_pid: Option<i32>,
+            leader_settled: bool,
+            escaped_pid: Option<i32>,
+            worker: Option<JoinHandle<()>>,
+        }
+
+        impl FixtureCleanup {
+            fn directory(&self) -> &std::path::Path {
+                self.directory.as_ref().unwrap().path()
+            }
+
+            fn pid(&self, name: &str) -> Option<i32> {
+                std::fs::read_to_string(self.directory().join(name))
+                    .ok()?
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|pid| *pid > 0)
+            }
+        }
+
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                // Cancellation also covers startup before PID publication.
+                // The fixture checks both this marker and directory custody.
+                let cancelled = std::fs::write(self.directory().join("cancel"), b"cancel").is_ok();
+                if let Some(mut child) = self.child.take() {
+                    child.kill_tree();
+                    child.reap();
+                    self.leader_settled = true;
+                } else if !self.leader_settled {
+                    if let Some(pid) = self.leader_pid {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    }
+                }
+                // The fixed writer exits on its private cancellation marker.
+                // Observe its PID only; never signal a possibly recycled PID.
+                // A non-child zombie or unfinished worker is uncertainty, so
+                // retain custody for the isolated runner's final teardown.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    let writer_exited = self.escaped_pid.is_none_or(|pid| !pid_alive(pid));
+                    let worker_finished = self.worker.as_ref().is_none_or(|w| w.is_finished());
+                    if writer_exited && worker_finished {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if self.worker.as_ref().is_some_and(|w| w.is_finished()) {
+                    self.leader_settled = self.worker.take().unwrap().join().is_ok();
+                }
+                let writer_exited = self.escaped_pid.is_none_or(|pid| !pid_alive(pid));
+                if !(cancelled && self.leader_settled && writer_exited && self.worker.is_none()) {
+                    let retained = self.directory.take().unwrap().keep();
+                    eprintln!(
+                        "escaped-pipe fixture custody retained at {}",
+                        retained.display()
+                    );
+                }
+            }
+        }
+
+        let mut fixture = FixtureCleanup {
+            directory: Some(tempfile::tempdir().expect("escaped-pipe fixture directory")),
+            child: None,
+            leader_pid: None,
+            leader_settled: false,
+            escaped_pid: None,
+            worker: None,
+        };
+        // Establish the exact writer identity before granting escape. Startup
+        // and readiness have a separate bound from the 300 ms supervised phase.
+        let script = r#"
+            use strict;
+            use warnings;
+            my $directory = $ARGV[0];
+            sub cancelled { return !-d $directory || -e "$directory/cancel"; }
+            sub publish {
+                my ($name, $value) = @_;
+                my $path = "$directory/$name";
+                open(my $file, ">", "$path.tmp") or die "fixture publication: $!";
+                print $file $value or die "fixture write: $!";
+                close($file) or die "fixture close: $!";
+                rename("$path.tmp", $path) or die "fixture rename: $!";
+            }
+            publish("leader.pid", $$);
+            exit 0 if cancelled();
+            my $child = fork();
+            defined($child) or die "fixture fork: $!";
+            if ($child == 0) {
+                publish("descendant.pid", $$);
+                while (!-e "$directory/release") {
+                    exit 0 if cancelled();
+                    select(undef, undef, undef, 0.01);
+                }
+                exit 0 if cancelled();
+                my $session = POSIX::setsid();
+                defined($session) && $session == $$ or die "fixture setsid: $!";
+                $| = 1;
+                print "x" x 4096 or die "fixture stdout: $!";
+                publish("ready", $$);
+            } else {
+                publish("fork.pid", $child);
+            }
+            while (!cancelled()) {
+                if ($child == 0 && -e "$directory/ping" && !-e "$directory/pong") {
+                    publish("pong", $$);
+                }
+                select(undef, undef, undef, 0.01);
+            }
+        "#;
+        let mut cmd = Command::new("perl");
+        cmd.args(["-MPOSIX", "-e", script])
+            .arg(fixture.directory())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let setup_deadline = Instant::now() + Duration::from_secs(2);
+        let child = BoundedChild::spawn(cmd).expect("spawn escaped-pipe fixture");
+        fixture.leader_pid = Some(child.child.id() as i32);
+        fixture.child = Some(child);
+        let descendant_pid = loop {
+            if let (Some(own_pid), Some(fork_pid)) =
+                (fixture.pid("descendant.pid"), fixture.pid("fork.pid"))
+            {
+                assert_eq!(own_pid, fork_pid, "writer must be the exact forked child");
+                assert_eq!(fixture.pid("leader.pid"), fixture.leader_pid);
+                assert_ne!(Some(own_pid), fixture.leader_pid);
+                break own_pid;
+            }
+            assert!(
+                Instant::now() < setup_deadline,
+                "fixture PID handshake timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        fixture.escaped_pid = Some(descendant_pid);
+        // Deliberately delay startup past the old 300 ms deadline. No supervised
+        // clock is running yet, and cleanup already owns the writer's identity.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            Instant::now() < setup_deadline,
+            "fixture setup timed out before release"
         );
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", &script]);
-        let result = run_watchdogged(cmd, Duration::from_millis(300), Duration::from_secs(5));
+        std::fs::write(fixture.directory().join("release"), b"release")
+            .expect("release identified fixture writer");
+        while fixture.pid("ready") != Some(descendant_pid) {
+            assert!(
+                Instant::now() < setup_deadline,
+                "fixture readiness timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pid_alive(descendant_pid),
+            "identified writer must be alive before supervision"
+        );
+        let leader_pid = fixture.leader_pid.unwrap();
+        let assert_escape = || {
+            let (session, group) =
+                unsafe { (libc::getsid(descendant_pid), libc::getpgid(descendant_pid)) };
+            assert_eq!(session, descendant_pid, "writer must lead its own session");
+            assert_eq!(group, descendant_pid, "writer must lead its own group");
+            assert_ne!(group, leader_pid, "writer must escape the supervised group");
+        };
+        assert_escape();
+        let child = fixture.child.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watchdog_deadline = Instant::now() + Duration::from_secs(5);
+        fixture.worker = Some(std::thread::spawn(move || {
+            let _ = tx.send(output_for_child_with_timeout(
+                child,
+                Duration::from_millis(300),
+            ));
+        }));
+        let result = rx
+            .recv_timeout(watchdog_deadline.saturating_duration_since(Instant::now()))
+            .expect("escaped-pipe supervision exceeded five-second watchdog");
+        while !fixture.worker.as_ref().unwrap().is_finished() {
+            assert!(
+                Instant::now() < watchdog_deadline,
+                "supervision worker did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fixture
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("supervision worker panicked");
+        fixture.leader_settled = true;
+        std::fs::write(fixture.directory().join("ping"), b"ping")
+            .expect("ping identified writer after supervision worker joined");
+        loop {
+            assert!(
+                Instant::now() < watchdog_deadline,
+                "escaped writer did not acknowledge post-join ping within watchdog"
+            );
+            if fixture.pid("pong") == Some(descendant_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_escape();
+        assert!(
+            fixture.pid("ready") == Some(descendant_pid),
+            "escaped-pipe fixture must be ready before supervised phase"
+        );
         assert!(
             result.is_none(),
             "a timed-out probe must fail closed even when an escaped writer holds the pipe"
         );
 
-        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
-            .expect("escaped descendant must have recorded its PID")
-            .trim()
-            .parse()
-            .expect("descendant PID must be numeric");
         assert!(
             pid_alive(descendant_pid),
             "descendant {descendant_pid} was expected to survive the group kill (proving it escaped)"
         );
-        // Reap the escaped writer so the test leaves nothing behind.
-        unsafe {
-            libc::kill(descendant_pid, libc::SIGKILL);
-        }
     }
 
     // Adversarial (capture bound): a producer that streams zero bytes
