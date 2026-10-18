@@ -65,6 +65,32 @@ pub(super) struct Entry {
     pub last_status_digest: Option<String>,
 }
 
+/// Decode a persisted status after checking its digest and operation identity.
+pub(super) fn last_status(
+    entry: &Entry,
+    operation_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let last_status = match (&entry.last_status_b64, &entry.last_status_digest) {
+        (None, None) => None,
+        (Some(encoded), Some(digest)) => {
+            let bytes = BASE64
+                .decode(encoded)
+                .map_err(|_| "invalid Rowvia journal status")?;
+            if hex::encode(Sha256::digest(&bytes)) != *digest {
+                return Err("Rowvia journal status digest mismatch".to_string());
+            }
+            let status: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid Rowvia journal status")?;
+            if status["operation_id"] != operation_id {
+                return Err("Rowvia journal status identity mismatch".to_string());
+            }
+            Some(status)
+        }
+        _ => return Err("incomplete Rowvia journal status".to_string()),
+    };
+    Ok(last_status)
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct RetiredEntry {
     pub logical_request_id: String,
@@ -379,7 +405,9 @@ mod tests {
         .unwrap();
         for index in MAX_ENTRIES..MAX_ENTRIES + 2 {
             transact(&file, &scope, |stored| {
-                stored.entries.push(entry(index, Utc::now().timestamp(), false, false));
+                stored
+                    .entries
+                    .push(entry(index, Utc::now().timestamp(), false, false));
                 Ok(((), true))
             })
             .unwrap();
@@ -401,7 +429,9 @@ mod tests {
         assert!(ids.contains(&"logical-2".to_string()));
         assert!(ids.contains(&format!("logical-{}", MAX_ENTRIES + 1)));
         assert!(transact(&file, &scope, |stored| {
-            stored.entries.push(entry(MAX_ENTRIES + 2, Utc::now().timestamp(), false, false));
+            stored
+                .entries
+                .push(entry(MAX_ENTRIES + 2, Utc::now().timestamp(), false, false));
             Ok(((), true))
         })
         .is_err());
@@ -424,7 +454,9 @@ mod tests {
         })
         .unwrap();
         transact(&file, &scope, |stored| {
-            stored.entries.push(entry(MAX_ENTRIES, Utc::now().timestamp(), false, false));
+            stored
+                .entries
+                .push(entry(MAX_ENTRIES, Utc::now().timestamp(), false, false));
             Ok(((), true))
         })
         .unwrap();

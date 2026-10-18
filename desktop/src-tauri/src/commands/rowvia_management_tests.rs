@@ -11,6 +11,79 @@ use nostr::{EventBuilder, JsonUtil, Kind};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
+impl ManagementClient {
+    async fn create_proposal(
+        &self,
+        keys: &Keys,
+        proposal: &ManagementProposalRequest,
+    ) -> Result<ManagementProposalResponse, String> {
+        validate_id(&proposal.request_id)?;
+        validate_id(&proposal.binding_id)?;
+        if proposal.target_agent_pubkey.len() != 64
+            || !proposal
+                .target_agent_pubkey
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid target agent pubkey".to_string());
+        }
+        if proposal.operations.is_empty()
+            || proposal.operations.len() > 64
+            || proposal.operations.iter().any(|operation| {
+                operation.is_empty() || operation.len() > 128 || !operation.is_ascii()
+            })
+            || proposal
+                .operations
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("operations must be sorted, unique, and bounded".to_string());
+        }
+        let body = serde_json::to_vec(proposal).map_err(|_| "invalid proposal")?;
+        let response = self
+            .request(keys, Method::POST, &["proposals"], Some(body))
+            .await?;
+        let receipt: ManagementProposalResponse = serde_json::from_value(response)
+            .map_err(|_| "invalid Rowvia proposal response".to_string())?;
+        verify_canonical_proposal(
+            &receipt.proposal_bytes_b64,
+            &receipt.proposal_digest,
+            &receipt.proposal_id,
+            &receipt.operation_id,
+        )?;
+        Ok(receipt)
+    }
+
+    async fn approve(
+        &self,
+        keys: &Keys,
+        approval: &ManagementApprovalRequest,
+    ) -> Result<serde_json::Value, String> {
+        let body = approval_body(approval, true)?;
+        self.post_approval_body(keys, &approval.proposal_id, body)
+            .await
+    }
+
+    async fn operation(
+        &self,
+        keys: &Keys,
+        operation_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        validate_id(operation_id)?;
+        self.request(keys, Method::GET, &["operations", operation_id], None)
+            .await
+    }
+}
+
+fn verify_canonical_proposal(
+    encoded: &str,
+    digest: &str,
+    proposal_id: &str,
+    operation_id: &str,
+) -> Result<String, String> {
+    verify_canonical_proposal_with_freshness(encoded, digest, proposal_id, operation_id, true)
+}
+
 // Opt-in cross-repository gate. The Rowvia runner owns the disposable database
 // and real HTTP handler; ordinary Buzz unit tests never connect to it.
 #[tokio::test]
@@ -458,8 +531,7 @@ async fn serve(State(fixture): State<Arc<Fixture>>, request: Request) -> impl In
         return Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                serde_json::json!({"operation_id": "operation-1", "state": "accepted"})
-                    .to_string(),
+                serde_json::json!({"operation_id": "operation-1", "state": "accepted"}).to_string(),
             ))
             .unwrap();
     }
@@ -669,9 +741,7 @@ async fn approval_timeout_recovers_exact_body_with_fresh_proof_after_status_chec
         .post_approval_body(&keys, "proposal-1", body.clone())
         .await
         .is_err());
-    fixture
-        .mode
-        .store(6, std::sync::atomic::Ordering::Relaxed);
+    fixture.mode.store(6, std::sync::atomic::Ordering::Relaxed);
     let result = retry_frozen_approval(&client, &keys, &path, &scope, "receipt-1", || Ok(()))
         .await
         .unwrap();
