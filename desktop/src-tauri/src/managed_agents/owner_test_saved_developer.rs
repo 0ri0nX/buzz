@@ -20,7 +20,7 @@ use tauri::{AppHandle, Manager};
 
 const ACP_SOURCE_REPO: &str =
     "/home/orionx/project/RowviaContext/repos/buzz-cerberus-ui-diagnostic-20261015";
-const ACP_SOURCE_COMMIT: &str = "0a82f47b90970e2e8d7141812c390f934e338cc1";
+const ACP_SOURCE_COMMIT: &str = "d09d5977265385d59ad9619ee3304003b19d3822";
 
 #[derive(Clone, Copy)]
 struct AcpPin<'a> {
@@ -32,9 +32,9 @@ struct AcpPin<'a> {
 // Root-qualified exact committed release and activation bytes, not authority
 // adopted from current files or the manifest's own provenance claims.
 const ACP_PIN: Option<AcpPin<'static>> = Some(AcpPin {
-    activation_sha256: "a34a52a717f59196e56ce445a45cb1491d1b0d60510eca7e932bdb6fdd3a68cb",
-    executable_sha256: "d81f022afe686ab068aa7e3190b315510c9e8bf30518cb34ecad0443a6ad52f4",
-    executable_bytes: 19_420_280,
+    activation_sha256: "ab1b6178676ee0adc979139f840d8155575d00b6940e7867d5978edd0a737645",
+    executable_sha256: "2c1d8308ca14d188d7be795b24164e9f6c6a7038c2a96db24c649625bc239e91",
+    executable_bytes: 19_421_016,
 });
 
 #[derive(Deserialize)]
