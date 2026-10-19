@@ -5345,11 +5345,28 @@ fn handle_prompt_result(
     // external effects. Exit before taking its batch, requeueing, or respawning.
     if config.startup_live_only_channel.is_some() && !matches!(result.outcome, PromptOutcome::Ok(_))
     {
+        // Classify only enum variants: error content may contain credentials.
+        let (error_kind, error_code) = match &result.outcome {
+            PromptOutcome::Error(error) => match error {
+                acp::AcpError::Io(_) => ("io", None),
+                acp::AcpError::Json(_) => ("json", None),
+                acp::AcpError::AgentExited => ("agent_exited", None),
+                acp::AcpError::IdleTimeout(_) => ("idle_timeout", None),
+                acp::AcpError::HardTimeout { .. } => ("hard_timeout", None),
+                acp::AcpError::CancelDrainTimeout(_) => ("cancel_drain_timeout", None),
+                acp::AcpError::Timeout(_) => ("timeout", None),
+                acp::AcpError::WriteTimeout(_) => ("write_timeout", None),
+                acp::AcpError::Protocol(_) => ("protocol", None),
+                acp::AcpError::AgentError { code, .. } => ("agent_error", Some(*code)),
+            },
+            _ => (outcome_label, None),
+        };
         tracing::error!(agent = result.agent.index, outcome = outcome_label,
+            error_kind, code = error_code,
             "live-only turn did not complete; explicit restart required; automatic batch retry disabled");
         emit_turn_error(
             "live-only turn did not complete; automatic retry disabled",
-            None,
+            error_code,
         );
         // Keep the client owned until the outer loop's awaited shutdown. The
         // caller exits before this slot can be claimed for another dispatch.
@@ -11558,16 +11575,152 @@ mod error_outcome_emission_tests {
     /// Dedicated mode exits before uncertain batches can be retried or respawned.
     #[tokio::test]
     async fn startup_live_only_uncertain_results_exit_before_batch_retry_or_respawn() {
-        for outcome in [
-            PromptOutcome::AgentExited,
-            PromptOutcome::Timeout(TimeoutKind::Idle),
-            PromptOutcome::Timeout(TimeoutKind::Hard {
-                recently_active: true,
-            }),
-            PromptOutcome::Error(AcpError::Protocol("synthetic protocol failure".into())),
-            PromptOutcome::Cancelled,
-            PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
-            PromptOutcome::ProjectContextIndeterminate("synthetic uncertainty".into()),
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const SECRET: &str = "SECRET-LIVE-ONLY-ERROR-CONTENT";
+
+        #[derive(Default)]
+        struct Fields(HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+
+        struct CapturedLog {
+            level: tracing::Level,
+            target: String,
+            fields: Fields,
+        }
+
+        struct Capture(Arc<std::sync::Mutex<Vec<CapturedLog>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(CapturedLog {
+                    level: *event.metadata().level(),
+                    target: event.metadata().target().into(),
+                    fields,
+                });
+            }
+        }
+
+        for (outcome, expected_outcome, expected_kind, expected_code) in [
+            (
+                PromptOutcome::Error(AcpError::AgentError {
+                    code: -32001,
+                    message: SECRET.into(),
+                }),
+                "error",
+                "agent_error",
+                Some(-32001),
+            ),
+            (
+                PromptOutcome::Error(AcpError::AgentError {
+                    code: i64::MAX,
+                    message: SECRET.into(),
+                }),
+                "error",
+                "agent_error",
+                Some(i64::MAX),
+            ),
+            (
+                PromptOutcome::Error(AcpError::Io(std::io::Error::other(SECRET))),
+                "error",
+                "io",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::Json(
+                    serde_json::from_value::<u64>(serde_json::json!(SECRET)).unwrap_err(),
+                )),
+                "error",
+                "json",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::Protocol(SECRET.into())),
+                "error",
+                "protocol",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::AgentExited),
+                "error",
+                "agent_exited",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::IdleTimeout(Duration::from_secs(1))),
+                "error",
+                "idle_timeout",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::HardTimeout {
+                    silence: Duration::from_secs(1),
+                }),
+                "error",
+                "hard_timeout",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::CancelDrainTimeout(Duration::from_secs(1))),
+                "error",
+                "cancel_drain_timeout",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::Timeout(Duration::from_secs(1))),
+                "error",
+                "timeout",
+                None,
+            ),
+            (
+                PromptOutcome::Error(AcpError::WriteTimeout(Duration::from_secs(1))),
+                "error",
+                "write_timeout",
+                None,
+            ),
+            (PromptOutcome::AgentExited, "exited", "exited", None),
+            (
+                PromptOutcome::Timeout(TimeoutKind::Idle),
+                "idle_timeout",
+                "idle_timeout",
+                None,
+            ),
+            (
+                PromptOutcome::Timeout(TimeoutKind::Hard {
+                    recently_active: true,
+                }),
+                "hard_timeout",
+                "hard_timeout",
+                None,
+            ),
+            (PromptOutcome::Cancelled, "cancelled", "cancelled", None),
+            (
+                PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+                "cancel_drain_timeout",
+                "cancel_drain_timeout",
+                None,
+            ),
+            (
+                PromptOutcome::ProjectContextIndeterminate(SECRET.into()),
+                "project_context_indeterminate",
+                "project_context_indeterminate",
+                None,
+            ),
         ] {
             let channel_id = Uuid::new_v4();
             let batch = live_only_failure_batch(channel_id);
@@ -11604,8 +11757,10 @@ mod error_outcome_emission_tests {
                 respawn_in_flight: false,
             }];
             let observer = ObserverHandle::in_process();
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(Capture(logs.clone()));
             assert!(matches!(
-                handle_prompt_result(
+                tracing::subscriber::with_default(subscriber, || handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -11617,7 +11772,7 @@ mod error_outcome_emission_tests {
                     &mut respawns,
                     Some(observer.clone()),
                     None
-                ),
+                )),
                 LoopAction::Exit
             ));
             assert_eq!(queue.queued_event_count(channel_id), 0);
@@ -11629,14 +11784,42 @@ mod error_outcome_emission_tests {
             assert!(respawns.is_empty());
             assert!(respawn_rx.try_recv().is_err());
             assert!(crash_history[0].crash_times.is_empty());
-            assert_eq!(
-                observer
-                    .snapshot()
+            let events = observer.snapshot();
+            assert_eq!(events.len(), 1, "exactly one diagnostic event");
+            assert_eq!(events[0].kind, "turn_error");
+            let mut expected_payload = serde_json::json!({
+                "outcome": expected_outcome,
+                "error": "live-only turn did not complete; automatic retry disabled",
+            });
+            if let Some(code) = expected_code {
+                expected_payload["code"] = serde_json::json!(code);
+            }
+            assert_eq!(events[0].payload, expected_payload);
+            assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));
+            {
+                let logs = logs.lock().unwrap();
+                for log in logs.iter() {
+                    assert!(!log.target.contains(SECRET));
+                    assert!(!serde_json::to_string(&log.fields.0)
+                        .unwrap()
+                        .contains(SECRET));
+                }
+                let diagnostics: Vec<_> = logs
                     .iter()
-                    .filter(|event| event.kind == "turn_error")
-                    .count(),
-                1
-            );
+                    .filter(|log| log.level == tracing::Level::ERROR && log.target == "buzz_acp")
+                    .collect();
+                assert_eq!(diagnostics.len(), 1, "exactly one tracing diagnostic");
+                let mut expected_fields = HashMap::from([
+                    ("agent".into(), "0".into()),
+                    ("outcome".into(), expected_outcome.into()),
+                    ("error_kind".into(), expected_kind.into()),
+                    ("message".into(), "live-only turn did not complete; explicit restart required; automatic batch retry disabled".into()),
+                ]);
+                if let Some(code) = expected_code {
+                    expected_fields.insert("code".into(), code.to_string());
+                }
+                assert_eq!(diagnostics[0].fields.0, expected_fields);
+            }
             // The main caller breaks on Exit; its existing cleanup drains/aborts
             // pending tasks rather than passing them back through recovery.
             pool.join_set.shutdown().await;
