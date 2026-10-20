@@ -2,7 +2,7 @@
 
 ## Active
 
-- [!] BUZZ-OWNER-TEST-ACTIVATE — Build the qualified exact revision and activate only through the existing Desktop-only path; current protected Desktop generation cannot be restarted in this source unit. Actual owner send/readback and agent reply acceptance remain unverified.
+- [x] BUZZ-OWNER-TEST-ACTIVATE — Qualified35ad4cb8 live/owner-hook ELF is installed through the existing Desktop-only path; preflight, installer mocks and fresh deployment-data review pass. Running hashdac14066 matches; immediate baselineb7e08522 backup and pin are verified. Two distinct owner-signed Cerberus messages each have a signature/source/channel/thread/content-bound reply; durable duplicate-send refusal passes. Architekt/native generations and retained seams remain unchanged. Developer reply acceptance is separate and awaits normal internal binding renewal (core_expired), not a Desktop restart permission.
 
 - [-] BUZZ-527-LIVE — Installed Desktop passes native owner/relay readiness and keyring metadata checks; interactive GUI/TTC/owner-operation acceptance still awaits human observation. Draft PR remains draft.
 
