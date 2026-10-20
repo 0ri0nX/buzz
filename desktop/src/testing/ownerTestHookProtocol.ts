@@ -27,8 +27,78 @@ const base = {
   }),
 };
 
+/** Public pairs from owner_test_saved_developer_core.rs and cerberusProposalUiDiagnostic.ts. */
+export const OWNER_TEST_MESSAGE_TARGETS = {
+  "31986c38-6676-4d6f-a4ba-ed833926d0d5":
+    "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78",
+  "fd0cc15d-c216-442f-bac2-837dd6fddbbd":
+    "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+} as const;
+
+const pilotExpected = z.strictObject({
+  ownerPubkey: z.literal(
+    "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68",
+  ),
+  architectPubkey: z.literal(
+    "05d1901b020205f04db1ee6c434d4cd69211af3dbc1d2a46e0e1e93f81f6dd20",
+  ),
+  relayUrl: relayUrl.refine((value) => value === "wss://buzz.rowvia.ai:8443"),
+});
+const pilotTargetFields = {
+  channelId: z.enum([
+    "31986c38-6676-4d6f-a4ba-ed833926d0d5",
+    "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+  ]),
+  recipientPubkey: pubkey,
+};
+
+/** Rechecked immediately before sending, so time spent in the queue cannot authorize a late send. */
+export function ownerTestMessageUnexpired(expiresAt: number): boolean {
+  const now = Date.now();
+  return expiresAt > now && expiresAt <= now + 120_000;
+}
+
 /** Strict validation rejects extra arguments and unrestricted operations. */
 export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
+  z.strictObject({
+    ...base,
+    operation: z.literal("read_existing_test_channel"),
+    expected: pilotExpected,
+    arguments: z
+      .strictObject({
+        ...pilotTargetFields,
+        limit: z.number().int().min(1).max(20),
+        since: z.number().int().nonnegative().optional(),
+      })
+      .refine(
+        (value) =>
+          OWNER_TEST_MESSAGE_TARGETS[value.channelId] === value.recipientPubkey,
+      ),
+  }),
+  z.strictObject({
+    ...base,
+    operation: z.literal("send_existing_test_message"),
+    expected: pilotExpected,
+    arguments: z
+      .strictObject({
+        ...pilotTargetFields,
+        content: z
+          .string()
+          .max(1024)
+          .startsWith("ROWVIA_E2E_")
+          .refine((value) => new TextEncoder().encode(value).length <= 1024),
+        // Absolute Unix milliseconds, checked again after the membership read.
+        expiresAt: z
+          .number()
+          .int()
+          .nonnegative()
+          .refine(ownerTestMessageUnexpired),
+      })
+      .refine(
+        (value) =>
+          OWNER_TEST_MESSAGE_TARGETS[value.channelId] === value.recipientPubkey,
+      ),
+  }),
   z.strictObject({
     ...base,
     operation: z.literal("inspect_saved_connector"),

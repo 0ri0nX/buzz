@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
@@ -25,6 +26,69 @@ const MAX_PENDING: usize = 8;
 const MAX_CACHE: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(30);
 const EMPTY_ID: &str = "00000000-0000-0000-0000-000000000000";
+const TEST_MESSAGE_TARGETS: [(&str, &str); 2] = [
+    (
+        "31986c38-6676-4d6f-a4ba-ed833926d0d5",
+        "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78",
+    ),
+    (
+        "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+        "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+    ),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TestMessageArguments {
+    channel_id: String,
+    recipient_pubkey: String,
+    content: String,
+    expires_at: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TestReadArguments {
+    channel_id: String,
+    recipient_pubkey: String,
+    limit: u8,
+    since: Option<u64>,
+}
+
+fn validate_test_read(arguments: &serde_json::Map<String, Value>) -> Result<(), Code> {
+    let args: TestReadArguments = serde_json::from_value(Value::Object(arguments.clone()))
+        .map_err(|_| Code::InvalidRequest)?;
+    if !TEST_MESSAGE_TARGETS.iter().any(|(channel, recipient)| {
+        args.channel_id == *channel && args.recipient_pubkey == *recipient
+    }) || !(1..=20).contains(&args.limit)
+        || args
+            .since
+            .is_some_and(|since| since > 9_007_199_254_740_991)
+        || arguments.get("since").is_some_and(Value::is_null)
+    {
+        return Err(Code::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_test_message(arguments: &serde_json::Map<String, Value>) -> Result<(), Code> {
+    let args: TestMessageArguments = serde_json::from_value(Value::Object(arguments.clone()))
+        .map_err(|_| Code::InvalidRequest)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Code::InvalidRequest)?
+        .as_millis();
+    if !TEST_MESSAGE_TARGETS.iter().any(|(channel, recipient)| {
+        args.channel_id == *channel && args.recipient_pubkey == *recipient
+    }) || !args.content.starts_with("ROWVIA_E2E_")
+        || args.content.len() > 1024
+        || u128::from(args.expires_at) <= now
+        || u128::from(args.expires_at) > now + 120_000
+    {
+        return Err(Code::InvalidRequest);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -199,10 +263,17 @@ struct SocketGuard {
     device: u64,
     inode: u64,
     uid: u32,
+    cleanup_attempted: AtomicBool,
 }
 
 impl SocketGuard {
     fn remove(&self) {
+        // stop, serve teardown and Drop share one cleanup attempt, even when
+        // it fails. A later path may have reused this socket's inode.
+        if self.cleanup_attempted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // The first metadata check/unlink is still not atomic.
         // Never unlink a replacement created by another process.
         if fs::symlink_metadata(&self.path).is_ok_and(|m| {
             m.file_type().is_socket() && m.dev() == self.device && m.ino() == self.inode
@@ -236,6 +307,8 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "create_private_stream"
                 | "add_architect"
                 | "send_message"
+                | "send_existing_test_message"
+                | "read_existing_test_channel"
                 | "read_channel"
                 | "inspect_managed_agent_runtime"
                 | "ensure_managed_agent_runtime"
@@ -252,6 +325,12 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
     }
     if request.operation == "inspect_cerberus_proposal_ui" && !request.arguments.is_empty() {
         return Err(Code::InvalidRequest);
+    }
+    if request.operation == "send_existing_test_message" {
+        validate_test_message(&request.arguments)?;
+    }
+    if request.operation == "read_existing_test_channel" {
+        validate_test_read(&request.arguments)?;
     }
     if crate::commands::owner_test_saved_connector::is_operation(&request.operation) {
         crate::commands::owner_test_saved_connector::validate_arguments(
@@ -326,6 +405,7 @@ pub(crate) fn setup(app: &tauri::AppHandle) -> Result<(), &'static str> {
         device: metadata.dev(),
         inode: metadata.ino(),
         uid: metadata.uid(),
+        cleanup_attempted: AtomicBool::new(false),
     };
     fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600))
         .map_err(|_| "socket_bind_failed")?;
@@ -870,6 +950,8 @@ mod tests {
         assert!(configured_path(Some(path.into_os_string())).is_err());
     }
 
+    include!("owner_test_hook_message_tests.rs");
+
     #[test]
     fn rejects_oversize_operation_and_scope() {
         assert!(validate_request(&vec![b' '; MAX_REQUEST + 1]).is_err());
@@ -1120,6 +1202,7 @@ mod tests {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 uid: metadata.uid(),
+                cleanup_attempted: AtomicBool::new(false),
             },
         };
         let r = request();
@@ -1155,6 +1238,7 @@ mod tests {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 uid: metadata.uid(),
+                cleanup_attempted: AtomicBool::new(false),
             },
         };
         let mut r = request();
@@ -1209,6 +1293,7 @@ mod tests {
                     device: metadata.dev(),
                     inode: metadata.ino(),
                     uid: metadata.uid(),
+                    cleanup_attempted: AtomicBool::new(false),
                 },
             });
             let mut r = request();
@@ -1296,6 +1381,7 @@ mod tests {
             device: metadata.dev(),
             inode: metadata.ino(),
             uid: metadata.uid(),
+            cleanup_attempted: AtomicBool::new(false),
         };
         assert!(configured_path(Some(path.clone().into_os_string())).is_err());
         guard.remove();

@@ -16,6 +16,7 @@ let onConnect = () => {};
 let createdChannelId = channelId;
 let sendCount = 0;
 let onNativeSend = () => {};
+let onHistory = () => {};
 const nativeOverrides = new Map();
 const eventCallbacks = new Map();
 const eventListeners = new Map();
@@ -209,6 +210,7 @@ relayClient.publishEvent = async (event) => {
 };
 relayClient.fetchHistory = async (filter) => {
   calls.push({ command: "history", args: filter });
+  onHistory();
   return events;
 };
 
@@ -221,6 +223,7 @@ function reset() {
   onSign = () => {};
   onConnect = () => {};
   onNativeSend = () => {};
+  onHistory = () => {};
   createdChannelId = channelId;
   sendCount = 0;
   nativeOverrides.clear();
@@ -265,6 +268,385 @@ function setNativeScope(payload) {
   relay = "wss://buzz.rowvia.ai:8443";
   relayClient.relayUrl = relay;
 }
+
+const existingTestTargets = [
+  [
+    "31986c38-6676-4d6f-a4ba-ed833926d0d5",
+    "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78",
+  ],
+  [
+    "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+    "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+  ],
+];
+
+function existingMessageRequest(target = existingTestTargets[0]) {
+  return {
+    ...nativeStatusRequest(),
+    operation: "send_existing_test_message",
+    arguments: {
+      channelId: target[0],
+      recipientPubkey: target[1],
+      content: "ROWVIA_E2E_ synthetic owner message",
+      expiresAt: Date.now() + 60_000,
+    },
+  };
+}
+
+function mockExistingMembership(item, change = () => {}) {
+  nativeOverrides.set("get_channel_members", (args) => {
+    assert.equal(args.channelId, item.arguments.channelId);
+    change();
+    return {
+      members: [item.expected.ownerPubkey, item.arguments.recipientPubkey].map(
+        (pubkey) => ({ pubkey, role: "member" }),
+      ),
+      next_cursor: null,
+    };
+  });
+}
+
+function existingReadRequest(target = existingTestTargets[0]) {
+  const item = existingMessageRequest(target);
+  item.operation = "read_existing_test_channel";
+  item.arguments = {
+    channelId: target[0],
+    recipientPubkey: target[1],
+    limit: 20,
+    since: 1,
+  };
+  return item;
+}
+
+test("existing test readback returns bounded signed root/reply events through normal scoped history without mutations", async (t) => {
+  for (const target of existingTestTargets) {
+    reset();
+    const item = existingReadRequest(target);
+    setNativeScope(item);
+    mockExistingMembership(item);
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    events = Array.from({ length: 21 }, (_, index) => ({
+      kind: 9,
+      id: index.toString(16).padStart(64, "0"),
+      pubkey: target[1],
+      sig: "e".repeat(128),
+      content: "automatic reply",
+      created_at: 2,
+      tags: [
+        ["h", target[0]],
+        ["e", "a".repeat(64), "", "reply"],
+      ],
+    }));
+    assert.deepEqual((await handler(item)).result, {
+      events: events.slice(0, 20),
+    });
+    assert.deepEqual(calls.find(({ command }) => command === "history").args, {
+      kinds: [9],
+      "#h": [target[0]],
+      limit: 20,
+      since: 1,
+    });
+    assert.equal(
+      calls.some(({ command }) =>
+        [
+          "create_channel",
+          "add_channel_members",
+          "send_channel_message",
+          "sign_event",
+          "publish",
+        ].includes(command),
+      ),
+      false,
+    );
+    assert.equal(
+      (
+        await handler({
+          ...item,
+          requestId: randomUUID(),
+          operation: "read_channel",
+          arguments: { channelId: target[0], limit: 1 },
+        })
+      ).code,
+      "channel_not_owned",
+    );
+  }
+});
+
+test("existing test readback rejects wrong pair, scope, limit and extra selectors before native reads", async (t) => {
+  reset();
+  const handler = createOwnerTestHandler(() => {});
+  t.after(handler.dispose);
+  for (const change of [
+    { channelId },
+    { recipientPubkey: existingTestTargets[1][1] },
+    { limit: 0 },
+    { limit: 21 },
+    { limit: 1.5 },
+    { since: -1 },
+    { since: "now" },
+    { parentEventId: "a".repeat(64) },
+    { rootEventId: "a".repeat(64) },
+    { content: "ROWVIA_E2E_" },
+    { pubkey: ownerPubkey },
+  ]) {
+    const item = existingReadRequest();
+    item.arguments = { ...item.arguments, ...change };
+    assert.equal((await handler(item)).code, "invalid_request");
+  }
+  for (const field of ["ownerPubkey", "architectPubkey", "relayUrl"]) {
+    const item = existingReadRequest();
+    item.expected[field] = field === "relayUrl" ? relayUrl : "f".repeat(64);
+    assert.equal((await handler(item)).code, "invalid_request");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("existing test readback requires both members and fences scope drift around roster and history reads", async (t) => {
+  for (const failure of [
+    "owner",
+    "recipient",
+    "rosterScope",
+    "historyScope",
+    "transport",
+  ]) {
+    reset();
+    const item = existingReadRequest();
+    setNativeScope(item);
+    mockExistingMembership(item, () => {
+      if (failure === "rosterScope") identity = "f".repeat(64);
+    });
+    if (failure === "owner" || failure === "recipient")
+      nativeOverrides.set("get_channel_members", () => ({
+        members: [
+          {
+            pubkey:
+              failure === "owner"
+                ? item.arguments.recipientPubkey
+                : item.expected.ownerPubkey,
+          },
+        ],
+        next_cursor: null,
+      }));
+    onHistory = () => {
+      if (failure === "historyScope") identity = "f".repeat(64);
+      if (failure === "transport") throw new Error("history failed");
+    };
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    const result = await handler(item);
+    assert.equal(
+      result.code,
+      failure === "transport"
+        ? "operation_failed"
+        : failure.endsWith("Scope")
+          ? "scope_mismatch"
+          : "membership_failed",
+    );
+    assert.equal(result.status, failure === "transport" ? "unknown" : "error");
+    assert.equal(
+      calls.filter(({ command }) => command === "history").length,
+      ["historyScope", "transport"].includes(failure) ? 1 : 0,
+    );
+    assert.equal(
+      calls.some(({ command }) => command === "send_channel_message"),
+      false,
+    );
+  }
+});
+
+test("existing test readback rejects cross-channel, wrong-kind, and oversized history responses", async (t) => {
+  for (const event of [
+    { kind: 9, tags: [["h", channelId]] },
+    { kind: 1, tags: [["h", existingTestTargets[0][0]]] },
+    {
+      kind: 9,
+      tags: [["h", existingTestTargets[0][0]]],
+      content: "x".repeat(17_000),
+    },
+  ]) {
+    reset();
+    const item = existingReadRequest();
+    setNativeScope(item);
+    mockExistingMembership(item);
+    events = [event];
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    assert.equal(
+      (await handler(item)).code,
+      event.content ? "response_too_large" : "operation_failed",
+    );
+    assert.equal(
+      calls.some(({ command }) => command === "send_channel_message"),
+      false,
+    );
+  }
+});
+
+test("existing test message uses only the pinned root channel/recipient and ordinary scoped native signer", async (t) => {
+  for (const target of existingTestTargets) {
+    reset();
+    const item = existingMessageRequest(target);
+    setNativeScope(item);
+    mockExistingMembership(item);
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    const result = await handler(item);
+    assert.equal(result.status, "ok");
+    assert.match(result.result.eventId, /^[0-9a-f]{64}$/);
+    const sends = calls.filter(
+      ({ command }) => command === "send_channel_message",
+    );
+    assert.equal(sends.length, 1);
+    assert.deepEqual(sends[0].args, {
+      ...nativeSendArgs(target[0], item.arguments.content),
+      mentionPubkeys: [target[1]],
+      expectedRelayUrl: "wss://buzz.rowvia.ai:8443",
+      expectedSignerPubkey: item.expected.ownerPubkey,
+    });
+    assert.equal(
+      calls.some(({ command }) =>
+        [
+          "add_channel_members",
+          "create_channel",
+          "sign_event",
+          "publish",
+        ].includes(command),
+      ),
+      false,
+    );
+    assert.equal((await handler(item)).code, "duplicate_request");
+    assert.equal(
+      calls.filter(({ command }) => command === "send_channel_message").length,
+      1,
+    );
+    assert.equal(
+      (
+        await handler({
+          ...item,
+          requestId: randomUUID(),
+          operation: "read_channel",
+          arguments: { channelId: target[0], limit: 1 },
+        })
+      ).code,
+      "channel_not_owned",
+    );
+  }
+});
+
+test("existing test message rejects malformed, expired, wrong-scope/recipient/channel/thread requests before native reads", async (t) => {
+  const changes = [
+    { channelId: channelId },
+    { recipientPubkey: existingTestTargets[1][1] },
+    { content: "unmarked" },
+    { content: "prefix ROWVIA_E2E_" },
+    { content: `ROWVIA_E2E_${"😀".repeat(300)}` },
+    { expiresAt: Date.now() - 1 },
+    { expiresAt: Date.now() + 180_000 },
+    { expiresAt: "tomorrow" },
+    { expiresAt: 1.5 },
+    { parentEventId: "a".repeat(64) },
+    { rootEventId: "a".repeat(64) },
+    { mentionPubkeys: [ownerPubkey] },
+    { kind: 40002 },
+    { eval: "no" },
+  ];
+  reset();
+  const handler = createOwnerTestHandler(() => {});
+  t.after(handler.dispose);
+  for (const change of changes) {
+    const item = existingMessageRequest();
+    item.arguments = { ...item.arguments, ...change };
+    assert.equal((await handler(item)).code, "invalid_request");
+  }
+  for (const key of ["ownerPubkey", "architectPubkey", "relayUrl"]) {
+    const item = existingMessageRequest();
+    item.expected[key] = key === "relayUrl" ? relayUrl : "f".repeat(64);
+    assert.equal((await handler(item)).code, "invalid_request");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("existing test message requires both current members and rechecks expiry and native scope after roster read", async (t) => {
+  for (const failure of ["owner", "recipient", "expiry", "scope", "relay"]) {
+    reset();
+    const item = existingMessageRequest();
+    setNativeScope(item);
+    const originalNow = Date.now;
+    mockExistingMembership(item, () => {
+      if (failure === "expiry") Date.now = () => item.arguments.expiresAt;
+      if (failure === "scope") identity = "f".repeat(64);
+      if (failure === "relay") relay = "ws://localhost:9999";
+    });
+    if (failure === "owner" || failure === "recipient") {
+      nativeOverrides.set("get_channel_members", () => ({
+        members: [
+          {
+            pubkey:
+              failure === "owner"
+                ? item.arguments.recipientPubkey
+                : item.expected.ownerPubkey,
+          },
+        ],
+        next_cursor: null,
+      }));
+    }
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    try {
+      const result = await handler(item);
+      assert.equal(result.status, "error");
+      assert.equal(
+        result.code,
+        failure === "expiry"
+          ? "invalid_request"
+          : failure === "scope" || failure === "relay"
+            ? "scope_mismatch"
+            : "membership_failed",
+      );
+      assert.equal(
+        calls.some(({ command }) => command === "send_channel_message"),
+        false,
+      );
+    } finally {
+      Date.now = originalNow;
+    }
+  }
+});
+
+test("existing test message preserves unknown outcome and never resends a nonce after failure or altered replay", async (t) => {
+  for (const failure of ["transport", "response", "scope"]) {
+    reset();
+    const item = existingMessageRequest();
+    setNativeScope(item);
+    mockExistingMembership(item);
+    onNativeSend = (result) => {
+      if (failure === "transport") throw new Error("transport uncertain");
+      if (failure === "response") result.parent_event_id = "f".repeat(64);
+      if (failure === "scope") identity = "f".repeat(64);
+    };
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    assert.equal((await handler(item)).status, "unknown");
+    assert.equal((await handler(item)).code, "duplicate_request");
+    assert.equal(
+      (
+        await handler({
+          ...item,
+          arguments: {
+            ...item.arguments,
+            content: "ROWVIA_E2E_ altered retry",
+          },
+        })
+      ).code,
+      "duplicate_request",
+    );
+    assert.equal(
+      calls.filter(({ command }) => command === "send_channel_message").length,
+      1,
+    );
+  }
+});
 
 function dispatchNativeRequest(payload) {
   const listeners = [...eventListeners.entries()].filter(

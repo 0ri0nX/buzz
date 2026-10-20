@@ -1,5 +1,29 @@
 # PLAN
 
+## Bounded existing-channel owner test message
+
+### Goal / Scope
+
+Extend only the opted-in temporary owner hook with `send_existing_test_message` and `read_existing_test_channel` for the source-confirmed Developer and Cerberus channel/recipient pairs. Reuse the normal native signer, scoped history reader, relay enforcement and request ledger. The explicit readback is needed because existing response readers cannot access these channels through the generic hook registry. No key export, generic invoke/sign API, permission bypass, live sends, process restart or deployment.
+
+### Approach / Validation / Risks
+
+- Pin both pairs in the strict TS and Rust contracts; use requestId as the nonce and existing ledger as the one-attempt boundary. Accept only root messages beginning `ROWVIA_E2E_`, at most 1024 UTF-8 bytes, with a future expiry no more than two minutes away.
+- Precheck both members through the normal roster read, recheck owner/relay and expiry before the scoped native send. Failures after send begins remain unknown and never trigger a hook retry.
+- Readback uses the same fixed pairs and membership checks, at most 20 kind-9 events with optional `since`, the existing scoped history reader and bounded response validation. It returns signed event fields for separate Core reply verification without registering channels or thread provenance.
+- A concrete native-test failure is consistent with Root's separate owned socket probe, which observes inode reuse8/8. Make `SocketGuard` cleanup atomic and one-attempt across stop/serve/Drop; retain the original replacement test and add a deterministic regression. This does not establish the failed run's original inode values or make the first metadata-check/unlink atomic.
+- Validate synthetic TS handler/schema tests, Rust validation/ledger tests, focused lint/typecheck/format under the capped runner. Native activation and actual relay acceptance require a separate executable/process and remain outside this source task; independent boundary review follows.
+
+### Implementation Notes
+
+- Implemented the strict TS/Rust operation and exact pairs. The handler checks both members through the existing roster wrapper, then uses the ordinary scoped native root-message path; existing channel access, thread provenance, hook flags and private socket transport are unchanged.
+- Added `read_existing_test_channel` with the same pinned scope/pairs and membership checks, limit 1–20 and optional `since`. It shares the unchanged scoped kind-9 history/response checks with `read_channel`, preserving signed reply envelopes for Core verification without granting generic channel access.
+- Added one-attempt atomic socket cleanup and a deterministic matching-metadata/Drop regression, preserving the original replacement test apart from required constructor initialization. Only new native tests moved into `owner_test_hook_message_tests.rs`, included inside the existing test module; final native files are below the size ceiling. The initial check/unlink race remains outside this narrow correction.
+- RequestId deduplication is process-local. Callers must retain attempted IDs and never replace a nonce after an unknown outcome, including across restarts. Expiry uses Unix milliseconds and gates admission/dispatch, not the settlement of an already submitted event.
+- Under the shared 5 GiB/zero-swap runner: new send/readback tests failed before implementation; author and Root repeat61/61 focused frontend tests with zero skips and full Desktop `tsc --noEmit`; focused Biome and both Rust formatting checks pass. The author's initial offline Cargo dependency miss is resolved only inside the existing isolated public-dependency phase. Root's first actual hook run compiles and passes19/20, exposing the old replacement-cleanup failure; final five-file packet compiles in1m42s and passes22/22 actual native tests, zero failed/ignored,3495 filtered. The pinned image, network-none/read-only source, synthetic HOME/TMPDIR, phase-only caches,5GiB/no-extra-swap and stopped/no-OOM container custody are verified. Fresh independent source review approves the final packet. This is not whole-suite/strict-Clippy, literal owner IPC, signatures or live relay acceptance.
+- Earlier Desktop file-size ratchet fails only on untouched `managed_agents/owner_test_saved_developer.rs` (1507/1500) and `relayClientSession.ts` (1261/1200); this patch's native files1395/219 remain below1500. Default Cargo/frontend opt-ins, same-UID socket, fixed scopes and ordinary signing remain intact; no key export exists.
+- No live hook calls, relay sends, key access, deployment, Desktop restart or protected-session interaction occurred. Release assets/native allowlist are compiled, so activation requires a new exact-revision build and Desktop-only replacement/restart. The existing protected Desktop generation is not restarted by this source unit; activation remains separately unqualified.
+
 ## Port Rowvia Buzz fork to desktop-v0.5.27
 
 ### Goal

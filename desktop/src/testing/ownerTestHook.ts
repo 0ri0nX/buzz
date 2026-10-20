@@ -7,7 +7,7 @@ import {
   getRelayWsUrl,
   invokeTauri,
 } from "@/shared/api/tauri";
-import { createChannel } from "@/shared/api/tauriChannels";
+import { createChannel, getChannelMembers } from "@/shared/api/tauriChannels";
 import { inspectCerberusProposalUi } from "./cerberusProposalUiDiagnostic";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import {
@@ -27,6 +27,7 @@ import {
 import {
   OWNER_TEST_SCHEMA,
   ownerTestRequestSchema,
+  ownerTestMessageUnexpired,
   ownerTestRuntimeProjectionSchema,
   type OwnerTestCode,
   type OwnerTestRequest,
@@ -41,7 +42,7 @@ class HookFailure extends Error {
   }
 }
 
-/** A session-local allowlist; only hook-created private streams are accessible. */
+/** Session-local streams plus a separate closed, expiring pilot-message operation. */
 export function createOwnerTestHandler(
   reportPhase: OwnerTestPhaseReporter = reportOwnerTestPhase,
 ) {
@@ -104,6 +105,48 @@ export function createOwnerTestHandler(
     if (identity.locked || identity.lost || identity.resetFailed)
       throw new HookFailure("not_ready");
     boundScope = scope;
+  }
+
+  async function readEvents(
+    request: Extract<
+      OwnerTestRequest,
+      { operation: "read_channel" | "read_existing_test_channel" }
+    >,
+    channelId: string,
+  ): Promise<object> {
+    const events = await relayClient.fetchEvents(
+      {
+        kinds: [9],
+        "#h": [channelId],
+        limit: request.arguments.limit,
+        ...(request.arguments.since === undefined
+          ? {}
+          : { since: request.arguments.since }),
+      },
+      {
+        ownerPubkey: request.expected.ownerPubkey,
+        relayUrl: request.expected.relayUrl,
+      },
+    );
+    await assertScope(request);
+    const bounded = events.slice(0, request.arguments.limit);
+    if (
+      bounded.some(
+        (event) =>
+          event.kind !== 9 ||
+          !event.tags.some((tag) => tag[0] === "h" && tag[1] === channelId),
+      )
+    )
+      throw new HookFailure("operation_failed");
+    if (
+      bounded.some(
+        (event) =>
+          new TextEncoder().encode(JSON.stringify(event)).length > 16_384,
+      ) ||
+      new TextEncoder().encode(JSON.stringify(bounded)).length > 245_760
+    )
+      throw new HookFailure("response_too_large");
+    return { events: bounded };
   }
 
   async function execute(
@@ -220,6 +263,54 @@ export function createOwnerTestHandler(
       });
       return { channelId: channel.id };
     }
+    if (
+      request.operation === "send_existing_test_message" ||
+      request.operation === "read_existing_test_channel"
+    ) {
+      const { channelId, recipientPubkey } = request.arguments;
+      const members = await getChannelMembers(channelId);
+      await assertScope(request);
+      if (
+        !members.some(
+          (member) => member.pubkey === request.expected.ownerPubkey,
+        ) ||
+        !members.some((member) => member.pubkey === recipientPubkey)
+      )
+        throw new HookFailure("membership_failed");
+      if (request.operation === "read_existing_test_channel")
+        return readEvents(request, channelId);
+      const { content, expiresAt } = request.arguments;
+      if (!ownerTestMessageUnexpired(expiresAt))
+        throw new HookFailure("invalid_request");
+      // requestId is the nonce: process-local ledgers retain unknown outcomes.
+      // The caller must retain attempted IDs and never reissue an uncertain
+      // send with a fresh nonce, including after a Desktop restart.
+      // This operation never adds channel access or thread targets.
+      markMutation();
+      const result = await sendChannelMessage(
+        channelId,
+        content,
+        null,
+        undefined,
+        [recipientPubkey],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        request.expected.relayUrl,
+        request.expected.ownerPubkey,
+      );
+      await assertScope(request);
+      if (
+        typeof result.eventId !== "string" ||
+        !/^[0-9a-f]{64}$/.test(result.eventId) ||
+        result.parentEventId !== null ||
+        result.rootEventId !== null
+      )
+        throw new HookFailure("operation_failed");
+      return { eventId: result.eventId };
+    }
     const entry = channels.get(request.arguments.channelId);
     if (!entry || entry.expected !== JSON.stringify(request.expected))
       throw new HookFailure("channel_not_owned");
@@ -302,41 +393,7 @@ export function createOwnerTestHandler(
       });
       return { eventId: result.eventId };
     }
-    const events = await relayClient.fetchEvents(
-      {
-        kinds: [9],
-        "#h": [entry.channel.id],
-        limit: request.arguments.limit,
-        ...(request.arguments.since === undefined
-          ? {}
-          : { since: request.arguments.since }),
-      },
-      {
-        ownerPubkey: request.expected.ownerPubkey,
-        relayUrl: request.expected.relayUrl,
-      },
-    );
-    await assertScope(request);
-    const bounded = events.slice(0, request.arguments.limit);
-    if (
-      bounded.some(
-        (event) =>
-          event.kind !== 9 ||
-          !event.tags.some(
-            (tag) => tag[0] === "h" && tag[1] === entry.channel.id,
-          ),
-      )
-    )
-      throw new HookFailure("operation_failed");
-    if (
-      bounded.some(
-        (event) =>
-          new TextEncoder().encode(JSON.stringify(event)).length > 16_384,
-      ) ||
-      new TextEncoder().encode(JSON.stringify(bounded)).length > 245_760
-    )
-      throw new HookFailure("response_too_large");
-    return { events: bounded };
+    return readEvents(request, entry.channel.id);
   }
 
   async function handle(payload: unknown): Promise<OwnerTestResponse> {
