@@ -504,6 +504,279 @@ fn confined_update(home: &Path) {
         state.managed_agent_processes.lock().unwrap().is_empty(),
         "post-save failure stays stopped even if normal already persisted"
     );
+    // A later known normal start is a distinct lifecycle from setup Stop.
+    // Exercise the production restore guard at BOTH normal Stop and Update.
+    let normal = target_contract(&restored, false).unwrap().clone();
+    let child = std::process::Command::new("/usr/bin/sleep")
+        .arg("30")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let normal_pid = child.id();
+    let key = ManagedAgentRuntimeKey::new(core::TARGET, core::RELAY).unwrap();
+    state.managed_agent_processes.lock().unwrap().insert(
+        key.clone(),
+        ManagedAgentPairRuntime::starting(crate::managed_agents::ManagedAgentProcess {
+            child,
+            log_path: home.join("inert-normal-stop.log"),
+            spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                &normal,
+                &[],
+                &[],
+                core::RELAY,
+                &Default::default(),
+                false,
+            ),
+            setup_mode: false,
+            adapter_availability: None,
+            start_nonce: "owned-normal-stop-fixture".into(),
+        }),
+    );
+    let stop_guard =
+        |rows: &[ManagedAgentRecord],
+         runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>| {
+            check_restore_target(&handle, rows, runtimes, true)
+        };
+    for change in [
+        "initial",
+        "command",
+        "relay",
+        "backend",
+        "duplicate",
+        "scalar",
+        "self",
+        "version",
+        "env",
+        "parallel",
+    ] {
+        let mut changed = normal.clone();
+        match change {
+            "initial" => {
+                changed.env_vars.clear();
+                changed.parallelism = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+            }
+            "command" => changed.agent_command_override = Some("/bin/sh".into()),
+            "relay" => changed.relay_url = "ws://127.0.0.1:9".into(),
+            "backend" => {
+                changed.backend = BackendKind::Provider {
+                    id: "PRIVATE_CANARY".into(),
+                    config: Value::Null,
+                }
+            }
+            "scalar" => changed.runtime_pid = Some(normal_pid + 1),
+            "self" => changed.persona_id = Some(core::TARGET.into()),
+            "version" => changed.persona_source_version = Some("PRIVATE_CANARY".into()),
+            "env" => {
+                changed
+                    .env_vars
+                    .insert("PRIVATE_CANARY".into(), "true".into());
+            }
+            "parallel" => changed.parallelism = 2,
+            _ => {}
+        }
+        let rows = if change == "duplicate" {
+            vec![changed.clone(), changed]
+        } else {
+            vec![changed]
+        };
+        save_managed_agents(&handle, &rows).unwrap();
+        assert!(
+            super::super::stop_managed_agent_guarded_in(
+                core::TARGET,
+                &handle,
+                &state,
+                (&stop_guard, &|| Ok(()))
+            )
+            .is_err(),
+            "{change}"
+        );
+        assert!(state
+            .managed_agent_processes
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none());
+    }
+    save_managed_agents(&handle, std::slice::from_ref(&normal)).unwrap();
+    {
+        let mut pairs = state.managed_agent_processes.lock().unwrap();
+        let runtime = pairs.remove(&key).unwrap();
+        let foreign = ManagedAgentRuntimeKey::new(core::TARGET, "ws://127.0.0.1:9").unwrap();
+        pairs.insert(foreign.clone(), runtime);
+        assert!(
+            check_restore_target(&handle, std::slice::from_ref(&normal), &pairs, true).is_err()
+        );
+        let runtime = pairs.remove(&foreign).unwrap();
+        pairs.insert(key.clone(), runtime);
+        let child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        pairs.insert(
+            foreign.clone(),
+            ManagedAgentPairRuntime::starting(crate::managed_agents::ManagedAgentProcess {
+                child,
+                log_path: home.join("inert-extra-pair.log"),
+                spawn_config:
+                    crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                        &normal,
+                        &[],
+                        &[],
+                        core::RELAY,
+                        &Default::default(),
+                        false,
+                    ),
+                setup_mode: false,
+                adapter_availability: None,
+                start_nonce: "extra-owned-pair".into(),
+            }),
+        );
+        let refused =
+            check_restore_target(&handle, std::slice::from_ref(&normal), &pairs, true).is_err();
+        let mut extra = pairs.remove(&foreign).unwrap();
+        extra.child.kill().unwrap();
+        extra.child.wait().unwrap();
+        assert!(refused, "multiple target pairs must stay refused");
+    }
+    let receipt_dir = data.join("agents/agent-pids");
+    fs::create_dir_all(&receipt_dir).unwrap();
+    let foreign_receipt = receipt_dir.join(format!("{}-foreign.json", core::TARGET));
+    fs::write(&foreign_receipt, b"PRIVATE_CANARY").unwrap();
+    let refused = super::super::stop_managed_agent_guarded_in(
+        core::TARGET,
+        &handle,
+        &state,
+        (&stop_guard, &|| Ok(())),
+    )
+    .is_err();
+    fs::remove_file(&foreign_receipt).unwrap();
+    assert!(refused, "unexpected receipt must stay refused");
+    // Real store/runtime waits may invalidate authorization before termination.
+    for (runtime_wait, error) in [
+        (false, "scope_mismatch"),
+        (true, "invalid_request"),
+        (false, "not_ready"),
+    ] {
+        let held_store = (!runtime_wait).then(|| state.managed_agents_store_lock.lock().unwrap());
+        let held_runtime = runtime_wait.then(|| state.managed_agent_processes.lock().unwrap());
+        let worker_handle = handle.clone();
+        let denied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_denied = denied.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let worker_state = worker_handle.state::<AppState>();
+            let authorize = || {
+                if worker_denied.load(Ordering::Acquire) {
+                    Err(error.into())
+                } else {
+                    Ok(())
+                }
+            };
+            let guard = |rows:&[ManagedAgentRecord],runtimes:&HashMap<ManagedAgentRuntimeKey,ManagedAgentPairRuntime>| {
+                check_restore_target(&worker_handle, rows, runtimes, true)?;
+                authorize()
+            };
+            entered_tx.send(()).unwrap();
+            done_tx
+                .send(
+                    super::super::stop_managed_agent_guarded_in(
+                        core::TARGET,
+                        &worker_handle,
+                        &worker_state,
+                        (&guard, &authorize),
+                    )
+                    .map(drop),
+                )
+                .unwrap();
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        denied.store(true, Ordering::Release);
+        drop((held_store, held_runtime));
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .err()
+                .as_deref(),
+            Some(error)
+        );
+        worker.join().unwrap();
+        assert!(state
+            .managed_agent_processes
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none());
+    }
+    {
+        let admission = crate::managed_agents::AdmissionSnapshot::capture(&state);
+        let _transition = state.managed_agent_runtime_transition.lock().unwrap();
+        let stopping =
+            |rows: &[ManagedAgentRecord],
+             runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>| {
+                check_restore_target(&handle, rows, runtimes, true)
+            };
+        let stopped = super::super::stop_managed_agent_guarded_in(
+            core::TARGET,
+            &handle,
+            &state,
+            (&stopping, &|| Ok(())),
+        );
+        if stopped.is_err() {
+            // Causal RED cleanup owns only this fixture's inert child.
+            if let Some(mut pair) = state.managed_agent_processes.lock().unwrap().remove(&key) {
+                let _ = pair.child.kill();
+                let _ = pair.child.wait();
+            }
+        }
+        drop(stopped.expect("configured NORMAL must pass the production Stop/restore guard"));
+        assert!(!Path::new(&format!("/proc/{normal_pid}")).exists());
+        let restoring =
+            |rows: &[ManagedAgentRecord],
+             runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>| {
+                check_restore_target(&handle, rows, runtimes, false)
+            };
+        let response = tauri::async_runtime::block_on(
+            super::super::super::agent_models::update_managed_agent_guarded_with_finish_in(
+                restore_input(),
+                &handle,
+                &state,
+                (&restoring, &|| Ok(())),
+                Some(&admission),
+                |saved, _| async move { Ok(saved.unreconciled_for_test()) },
+            ),
+        )
+        .expect("stopped NORMAL must pass the same production restore guard");
+        discard_update(response).unwrap();
+    }
+    let rows = load_managed_agents(&handle).unwrap();
+    let saved_normal = target_contract(&rows, false).unwrap();
+    assert_eq!(saved_normal.private_key_nsec, normal.private_key_nsec);
+    assert_eq!(saved_normal.auth_tag, normal.auth_tag);
+    assert!(state.managed_agent_processes.lock().unwrap().is_empty());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

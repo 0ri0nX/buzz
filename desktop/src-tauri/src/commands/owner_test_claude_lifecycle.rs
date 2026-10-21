@@ -302,6 +302,22 @@ fn check_target<R: tauri::Runtime>(
     check_target_with_initial(app, rows, runtimes, setup, stopping, false)
 }
 
+fn check_restore_target<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    rows: &[ManagedAgentRecord],
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    stopping: bool,
+) -> Result<(), String> {
+    match check_target(app, rows, runtimes, true, stopping) {
+        // Both configurations are separately exact. Never catch ownership,
+        // receipt or storage failures, and never admit the unconfigured state.
+        Err(error) if error == "target_contract_mismatch" => {
+            check_target(app, rows, runtimes, false, stopping)
+        }
+        result => result,
+    }
+}
+
 fn check_target_with_initial<R: tauri::Runtime>(
     app: &AppHandle<R>,
     rows: &[ManagedAgentRecord],
@@ -581,7 +597,11 @@ pub(crate) fn execute(
                     ManagedAgentRuntimeKey,
                     ManagedAgentPairRuntime,
                 >| {
-                    check_target_with_initial(app, rows, runtimes, !to_setup, false, to_setup)?;
+                    if to_setup {
+                        check_target_with_initial(app, rows, runtimes, false, false, true)?;
+                    } else {
+                        check_restore_target(app, rows, runtimes, false)?;
+                    }
                     if to_setup {
                         verify_setup()?;
                     }
@@ -614,7 +634,7 @@ pub(crate) fn execute(
                             ManagedAgentRuntimeKey,
                             ManagedAgentPairRuntime,
                         >| {
-                            check_target(app, rows, runtimes, true, true)?;
+                            check_restore_target(app, rows, runtimes, true)?;
                             authorize()
                         };
                         super::stop_managed_agent_guarded_in(

@@ -36,11 +36,20 @@ socket admission still apply. No caller-selected command/path/provider/env/key.
 5. Root requires complete new receipt validation and child/pipe settlement.
    `stop_restore_saved_claude_normal` uses normal Stop then guarded normal Update.
    Stop waits/reaps its owned outer child; it does not independently certify the
-   inner setup protocol/pipe settlement. Restore requires exact persisted setup
-   configuration, stopped, no conflicting target pairs/receipts. A before-save
-   restore failure leaves stopped setup configuration. A post-save ancillary
+   inner protocol/pipe settlement. Restore requires an exact persisted configured
+   SETUP or NORMAL, stopped, no conflicting target pairs/receipts. A before-save
+   restore failure leaves the stopped source configuration. A post-save ancillary
    failure can leave stopped NORMAL instead: the outcome remains Unknown, no
    automatic retry or assertion that every failure leaves SETUP is made.
+   Stop/restore also accepts a later separately exact configured NORMAL lifecycle:
+   the shared production guard validates the full configured SETUP or NORMAL
+   contract, with identical stopping/receipt/PID/unique-pair checks, both before
+   and after normal runtime synchronization and again before the stopped update.
+   Only a static-contract mismatch permits checking the other exact mode;
+   ownership, receipt, storage, scope and expiry failures never become acceptance.
+   Initial unconfigured env{} is never accepted by Stop/restore. Outer identity,
+   workspace and transition exclusion prevent a mode change across this sequence.
+   This supports a new known normal lifecycle, not replay of any consumed Unknown.
 6. Root binds this NEW receipt digest, compiles/prepares normal worker inputs,
    and only then requests `start_saved_claude_normal`. It restores/starts exactly
    `/usr/bin/python3.13 -IS /home/orionx/.local/state/rowvia-saved-claude-normal/buzz-worker/run`.
