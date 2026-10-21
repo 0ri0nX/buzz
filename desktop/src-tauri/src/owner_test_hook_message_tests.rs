@@ -1,6 +1,134 @@
 // Included inside owner_test_hook::tests to share the production validator and ledger fixtures.
 
 #[test]
+fn saved_claude_membership_is_pending_deadlined_and_reserved_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("membership.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    let hook = Hook {
+        ledger: Mutex::new(Ledger::default()),
+        cancel: CancellationToken::new(),
+        socket: SocketGuard {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            cleanup_attempted: AtomicBool::new(false),
+        },
+    };
+    let mut r = request();
+    r.operation = "attach_saved_claude_developer".into();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    r.arguments = serde_json::json!({"expiresAt":now+60_000})
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(pending_claude_attachment(&hook, &r.request_id, true).is_err());
+    assert!(matches!(
+        hook.ledger.lock().unwrap().admit(&r),
+        Admission::Dispatch(_)
+    ));
+    assert!(pending_claude_attachment(&hook, &r.request_id, true).is_err());
+    hook.ledger
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&r.request_id)
+        .unwrap()
+        .deadline = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+    assert!(pending_claude_attachment(&hook, &r.request_id, false).is_ok());
+    assert!(pending_claude_attachment(&hook, &r.request_id, true).is_ok());
+    assert!(pending_claude_attachment(&hook, &r.request_id, true).is_err());
+    assert!(pending_claude_attachment(&hook, &r.request_id, false).is_ok());
+    hook.ledger
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&r.request_id)
+        .unwrap()
+        .request
+        .arguments
+        .insert("expiresAt".into(), serde_json::json!(now));
+    assert!(pending_claude_attachment(&hook, &r.request_id, false).is_err());
+    hook.cancel.cancel();
+    assert!(pending_claude_attachment(&hook, &r.request_id, false).is_err());
+}
+
+#[test]
+fn saved_claude_and_codex_pair_matrix_remains_exact_for_send_and_read() {
+    let developer = "31986c38-6676-4d6f-a4ba-ed833926d0d5";
+    let diagnostic = "fd0cc15d-c216-442f-bac2-837dd6fddbbd";
+    let codex = "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78";
+    let claude = "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c";
+    let other = "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87";
+    for channel in [developer, diagnostic] {
+        for recipient in [codex, claude, other] {
+            let allowed = (channel == developer && recipient != other)
+                || (channel == diagnostic && recipient == other);
+            let mut r = test_message_request((channel, recipient));
+            assert_eq!(
+                validate_request(&serde_json::to_vec(&r).unwrap()).is_ok(),
+                allowed
+            );
+            r.operation = "read_existing_test_channel".into();
+            r.arguments =
+                serde_json::json!({"channelId":channel,"recipientPubkey":recipient,"limit":20})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert_eq!(
+                validate_request(&serde_json::to_vec(&r).unwrap()).is_ok(),
+                allowed
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_claude_lifecycle_operations_are_closed_and_expiring() {
+    for operation in [
+        "attach_saved_claude_developer",
+        "prepare_saved_claude_setup",
+        "start_saved_claude_setup",
+        "stop_restore_saved_claude_normal",
+        "start_saved_claude_normal",
+    ] {
+        let mut r = request();
+        r.operation = operation.into();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        r.arguments = serde_json::json!({"expiresAt": now + 60_000})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            validate_request(&serde_json::to_vec(&r).unwrap()).is_ok(),
+            "{operation}"
+        );
+        for (field, value) in [
+            ("command", serde_json::json!("/bin/sh")),
+            ("path", serde_json::json!("/tmp/other")),
+            ("pubkey", serde_json::json!("f".repeat(64))),
+            ("expiresAt", serde_json::json!(now)),
+            ("expiresAt", serde_json::json!(now + 121_000)),
+        ] {
+            let mut invalid = r.clone();
+            invalid.arguments.insert(field.into(), value);
+            assert!(matches!(
+                validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Code::InvalidRequest)
+            ));
+        }
+    }
+}
+
+#[test]
 fn fixed_claude_create_contract_is_native_closed_expiring_and_owner_scoped() {
     let mut r = request();
     r.operation = "create_stopped_claude_developer".into();
@@ -230,7 +358,7 @@ fn existing_test_message_contract_denies_wrong_pairs_scope_threads_and_expiry() 
             Value::String(
                 TEST_MESSAGE_TARGETS
                     .iter()
-                    .find(|pair| **pair != target)
+                    .find(|pair| pair.0 != target.0)
                     .unwrap()
                     .1
                     .into(),

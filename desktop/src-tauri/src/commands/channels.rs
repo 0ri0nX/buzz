@@ -603,14 +603,36 @@ pub async fn add_channel_members(
     expected_signer_pubkey: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    add_channel_members_guarded(
+        channel_id,
+        pubkeys,
+        role,
+        expected_relay_url,
+        expected_signer_pubkey,
+        &state,
+        &|| Ok(()),
+    )
+    .await
+}
+
+pub(crate) async fn add_channel_members_guarded(
+    channel_id: String,
+    pubkeys: Vec<String>,
+    role: Option<String>,
+    expected_relay_url: Option<String>,
+    expected_signer_pubkey: Option<String>,
+    state: &AppState,
+    guard: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<serde_json::Value, String> {
     let uuid = parse_channel_uuid(&channel_id)?;
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay_api_base_url_with_override(state);
     assert_expected_relay_scope(expected_relay_url.as_deref(), &relay_base)?;
     let signing_keys = state.signing_keys()?;
     assert_expected_signer(
         expected_signer_pubkey.as_deref(),
         &signing_keys.public_key().to_hex(),
     )?;
+    guard()?;
     let role_str = match role.as_deref() {
         Some("admin") => Some("admin"),
         Some("bot") => Some("bot"),
@@ -630,7 +652,16 @@ pub async fn add_channel_members(
                 continue;
             }
         };
-        match submit_event_at_with_keys(builder, &state, &relay_base, &signing_keys).await {
+        guard()?;
+        match crate::relay::submit_event_at_with_keys_guarded(
+            builder,
+            state,
+            &relay_base,
+            &signing_keys,
+            guard,
+        )
+        .await
+        {
             Ok(_) => added.push(pubkey.clone()),
             Err(e) => errors.push(serde_json::json!({"pubkey": pubkey, "error": e})),
         }

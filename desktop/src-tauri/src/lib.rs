@@ -939,6 +939,8 @@ pub fn run() {
             #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
             owner_test_hook::rowvia_owner_test_reply,
             #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+            owner_test_hook::claude_membership::rowvia_owner_test_claude_membership,
+            #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
             owner_test_hook::rowvia_owner_test_saved_connector_context,
             #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
             owner_test_hook::rowvia_owner_test_phase,

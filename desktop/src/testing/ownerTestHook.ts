@@ -1,11 +1,14 @@
 import { listen } from "@tauri-apps/api/event";
 import { normalizeRelayUrl } from "@/features/communities/relayProbe";
+import { attachManagedAgentToChannel } from "@/features/agents/channelAgents";
 import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { relayClient } from "@/shared/api/relayClient";
+import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import {
   addChannelMembers,
   getRelayWsUrl,
   invokeTauri,
+  listManagedAgents,
 } from "@/shared/api/tauri";
 import { createChannel, getChannelMembers } from "@/shared/api/tauriChannels";
 import { inspectCerberusProposalUi } from "./cerberusProposalUiDiagnostic";
@@ -26,6 +29,8 @@ import {
 } from "./ownerTestHookPhases";
 import {
   OWNER_TEST_SCHEMA,
+  OWNER_TEST_CLAUDE_PUBKEY,
+  OWNER_TEST_CLAUDE_CHANNEL,
   ownerTestRequestSchema,
   ownerTestMessageUnexpired,
   ownerTestRuntimeProjectionSchema,
@@ -184,6 +189,56 @@ export function createOwnerTestHandler(
       const snapshot = inspectCerberusProposalUi(request.expected);
       if (!snapshot) throw new HookFailure("not_ready");
       return snapshot;
+    }
+    if (request.operation === "attach_saved_claude_developer") {
+      if (!ownerTestMessageUnexpired(request.arguments.expiresAt))
+        throw new HookFailure("invalid_request");
+      // Listing may reap exited pairs, so failures from this point are Unknown.
+      markMutation();
+      const agents = await listManagedAgents();
+      await assertScope(request);
+      const matches = agents.filter(
+        (agent) => agent.pubkey === OWNER_TEST_CLAUDE_PUBKEY,
+      );
+      const agent = matches[0];
+      if (
+        matches.length !== 1 ||
+        !agent ||
+        agent.status !== "stopped" ||
+        agent.backend.type !== "local" ||
+        agent.startOnAppLaunch !== false
+      )
+        throw new HookFailure("not_ready");
+      if (!ownerTestMessageUnexpired(request.arguments.expiresAt))
+        throw new HookFailure("invalid_request");
+      const result = await attachManagedAgentToChannel(
+        OWNER_TEST_CLAUDE_CHANNEL,
+        {
+          agent,
+          role: "bot",
+          ensureRunning: false,
+          expectedRelayUrl: request.expected.relayUrl,
+          expectedSignerPubkey: request.expected.ownerPubkey,
+          writeMembership: async () => {
+            const record = beginChannelMembershipWrite();
+            const membership = await invokeTauri<{
+              added: string[];
+              errors: { pubkey: string; error: string }[];
+            }>("rowvia_owner_test_claude_membership", {
+              requestId: request.requestId,
+            });
+            record(OWNER_TEST_CLAUDE_CHANNEL);
+            return membership;
+          },
+        },
+      );
+      await assertScope(request);
+      return {
+        pubkey: OWNER_TEST_CLAUDE_PUBKEY,
+        channelId: OWNER_TEST_CLAUDE_CHANNEL,
+        membershipAdded: result.membershipAdded,
+        started: false,
+      };
     }
     if (request.operation === "inspect_managed_agent_runtime") {
       const target = request.arguments;

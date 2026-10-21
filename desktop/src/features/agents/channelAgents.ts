@@ -36,6 +36,10 @@ export type AttachManagedAgentToChannelInput = {
   agent: ManagedAgent;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
+  expectedRelayUrl?: string;
+  expectedSignerPubkey?: string;
+  /** Narrow test adapter; ordinary attachment always uses addChannelMembers. */
+  writeMembership?: typeof addChannelMembers;
   /**
    * When set, a needed start/deploy is handed to this callback instead of
    * being awaited: the attach resolves as soon as the membership write lands
@@ -175,10 +179,16 @@ export async function attachManagedAgentToChannel(
   const role = input.role ?? "bot";
   const ensureRunning = input.ensureRunning ?? true;
   const agentPubkey = normalizePubkey(input.agent.pubkey);
-  const membershipResult = await addChannelMembers({
+  const membershipResult = await (input.writeMembership ?? addChannelMembers)({
     channelId,
     pubkeys: [input.agent.pubkey],
     role,
+    ...(input.expectedRelayUrl === undefined
+      ? {}
+      : { expectedRelayUrl: input.expectedRelayUrl }),
+    ...(input.expectedSignerPubkey === undefined
+      ? {}
+      : { expectedSignerPubkey: input.expectedSignerPubkey }),
   });
   const membershipError = membershipResult.errors.find(
     (error) => normalizePubkey(error.pubkey) === agentPubkey,

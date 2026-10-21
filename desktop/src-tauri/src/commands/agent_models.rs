@@ -699,6 +699,12 @@ use databricks::{discover_databricks_models, DatabricksAuthIntent};
 #[path = "agent_models_update.rs"]
 mod update;
 pub use update::update_managed_agent;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(super) use update::update_managed_agent_guarded_in;
+#[cfg(test)]
+pub(super) use update::update_managed_agent_guarded_with_finish_in;
+#[cfg(test)]
+pub(super) use update::update_managed_agent_local_guarded_in;
 pub(super) use update::{flush_managed_agent_policy, managed_agent_access_policy_changed};
 
 // ── Model normalization ───────────────────────────────────────────────────────

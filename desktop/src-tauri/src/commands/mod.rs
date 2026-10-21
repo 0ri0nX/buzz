@@ -14,12 +14,16 @@ mod agent_update_rollback;
 mod agents;
 #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
 pub(crate) use agents::owner_test_claude_create;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(crate) use agents::owner_test_claude_lifecycle;
 mod bestie;
 mod canvas;
 mod channel_reconnect_repair;
 mod channel_templates;
 mod channel_window;
 mod channels;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(crate) use channels::add_channel_members_guarded;
 mod clipboard;
 mod dms;
 mod engrams;

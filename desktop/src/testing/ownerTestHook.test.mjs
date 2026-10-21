@@ -278,7 +278,148 @@ const existingTestTargets = [
     "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
     "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
   ],
+  [
+    "31986c38-6676-4d6f-a4ba-ed833926d0d5",
+    "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c",
+  ],
 ];
+
+test("saved Claude exact pair is admitted without replacing Codex", async (t) => {
+  for (const target of [existingTestTargets[0], existingTestTargets[2]]) {
+    reset();
+    const item = existingMessageRequest(target);
+    setNativeScope(item);
+    mockExistingMembership(item);
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    assert.equal((await handler(item)).status, "ok");
+    const send = calls.find(
+      ({ command }) => command === "send_channel_message",
+    );
+    assert.deepEqual(send.args.mentionPubkeys, [target[1]]);
+    assert.equal(send.args.parentEventId, null);
+  }
+});
+
+test("saved Claude attach operation is closed and never starts", async (t) => {
+  reset();
+  const item = {
+    ...nativeStatusRequest(),
+    operation: "attach_saved_claude_developer",
+    arguments: { expiresAt: Date.now() + 60_000 },
+  };
+  setNativeScope(item);
+  nativeOverrides.set("list_managed_agents", () => [
+    {
+      pubkey: existingTestTargets[2][1],
+      name: "Rowvia Developer Claude",
+      status: "stopped",
+      backend: { type: "local" },
+      start_on_app_launch: false,
+    },
+  ]);
+  membersResult = { added: [existingTestTargets[2][1]], errors: [] };
+  nativeOverrides.set(
+    "rowvia_owner_test_claude_membership",
+    () => membersResult,
+  );
+  const handler = createOwnerTestHandler(() => {});
+  t.after(handler.dispose);
+  const result = await handler(item);
+  assert.deepEqual(result.result, {
+    pubkey: existingTestTargets[2][1],
+    channelId: existingTestTargets[2][0],
+    membershipAdded: true,
+    started: false,
+  });
+  const add = calls.find(
+    ({ command }) => command === "rowvia_owner_test_claude_membership",
+  );
+  assert.deepEqual(add.args, { requestId: item.requestId });
+  assert.equal(
+    calls.some(({ command }) => command === "add_channel_members"),
+    false,
+  );
+  assert.equal(
+    calls.some(({ command }) => /start|create_managed|deploy/.test(command)),
+    false,
+  );
+});
+
+test("saved Claude attach refuses selectors, late expiry and drift without membership or starts", async (t) => {
+  for (const failure of [
+    "selector",
+    "expiry",
+    "owner",
+    "relay",
+    "running",
+    "autostart",
+    "duplicate",
+    "native",
+  ]) {
+    const realNow = Date.now;
+    reset();
+    const item = {
+      ...nativeStatusRequest(),
+      operation: "attach_saved_claude_developer",
+      arguments: { expiresAt: Date.now() + 60_000 },
+    };
+    setNativeScope(item);
+    if (failure === "selector") item.arguments.command = "/bin/sh";
+    nativeOverrides.set("list_managed_agents", () => {
+      if (failure === "expiry") Date.now = () => realNow() + 120_000;
+      if (failure === "owner") identity = "f".repeat(64);
+      if (failure === "relay") relay = "wss://foreign.invalid";
+      const agent = {
+        pubkey: existingTestTargets[2][1],
+        backend: { type: "local" },
+        status: failure === "running" ? "running" : "stopped",
+        start_on_app_launch: failure === "autostart",
+      };
+      return failure === "duplicate" ? [agent, agent] : [agent];
+    });
+    nativeOverrides.set("rowvia_owner_test_claude_membership", () => {
+      throw new Error("nsec1_RAW_ERROR_AUTH_CANARY");
+    });
+    const handler = createOwnerTestHandler(() => {});
+    t.after(handler.dispose);
+    let response;
+    try {
+      response = await handler(item);
+    } finally {
+      Date.now = realNow;
+    }
+    assert.notEqual(response.status, "ok", failure);
+    assert.equal(JSON.stringify(response).includes("CANARY"), false);
+    assert.equal(
+      calls.filter(
+        ({ command }) => command === "rowvia_owner_test_claude_membership",
+      ).length,
+      failure === "native" ? 1 : 0,
+      failure,
+    );
+    assert.equal(
+      calls.some(({ command }) => /start|create_managed|deploy/.test(command)),
+      false,
+    );
+  }
+});
+
+test("saved Claude pair matrix preserves exact send/read admission", async () => {
+  const { ownerTestRequestSchema } = await import("./ownerTestHookProtocol.ts");
+  for (const channel of [
+    existingTestTargets[0][0],
+    existingTestTargets[1][0],
+  ]) {
+    for (const target of existingTestTargets) {
+      const allowed = channel === target[0];
+      for (const build of [existingMessageRequest, existingReadRequest]) {
+        const item = build([channel, target[1]]);
+        assert.equal(ownerTestRequestSchema.safeParse(item).success, allowed);
+      }
+    }
+  }
+});
 
 function existingMessageRequest(target = existingTestTargets[0]) {
   return {
@@ -329,7 +470,7 @@ test("existing test readback returns bounded signed root/reply events through no
     events = Array.from({ length: 21 }, (_, index) => ({
       kind: 9,
       id: index.toString(16).padStart(64, "0"),
-      pubkey: target[1],
+      pubkey: index % 2 === 0 ? existingTestTargets[0][1] : target[1],
       sig: "e".repeat(128),
       content: "automatic reply",
       created_at: 2,

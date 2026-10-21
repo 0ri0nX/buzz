@@ -6,3 +6,7 @@ mod contract;
 #[path = "../../src/commands/owner_test_claude_create_core.rs"]
 #[cfg(test)]
 mod claude_create_contract;
+
+#[path = "../../src/commands/owner_test_claude_lifecycle_core.rs"]
+#[cfg(test)]
+mod claude_lifecycle_contract;

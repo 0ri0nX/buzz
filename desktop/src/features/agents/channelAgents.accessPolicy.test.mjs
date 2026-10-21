@@ -1,7 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyReusableAgentAccessPolicy } from "./channelAgents.ts";
+import {
+  applyReusableAgentAccessPolicy,
+  attachManagedAgentToChannel,
+} from "./channelAgents.ts";
+
+test("stopped attachment preserves native scope guards and optional narrow writer without start", async (t) => {
+  const calls = [];
+  t.after(
+    installTauriInvoke((command, args) => {
+      calls.push([command, args]);
+      assert.equal(command, "add_channel_members");
+      return Promise.resolve({ added: [AGENT_PUBKEY], errors: [] });
+    }),
+  );
+  const agent = managedAgent({ status: "stopped", backend: { type: "local" } });
+  const scope = {
+    expectedRelayUrl: "wss://relay.example",
+    expectedSignerPubkey: ALLOWED_PUBKEY,
+  };
+  const result = await attachManagedAgentToChannel("fixed-channel", {
+    agent,
+    ensureRunning: false,
+    ...scope,
+  });
+  assert.deepEqual(calls, [
+    [
+      "add_channel_members",
+      {
+        channelId: "fixed-channel",
+        pubkeys: [AGENT_PUBKEY],
+        role: "bot",
+        ...scope,
+      },
+    ],
+  ]);
+  assert.equal(result.started, false);
+  calls.length = 0;
+  let writes = 0;
+  const guarded = await attachManagedAgentToChannel("fixed-channel", {
+    agent,
+    ensureRunning: false,
+    ...scope,
+    writeMembership: async (input) => {
+      writes++;
+      assert.equal(input.expectedSignerPubkey, ALLOWED_PUBKEY);
+      return { added: [AGENT_PUBKEY], errors: [] };
+    },
+  });
+  assert.equal(writes, 1);
+  assert.equal(guarded.started, false);
+  assert.deepEqual(calls, []);
+});
 
 const AGENT_PUBKEY = "a".repeat(64);
 const ALLOWED_PUBKEY = "b".repeat(64);

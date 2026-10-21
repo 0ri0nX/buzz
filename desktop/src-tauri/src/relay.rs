@@ -669,6 +669,9 @@ mod get;
 pub use get::get_relay_json;
 
 mod submit;
+pub(crate) use submit::submit_event_at_with_keys_guarded;
+#[cfg(test)]
+pub(crate) use submit::submit_signed_event_guarded_after_admission;
 pub use submit::{
     submit_event, submit_event_at_created_at, submit_event_at_with_keys,
     submit_event_with_keys_created_at, submit_signed_event_at_with_keys, SubmitEventResponse,

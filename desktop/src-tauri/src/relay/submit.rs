@@ -19,16 +19,40 @@ pub async fn submit_signed_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    submit_signed_event_guarded_after_admission(
+        event,
+        state,
+        api_base_url,
+        keys,
+        &|| Ok(()),
+        crate::relay_admission::wait_for_rate_limit(),
+    )
+    .await
+}
+
+pub(crate) async fn submit_signed_event_guarded_after_admission<F>(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+    guard: &(dyn Fn() -> Result<(), String> + Sync),
+    admission: F,
+) -> Result<SubmitEventResponse, String>
+where
+    F: std::future::Future<Output = ()>,
+{
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
-    crate::relay_admission::wait_for_rate_limit().await;
+    guard()?;
+    admission.await;
+    guard()?;
     let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "relay event submit")?;
     let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
 
-    let response = build_authenticated_relay_request(
+    let request = build_authenticated_relay_request(
         &state.http_client,
         Method::POST,
         &url,
@@ -36,10 +60,12 @@ pub async fn submit_signed_event_at_with_keys(
         Some(body_bytes),
         None,
         None,
-    )
-    .send()
-    .await
-    .map_err(|e| classify_request_error(&e))?;
+    );
+    guard()?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| classify_request_error(&e))?;
 
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);
@@ -64,10 +90,28 @@ pub async fn submit_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    submit_event_at_with_keys_guarded(builder, state, api_base_url, keys, &|| Ok(())).await
+}
+
+pub(crate) async fn submit_event_at_with_keys_guarded(
+    builder: nostr::EventBuilder,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+    guard: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<SubmitEventResponse, String> {
     let event = builder
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign event: {e}"))?;
-    submit_signed_event_at_with_keys(&event, state, api_base_url, keys).await
+    submit_signed_event_guarded_after_admission(
+        &event,
+        state,
+        api_base_url,
+        keys,
+        guard,
+        crate::relay_admission::wait_for_rate_limit(),
+    )
+    .await
 }
 
 /// Build and submit an event to the currently active workspace relay.

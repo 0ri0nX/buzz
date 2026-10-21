@@ -145,22 +145,107 @@ pub async fn update_managed_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
-    // Captured before Phase 1 stops the runtime for an access-policy change: a
-    // community removed while this update runs refuses the restart.
-    let admission = crate::managed_agents::AdmissionSnapshot::capture(&state);
+    update_managed_agent_guarded_in(input, &app, &state, (&|_, _| Ok(()), &|| Ok(())), None).await
+}
+
+pub(in crate::commands) async fn update_managed_agent_guarded_in(
+    input: UpdateManagedAgentRequest,
+    app: &AppHandle,
+    state: &AppState,
+    checks: (
+        &super::super::agents::ManagedAgentOperationGuard<'_>,
+        &(dyn Fn() -> Result<(), String> + Sync),
+    ),
+    admission: Option<&crate::managed_agents::AdmissionSnapshot>,
+) -> Result<UpdateManagedAgentResponse, String> {
+    update_managed_agent_guarded_with_finish_in(
+        input,
+        app,
+        state,
+        checks,
+        admission,
+        |saved, admission| finish_managed_agent_update(saved, app, state, admission),
+    )
+    .await
+}
+
+pub(in crate::commands) async fn update_managed_agent_guarded_with_finish_in<R, F, U>(
+    input: UpdateManagedAgentRequest,
+    app: &AppHandle<R>,
+    state: &AppState,
+    checks: (
+        &super::super::agents::ManagedAgentOperationGuard<'_>,
+        &(dyn Fn() -> Result<(), String> + Sync),
+    ),
+    admission: Option<&crate::managed_agents::AdmissionSnapshot>,
+    finish: F,
+) -> Result<UpdateManagedAgentResponse, String>
+where
+    R: tauri::Runtime,
+    F: FnOnce(SavedAgentUpdate, crate::managed_agents::AdmissionSnapshot) -> U,
+    U: std::future::Future<Output = Result<UpdateManagedAgentResponse, String>>,
+{
+    // Fixed stopped workflows already own transition: never capture it again.
+    // Ordinary callers still capture before the local save exactly as before.
+    let admission = admission
+        .cloned()
+        .unwrap_or_else(|| crate::managed_agents::AdmissionSnapshot::capture(state));
+    let saved = update_managed_agent_local_guarded_in(input, app, state, checks)?;
+    finish(saved, admission).await
+}
+
+type AgentUpdateSyncParams = (
+    Keys,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+pub(in crate::commands) struct SavedAgentUpdate {
+    summary: crate::managed_agents::ManagedAgentSummary,
+    sync_params: Option<AgentUpdateSyncParams>,
+    rollback: Option<AgentUpdateRollback>,
+    access_policy_changed: bool,
+    access_restart_relays: Vec<String>,
+}
+
+#[cfg(test)]
+impl SavedAgentUpdate {
+    pub(in crate::commands) fn unreconciled_for_test(self) -> UpdateManagedAgentResponse {
+        UpdateManagedAgentResponse {
+            agent: self.summary,
+            profile_sync_error: None,
+        }
+    }
+}
+
+pub(in crate::commands) fn update_managed_agent_local_guarded_in<R: tauri::Runtime>(
+    input: UpdateManagedAgentRequest,
+    app: &AppHandle<R>,
+    state: &AppState,
+    checks: (
+        &super::super::agents::ManagedAgentOperationGuard<'_>,
+        &(dyn Fn() -> Result<(), String> + Sync),
+    ),
+) -> Result<SavedAgentUpdate, String> {
+    let (guard, before_save) = checks;
     // Phase 1: local save (synchronous, under lock)
-    let (mut summary, sync_params, rollback, access_policy_changed, access_restart_relays) = {
+    let (summary, sync_params, rollback, access_policy_changed, access_restart_relays) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        before_save()?;
+        let mut records = load_managed_agents(app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
+        guard(&records, &runtimes)?;
         let (_, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
+            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(app));
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
@@ -209,7 +294,7 @@ pub async fn update_managed_agent(
         // rules.
         let mut inherit_transition = false;
         if let Some(agent_command) = input.agent_command {
-            let personas = load_personas(&app).unwrap_or_default();
+            let personas = load_personas(app).unwrap_or_default();
             inherit_transition = crate::managed_agents::apply_agent_command_update(
                 record,
                 &personas,
@@ -290,11 +375,11 @@ pub async fn update_managed_agent(
             if access_restart_relays.is_empty() && record.runtime_pid.is_some() {
                 access_restart_relays.push(crate::relay::effective_agent_relay_url(
                     &record.relay_url,
-                    &relay_ws_url_with_override(&state),
+                    &relay_ws_url_with_override(state),
                 ));
             }
             if !access_restart_relays.is_empty() {
-                crate::managed_agents::stop_managed_agent_process(&app, record, &mut runtimes)?;
+                crate::managed_agents::stop_managed_agent_process(app, record, &mut runtimes)?;
             }
         }
 
@@ -323,7 +408,8 @@ pub async fn update_managed_agent(
 
         stamp_record_updated_at(record, applied);
 
-        save_managed_agents(&app, &records)?;
+        before_save()?;
+        save_managed_agents(app, &records)?;
 
         let record = records
             .iter()
@@ -333,7 +419,7 @@ pub async fn update_managed_agent(
         // Publish the edit to the relay. After-save, inside the lock, before
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.
-        super::super::agents::retain_managed_agent_pending(&app, &state, record);
+        super::super::agents::retain_managed_agent_pending(app, state, record);
 
         let sync_params = if name_changed {
             let agent_keys = Keys::parse(&record.private_key_nsec)
@@ -342,13 +428,13 @@ pub async fn update_managed_agent(
             // an explicit per-agent relay wins; empty falls back to workspace.
             let relay_url = crate::relay::effective_agent_relay_url(
                 &record.relay_url,
-                &relay_ws_url_with_override(&state),
+                &relay_ws_url_with_override(state),
             );
             let display_name = record.name.clone();
             // Avatar fallback derives from the EFFECTIVE harness (persona-wins),
             // not the frozen snapshot, so an inherited harness picks the right
             // default avatar.
-            let personas = load_personas(&app).unwrap_or_default();
+            let personas = load_personas(app).unwrap_or_default();
             let effective_command = crate::managed_agents::record_agent_command(record, &personas);
             let avatar_url = record
                 .avatar_url
@@ -368,7 +454,7 @@ pub async fn update_managed_agent(
             None
         };
 
-        let summary = { super::super::agents::summarize_from_disk(&app, record, &runtimes)? };
+        let summary = { super::super::agents::summarize_from_disk(app, record, &runtimes)? };
         let rollback = name_changed
             .then(|| AgentUpdateRollback::new(previous_record, record, access_policy_changed));
         (
@@ -380,7 +466,30 @@ pub async fn update_managed_agent(
         )
     }; // lock dropped here
 
-    try_regenerate_nest(&app);
+    Ok(SavedAgentUpdate {
+        summary,
+        sync_params,
+        rollback,
+        access_policy_changed,
+        access_restart_relays,
+    })
+}
+
+async fn finish_managed_agent_update(
+    saved: SavedAgentUpdate,
+    app: &AppHandle,
+    state: &AppState,
+    admission: crate::managed_agents::AdmissionSnapshot,
+) -> Result<UpdateManagedAgentResponse, String> {
+    let SavedAgentUpdate {
+        mut summary,
+        sync_params,
+        rollback,
+        access_policy_changed,
+        access_restart_relays,
+    } = saved;
+
+    try_regenerate_nest(app);
 
     // Phase 2: relay sync (async, outside lock). The owner-signed managed
     // policy is security-sensitive: an access reduction must replace the old
@@ -388,14 +497,14 @@ pub async fn update_managed_agent(
     // 30-second retention sweep. The flush remains durable/best-effort; rows a
     // relay does not accept stay pending for the background retry.
     let mut profile_sync_error =
-        crate::managed_agents::persona_events::flush_active_pending_events(&app, &state)
+        crate::managed_agents::persona_events::flush_active_pending_events(app, state)
             .await
             .err()
             .map(|error| format!("managed policy sync failed: {error}"));
     if profile_sync_error.is_none()
         && crate::managed_agents::persona_events::active_pending_event(
-            &app,
-            &state,
+            app,
+            state,
             buzz_core_pkg::kind::KIND_MANAGED_AGENT,
             &summary.pubkey,
         )?
@@ -411,7 +520,7 @@ pub async fn update_managed_agent(
     // authoritative name.
     if let Some((agent_keys, relay_url, display_name, avatar_url, about, auth_tag)) = sync_params {
         if let Err(sync_error) = sync_managed_agent_profile(
-            &state,
+            state,
             &relay_url,
             &agent_keys,
             &display_name,
@@ -424,13 +533,13 @@ pub async fn update_managed_agent(
             let rollback = rollback.ok_or_else(|| {
                 "missing local rollback state after relay profile sync failure".to_string()
             })?;
-            rollback_failed_agent_update(&app, &state, &summary.pubkey, rollback)?;
+            rollback_failed_agent_update(app, state, &summary.pubkey, rollback)?;
             let restart_suffix = if access_restart_relays.is_empty() {
                 String::new()
             } else {
                 match super::super::agents::start_local_agent_pairs_with_preflight(
-                    &app,
-                    &state,
+                    app,
+                    state,
                     &summary.pubkey,
                     &access_restart_relays,
                     &admission,
@@ -456,8 +565,8 @@ pub async fn update_managed_agent(
 
     if !access_restart_relays.is_empty() {
         summary = super::super::agents::start_local_agent_pairs_with_preflight(
-            &app,
-            &state,
+            app,
+            state,
             &summary.pubkey,
             &access_restart_relays,
             &admission,

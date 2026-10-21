@@ -62,6 +62,21 @@ use create_fields::{normalize_relay_mesh, resolve_created_avatar_url, trim_to_op
 #[path = "owner_test_claude_create.rs"]
 pub(crate) mod owner_test_claude_create;
 
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+#[path = "owner_test_claude_lifecycle.rs"]
+pub(crate) mod owner_test_claude_lifecycle;
+
+pub(super) type ManagedAgentOperationGuard<'a> = dyn Fn(
+        &[ManagedAgentRecord],
+        &std::collections::HashMap<
+            crate::managed_agents::ManagedAgentRuntimeKey,
+            crate::managed_agents::ManagedAgentPairRuntime,
+        >,
+    ) -> Result<(), String>
+    + Sync
+    + 'a;
+pub(super) type ManagedAgentAuthorization<'a> = dyn Fn() -> Result<(), String> + Sync + 'a;
+
 #[cfg(feature = "mesh-llm")]
 async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
     app: &AppHandle<R>,
@@ -211,6 +226,37 @@ where
     P: FnOnce(Option<String>) -> F,
     F: std::future::Future<Output = Result<(), String>>,
 {
+    start_local_agent_after_preflight_guarded(
+        app,
+        state,
+        pubkey,
+        expected_relay_url,
+        expected_signer_pubkey,
+        replay_floor_unix,
+        (preflight, None, None),
+    )
+    .await
+}
+
+pub(super) async fn start_local_agent_after_preflight_guarded<R, P, F>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    pubkey: &str,
+    expected_relay_url: Option<&str>,
+    expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    checks: (
+        P,
+        Option<&ManagedAgentOperationGuard<'_>>,
+        Option<&ManagedAgentAuthorization<'_>>,
+    ),
+) -> Result<ManagedAgentSummary, String>
+where
+    R: tauri::Runtime,
+    P: FnOnce(Option<String>) -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let (preflight, guard, authorize) = checks;
     // Captured before mesh preflight: a community removed while it awaits
     // refuses this start below.
     let admission = crate::managed_agents::AdmissionSnapshot::capture(state);
@@ -219,7 +265,17 @@ where
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
+        if let Some(check) = authorize {
+            check()?;
+        }
         let records = load_managed_agents(app)?;
+        if let Some(check) = guard {
+            let runtimes = state
+                .managed_agent_processes
+                .lock()
+                .map_err(|_| "operation_failed")?;
+            check(&records, &runtimes)?;
+        }
         records
             .iter()
             .find(|record| record.pubkey == pubkey)
@@ -278,11 +334,18 @@ where
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
+    if let Some(check) = authorize {
+        check()?;
+    }
     let mut records = load_managed_agents(app)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
+    let personas = load_personas(app).unwrap_or_default();
+    if let Some(check) = guard {
+        check(&records, &runtimes)?;
+    }
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     if record.backend != BackendKind::Local {
         return Err(format!("agent {pubkey} is no longer a local agent"));
@@ -294,7 +357,6 @@ where
     // env-override self-heal rules.
     // Load personas once: used for snapshot application below and summary build
     // at the end — avoids a second disk read for the same file in the same call.
-    let personas = load_personas(app).unwrap_or_default();
     if let Some(persona_id) = record.persona_id.clone() {
         match personas.iter().find(|p| p.id == persona_id) {
             Some(persona) => {
@@ -1093,47 +1155,64 @@ pub async fn stop_managed_agent(
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
-        let mut runtimes = state
-            .managed_agent_processes
-            .lock()
-            .map_err(|error| error.to_string())?;
-
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
-
-        {
-            let record = find_managed_agent_mut(&mut records, &pubkey)?;
-            // Remote agents are stopped via !shutdown @mention from the frontend,
-            // not via this backend command. Reject the call.
-            if record.backend != BackendKind::Local {
-                return Err(
-                    "remote agents are stopped via !shutdown message, not this command".to_string(),
-                );
-            }
-            // Pair-scoped: stops only the active workspace's pair; delete and
-            // the config-restart flows still drain every pair.
-            stop_managed_agent_workspace_pair(&app, record, &mut runtimes)?;
-        }
-        save_managed_agents(&app, &records)?;
-        let record = records
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?;
-        summarize_from_disk(&app, record, &runtimes)
+        stop_managed_agent_guarded_in(&pubkey, &app, &state, (&|_, _| Ok(()), &|| Ok(())))
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+pub(super) fn stop_managed_agent_guarded_in<R: tauri::Runtime>(
+    pubkey: &str,
+    app: &AppHandle<R>,
+    state: &AppState,
+    checks: (
+        &ManagedAgentOperationGuard<'_>,
+        &ManagedAgentAuthorization<'_>,
+    ),
+) -> Result<ManagedAgentSummary, String> {
+    let (guard, authorize) = checks;
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    authorize()?;
+    let mut records = load_managed_agents(app)?;
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+
+    guard(&records, &runtimes)?;
+
+    let (sync_changed, exited_pubkeys) =
+        sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(app));
+    if sync_changed {
+        save_managed_agents(app, &records)?;
+    }
+    for pubkey in &exited_pubkeys {
+        state.clear_agent_session_caches(pubkey);
+    }
+
+    {
+        let record = find_managed_agent_mut(&mut records, pubkey)?;
+        // Remote agents are stopped via !shutdown @mention from the frontend,
+        // not via this backend command. Reject the call.
+        if record.backend != BackendKind::Local {
+            return Err(
+                "remote agents are stopped via !shutdown message, not this command".to_string(),
+            );
+        }
+        // Pair-scoped: stops only the active workspace's pair; delete and
+        // the config-restart flows still drain every pair.
+        authorize()?;
+        stop_managed_agent_workspace_pair(app, record, &mut runtimes)?;
+    }
+    save_managed_agents(app, &records)?;
+    let record = records
+        .iter()
+        .find(|record| record.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    summarize_from_disk(app, record, &runtimes)
 }
 
 // Async so the blocking body (disk reads/writes, process termination, keyring

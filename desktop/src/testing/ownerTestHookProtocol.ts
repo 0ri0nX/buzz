@@ -29,11 +29,18 @@ const base = {
 
 /** Public pairs from owner_test_saved_developer_core.rs and cerberusProposalUiDiagnostic.ts. */
 export const OWNER_TEST_MESSAGE_TARGETS = {
-  "31986c38-6676-4d6f-a4ba-ed833926d0d5":
+  "31986c38-6676-4d6f-a4ba-ed833926d0d5": [
     "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78",
-  "fd0cc15d-c216-442f-bac2-837dd6fddbbd":
+    "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c",
+  ],
+  "fd0cc15d-c216-442f-bac2-837dd6fddbbd": [
     "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+  ],
 } as const;
+
+export const OWNER_TEST_CLAUDE_PUBKEY =
+  "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c";
+export const OWNER_TEST_CLAUDE_CHANNEL = "31986c38-6676-4d6f-a4ba-ed833926d0d5";
 
 const pilotExpected = z.strictObject({
   ownerPubkey: z.literal(
@@ -62,6 +69,18 @@ export function ownerTestMessageUnexpired(expiresAt: number): boolean {
 export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
   z.strictObject({
     ...base,
+    expected: pilotExpected,
+    operation: z.literal("attach_saved_claude_developer"),
+    arguments: z.strictObject({
+      expiresAt: z
+        .number()
+        .int()
+        .nonnegative()
+        .refine(ownerTestMessageUnexpired),
+    }),
+  }),
+  z.strictObject({
+    ...base,
     operation: z.literal("read_existing_test_channel"),
     expected: pilotExpected,
     arguments: z
@@ -70,9 +89,10 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
         limit: z.number().int().min(1).max(20),
         since: z.number().int().nonnegative().optional(),
       })
-      .refine(
-        (value) =>
-          OWNER_TEST_MESSAGE_TARGETS[value.channelId] === value.recipientPubkey,
+      .refine((value) =>
+        (
+          OWNER_TEST_MESSAGE_TARGETS[value.channelId] as readonly string[]
+        ).includes(value.recipientPubkey),
       ),
   }),
   z.strictObject({
@@ -94,9 +114,10 @@ export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
           .nonnegative()
           .refine(ownerTestMessageUnexpired),
       })
-      .refine(
-        (value) =>
-          OWNER_TEST_MESSAGE_TARGETS[value.channelId] === value.recipientPubkey,
+      .refine((value) =>
+        (
+          OWNER_TEST_MESSAGE_TARGETS[value.channelId] as readonly string[]
+        ).includes(value.recipientPubkey),
       ),
   }),
   z.strictObject({

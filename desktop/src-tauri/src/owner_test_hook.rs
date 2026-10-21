@@ -26,7 +26,7 @@ const MAX_PENDING: usize = 8;
 const MAX_CACHE: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(30);
 const EMPTY_ID: &str = "00000000-0000-0000-0000-000000000000";
-const TEST_MESSAGE_TARGETS: [(&str, &str); 2] = [
+const TEST_MESSAGE_TARGETS: [(&str, &str); 3] = [
     (
         "31986c38-6676-4d6f-a4ba-ed833926d0d5",
         "29cc1bb0ac338520c263dcfe654764224018a1ff5e5d3fc633be73f71f0c8c78",
@@ -34,6 +34,10 @@ const TEST_MESSAGE_TARGETS: [(&str, &str); 2] = [
     (
         "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
         "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+    ),
+    (
+        "31986c38-6676-4d6f-a4ba-ed833926d0d5",
+        "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c",
     ),
 ];
 
@@ -176,6 +180,7 @@ struct Entry {
     response: Option<Response>,
     pending: Option<oneshot::Sender<Response>>,
     deadline: Option<tokio::time::Instant>,
+    claude_membership_started: bool,
 }
 
 #[derive(Default)]
@@ -227,6 +232,7 @@ impl Ledger {
                 response: None,
                 pending: Some(tx),
                 deadline: None,
+                claude_membership_started: false,
             },
         );
         Admission::Dispatch(rx)
@@ -316,6 +322,11 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "configure_saved_developer"
                 | "start_saved_developer"
                 | "create_stopped_claude_developer"
+                | "attach_saved_claude_developer"
+                | "prepare_saved_claude_setup"
+                | "start_saved_claude_setup"
+                | "stop_restore_saved_claude_normal"
+                | "start_saved_claude_normal"
                 | "inspect_saved_connector"
                 | "prepare_saved_connector"
                 | "approve_saved_connector"
@@ -336,6 +347,13 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
     if request.operation == crate::commands::owner_test_claude_create::OPERATION {
         crate::commands::owner_test_claude_create::validate_arguments(&request.arguments)
             .map_err(|_| Code::InvalidRequest)?;
+    }
+    if crate::commands::owner_test_claude_lifecycle::is_operation(&request.operation) {
+        crate::commands::owner_test_claude_lifecycle::validate_arguments(
+            &request.operation,
+            &request.arguments,
+        )
+        .map_err(|_| Code::InvalidRequest)?;
     }
     if crate::commands::owner_test_saved_connector::is_operation(&request.operation) {
         crate::commands::owner_test_saved_connector::validate_arguments(
@@ -494,6 +512,11 @@ fn pending_connector_request(
     }
     Ok((entry.request.clone(), deadline))
 }
+
+#[path = "owner_test_hook_claude_membership.rs"]
+pub(crate) mod claude_membership;
+#[cfg(test)]
+use claude_membership::pending_claude_attachment;
 
 /// The main webview can resolve only an already admitted, still-live closed
 /// connector request. No caller-selected target, receipt, action or body.
@@ -748,6 +771,28 @@ async fn dispatch(
             crate::commands::owner_test_claude_create::execute(&native_app, &arguments)
         })
         .await;
+    }
+    if crate::commands::owner_test_claude_lifecycle::is_operation(&request.operation)
+        && request.operation != crate::commands::owner_test_claude_lifecycle::ATTACH
+    {
+        let operation = request.operation.clone();
+        let arguments = request.arguments.clone();
+        let native_app = app.clone();
+        return dispatch_native(hook, &request, deadline, move || {
+            crate::commands::owner_test_claude_lifecycle::execute(
+                &native_app,
+                &operation,
+                &arguments,
+            )
+        })
+        .await;
+    }
+    if request.operation == crate::commands::owner_test_claude_lifecycle::ATTACH {
+        if let Ok(mut ledger) = hook.ledger.lock() {
+            if let Some(entry) = ledger.entries.get_mut(&request.request_id) {
+                entry.deadline = Some(deadline);
+            }
+        }
     }
     if crate::commands::owner_test_saved_connector::is_operation(&request.operation) {
         if let Ok(mut ledger) = hook.ledger.lock() {
