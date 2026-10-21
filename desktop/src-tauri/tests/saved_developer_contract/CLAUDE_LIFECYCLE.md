@@ -81,6 +81,29 @@ dispatched, not ready. Unknown outcomes stay consumed; Root must not blindly ret
 Existing readback remains bounded channel history (mixed authors), not target-only.
 The helper's existing source was not modified or newly attested by this change.
 
+`inspect_saved_claude_initial_state` is a separate native-only, expiresAt-only
+semantic inspection. It returns exactly fixed `pubkey`, `recordState`
+(`missing|unique|ambiguous`), `contractMatches`, `stoppedInitialMatches`,
+`noTrackedPairs`, `noScalarPid`, `receiptsReadable`, `noTargetReceipts`, and
+`checks`. Checks are null unless the fixed record is unique; otherwise only
+eleven closed predicate booleans identify name/backend/transport/link/runtime,
+opaque binding presence, autostart, normal argv, initial/configured settings,
+and relay matches. No record/summary, environment value, command/path, key,
+authorization value/digest or raw error is returned. The two authoritative
+results call the existing target contract and stopped-attachment guard, not
+an approximation built from diagnostic flags. Those guards accept initial OR
+configured-normal state; neither result means membership or runtime readiness.
+
+Inspection uses the normal `load_managed_agents` helper, which may hydrate or
+migrate internal key metadata. Ordinary Native list flows additionally perform
+reaping/builtin bookkeeping that can persist metadata: this is not a zero-write
+claim. Inspection itself does not call list/summary, reap, start, stop, edit the
+requested configuration, change membership or publish relay content. Raw rows
+are dropped before constructing the closed DTO. Existing independent channel
+readback supplies membership facts; no new membership/HTTP API is introduced.
+The confined real-creator fixture substitutes ONLY the generated public key to
+exercise the fixed metadata predicate; it is not signature/identity proof.
+
 Validation uses disposable isolated app-data fixtures, inert process groups and
 no actual Desktop/provider/IPC/auth state. Focused checks:
 

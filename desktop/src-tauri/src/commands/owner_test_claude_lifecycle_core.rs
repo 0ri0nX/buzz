@@ -2,6 +2,7 @@
 use serde_json::{json, Map, Value};
 
 pub(super) const TARGET: &str = "01ab717b2ebeeef89c3abde0be5a55f6aa95fac66d89c96124083ad381857b4c";
+pub(super) const INSPECT_INITIAL: &str = "inspect_saved_claude_initial_state";
 pub(super) const CHANNEL: &str = "31986c38-6676-4d6f-a4ba-ed833926d0d5";
 pub(super) const OWNER: &str = "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68";
 pub(super) const RELAY: &str = "wss://buzz.rowvia.ai:8443";
@@ -19,7 +20,8 @@ pub(super) const PROFILE_SHA: &str =
 pub(crate) fn is_operation(op: &str) -> bool {
     matches!(
         op,
-        "attach_saved_claude_developer"
+        INSPECT_INITIAL
+            | "attach_saved_claude_developer"
             | "prepare_saved_claude_setup"
             | "start_saved_claude_setup"
             | "stop_restore_saved_claude_normal"
@@ -107,6 +109,7 @@ mod tests {
         assert!(check_scope(OWNER, "wss://foreign.invalid", true).is_err());
         assert!(check_scope(OWNER, RELAY, false).is_err());
         for op in [
+            "inspect_saved_claude_initial_state",
             "attach_saved_claude_developer",
             "prepare_saved_claude_setup",
             "start_saved_claude_setup",

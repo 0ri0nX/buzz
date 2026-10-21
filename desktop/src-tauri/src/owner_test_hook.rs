@@ -327,6 +327,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "start_saved_claude_setup"
                 | "stop_restore_saved_claude_normal"
                 | "start_saved_claude_normal"
+                | "inspect_saved_claude_initial_state"
                 | "stop_cerberus_for_recovery"
                 | "inspect_saved_connector"
                 | "prepare_saved_connector"

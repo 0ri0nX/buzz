@@ -325,6 +325,93 @@ fn discard_update(response: UpdateManagedAgentResponse) -> Result<(), String> {
     }
 }
 
+fn inspect_initial_in<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    authorize: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Map<String, Value>, String> {
+    let state = app.state::<AppState>();
+    let _workspace = state
+        .workspace_apply_lock
+        .try_lock()
+        .map_err(|_| "not_ready")?;
+    let _identity = state
+        .identity_mutation
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    authorize()?;
+    // Normal loading may hydrate/migrate internal keys. Not a zero-write claim.
+    let rows = crate::managed_agents::load_managed_agents(app).map_err(|_| "operation_failed")?;
+    authorize()?;
+    let runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    authorize()?;
+    let matching: Vec<_> = rows
+        .iter()
+        .filter(|row| row.pubkey == core::TARGET)
+        .collect();
+    let record_state = match matching.len() {
+        0 => "missing",
+        1 => "unique",
+        _ => "ambiguous",
+    };
+    let row = match matching.as_slice() {
+        [row] => Some(*row),
+        _ => None,
+    };
+    // These actual guards remain authoritative, not the diagnostic flags below.
+    let contract = target_contract_with_initial(&rows, false, true).is_ok();
+    let stopped = check_target_with_initial(app, &rows, &runtimes, false, false, true).is_ok();
+    let no_pairs = !runtimes.keys().any(|key| key.pubkey == core::TARGET);
+    let no_scalar = row.is_some_and(|row| row.runtime_pid.is_none());
+    let receipts = receipt_present(app, None);
+    let receipts_readable = receipts.is_ok();
+    let no_receipts = matches!(receipts, Ok(false));
+    let checks = row.map(|row| {
+        [
+            row.name == "Rowvia Developer Claude",
+            row.backend == BackendKind::Local,
+            row.acp_command == crate::managed_agents::DEFAULT_ACP_COMMAND,
+            row.persona_id.is_none() && row.team_id.is_none(),
+            row.runtime.is_none(),
+            row.auth_tag.as_ref().is_some_and(|tag| !tag.is_empty()),
+            !row.start_on_app_launch,
+            row.agent_command == core::PYTHON
+                && row.agent_command_override.as_deref() == Some(core::PYTHON)
+                && row.agent_args == core::command(false).1,
+            row.env_vars.is_empty()
+                && row.parallelism == crate::managed_agents::DEFAULT_AGENT_PARALLELISM,
+            row.env_vars == core::configured_env() && row.parallelism == 1,
+            row.relay_url == core::RELAY,
+        ]
+    });
+    drop(matching);
+    drop(runtimes);
+    drop(rows);
+    authorize()?;
+    Ok(
+        serde_json::json!({"pubkey":core::TARGET,"recordState":record_state,
+        "contractMatches":contract,"stoppedInitialMatches":stopped,"noTrackedPairs":no_pairs,
+        "noScalarPid":no_scalar,"receiptsReadable":receipts_readable,"noTargetReceipts":no_receipts,
+        "checks":checks.map(|c|serde_json::json!({"nameMatches":c[0],"localBackend":c[1],
+            "defaultTransport":c[2],"unlinked":c[3],"runtimeUnset":c[4],"bindingPresent":c[5],
+            "autostartOff":c[6],"normalCommandMatches":c[7],"initialSettingsMatch":c[8],
+            "configuredNormalSettingsMatch":c[9],"relayMatches":c[10]}))})
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+}
+
 pub(crate) fn execute(
     app: &AppHandle,
     op: &str,
@@ -335,6 +422,9 @@ pub(crate) fn execute(
         return Err("invalid_request".into());
     }
     let state = app.state::<AppState>();
+    if op == core::INSPECT_INITIAL {
+        return inspect_initial_in(app, &|| current_scope(&state, op, args));
+    }
     // Never reacquire these outer locks in the normal helpers. Start owns its
     // own transition; stopped updates and stop/restore hold it here instead.
     let _workspace = state

@@ -400,6 +400,13 @@ fn confined_update(home: &Path) {
         ManagedAgentRuntimeKey::new(core::TARGET, core::RELAY).unwrap(),
         ManagedAgentPairRuntime::starting(process),
     );
+    let inspected = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(inspected["noTrackedPairs"], false);
+    assert_eq!(inspected["stoppedInitialMatches"], false);
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "inspection must not stop/reap the owned child"
+    );
     let mut wrong_pid = saved.clone();
     wrong_pid.runtime_pid = Some(pid + 1);
     assert!(check_target(
@@ -625,5 +632,277 @@ fn confined_update(home: &Path) {
     assert!(
         !Path::new(core::SETUP_DIR).exists(),
         "fixture must never mount/access the real setup artifacts"
+    );
+}
+
+#[test]
+fn claude_initial_inspection_real_creator_projection_and_waits_are_confined() {
+    const CHILD: &str = "BUZZ_CLAUDE_INITIAL_INSPECT_FIXTURE";
+    if let Some(home) = std::env::var_os(CHILD) {
+        return confined_initial_inspection(Path::new(&home));
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","commands::agents::owner_test_claude_lifecycle::tests::claude_initial_inspection_real_creator_projection_and_waits_are_confined","--nocapture"])
+        .env(CHILD,home.path()).env("HOME",home.path()).env("XDG_DATA_HOME",home.path())
+        .env("APPDATA",home.path()).env("LOCALAPPDATA",home.path())
+        .env_remove("BUZZ_PRIVATE_KEY").env_remove("BUZZ_AUTH_TAG").env_remove("BUZZ_RELAY_URL")
+        .env_remove("BUZZ_NETWORK_TRACE").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("bounded initial-inspection production wrapper fixture timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn confined_initial_inspection(home: &Path) {
+    use crate::managed_agents::{
+        load_managed_agents, save_managed_agents, storage::NO_KEYCHAIN_FOR_TEST,
+    };
+    NO_KEYCHAIN_FOR_TEST.store(true, Ordering::SeqCst);
+    crate::managed_agents::pin_nest_dir_for_test(home.join("nest"));
+    let data = home.join("app-data");
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    context.config_mut().identifier = data.to_str().unwrap().to_owned();
+    let mut state = crate::app_state::build_app_state();
+    *state.relay_url_override.lock().unwrap() = Some(core::RELAY.into());
+    // Exact creator relay/tuple, but all HTTP is routed to owned loopback refusal.
+    state.http_client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(context)
+        .unwrap();
+    let handle = app.handle().clone();
+    let state = handle.state::<AppState>();
+    let empty = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(empty["recordState"], "missing");
+    assert!(empty["checks"].is_null());
+    let input=serde_json::from_value(serde_json::json!({"name":"Rowvia Developer Claude",
+        "relayUrl":core::RELAY,"agentCommand":core::PYTHON,"personaId":null,"teamId":null,
+        "agentArgs":["-IS",core::RUN],"envVars":{},"spawnAfterCreate":false,"startOnAppLaunch":false})).unwrap();
+    let response = tauri::async_runtime::block_on(super::super::create_managed_agent_in(
+        input,
+        handle.clone(),
+        &state,
+    ))
+    .unwrap();
+    let created = response.agent.pubkey.clone();
+    drop(response);
+    let mut original = load_managed_agents(&handle)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.pubkey == created)
+        .unwrap();
+    // Only public-key substitution: exact real creator metadata, NOT signature proof.
+    original.pubkey = core::TARGET.into();
+    save_managed_agents(&handle, std::slice::from_ref(&original)).unwrap();
+    let snapshot = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(
+        snapshot.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "checks",
+            "contractMatches",
+            "noScalarPid",
+            "noTargetReceipts",
+            "noTrackedPairs",
+            "pubkey",
+            "receiptsReadable",
+            "recordState",
+            "stoppedInitialMatches"
+        ]
+    );
+    assert_eq!(snapshot["recordState"], "unique");
+    assert_eq!(
+        snapshot["contractMatches"], true,
+        "real creator closed projection: {snapshot:?}"
+    );
+    assert_eq!(snapshot["stoppedInitialMatches"], true);
+    assert_eq!(snapshot["checks"]["initialSettingsMatch"], true);
+    assert_eq!(snapshot["checks"]["configuredNormalSettingsMatch"], false);
+    assert_eq!(
+        snapshot["checks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "autostartOff",
+            "bindingPresent",
+            "configuredNormalSettingsMatch",
+            "defaultTransport",
+            "initialSettingsMatch",
+            "localBackend",
+            "nameMatches",
+            "normalCommandMatches",
+            "relayMatches",
+            "runtimeUnset",
+            "unlinked"
+        ]
+    );
+    for field in [
+        "name",
+        "backend",
+        "transport",
+        "persona",
+        "team",
+        "runtime",
+        "binding",
+        "autostart",
+        "legacy_command",
+        "override",
+        "args",
+        "env",
+        "parallelism",
+        "relay",
+        "pubkey",
+    ] {
+        let mut changed = original.clone();
+        match field {
+            "name" => changed.name = "PRIVATE_CANARY".into(),
+            "backend" => {
+                changed.backend = BackendKind::Provider {
+                    id: "inert".into(),
+                    config: Value::Null,
+                }
+            }
+            "transport" => changed.acp_command = "/bin/sh".into(),
+            "persona" => changed.persona_id = Some("inert".into()),
+            "team" => changed.team_id = Some("inert".into()),
+            "runtime" => changed.runtime = Some("inert".into()),
+            "binding" => changed.auth_tag = None,
+            "autostart" => changed.start_on_app_launch = true,
+            "legacy_command" => changed.agent_command = "nsec1_PRIVATE_CANARY".into(),
+            "override" => changed.agent_command_override = None,
+            "args" => changed.agent_args = vec!["nsec1_PRIVATE_CANARY".into()],
+            "env" => {
+                changed
+                    .env_vars
+                    .insert("TOKEN".into(), "nsec1_PRIVATE_CANARY".into());
+            }
+            "parallelism" => {
+                changed.parallelism = crate::managed_agents::DEFAULT_AGENT_PARALLELISM + 1
+            }
+            "relay" => changed.relay_url = "ws://127.0.0.1:9".into(),
+            _ => changed.pubkey = "f".repeat(64),
+        }
+        let expected =
+            target_contract_with_initial(std::slice::from_ref(&changed), false, true).is_ok();
+        assert!(
+            !expected,
+            "fixture mutation must actually fail the existing guard: {field}"
+        );
+        save_managed_agents(&handle, std::slice::from_ref(&changed)).unwrap();
+        let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+        assert_eq!(result["contractMatches"], expected, "{field}");
+        assert_eq!(result["stoppedInitialMatches"], false, "{field}");
+        let public = serde_json::to_string(&result).unwrap();
+        for private in [
+            "CANARY",
+            "nsec",
+            core::PYTHON,
+            core::RUN,
+            "auth_tag",
+            "private_key",
+        ] {
+            assert!(!public.contains(private), "{field}");
+        }
+    }
+    let mut configured = original.clone();
+    configured.env_vars = core::configured_env();
+    configured.parallelism = 1;
+    save_managed_agents(&handle, std::slice::from_ref(&configured)).unwrap();
+    let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(result["contractMatches"], true);
+    assert_eq!(result["checks"]["configuredNormalSettingsMatch"], true);
+    save_managed_agents(&handle, &[original.clone(), original.clone()]).unwrap();
+    let duplicate = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(duplicate["recordState"], "ambiguous");
+    assert!(duplicate["checks"].is_null());
+    save_managed_agents(&handle, std::slice::from_ref(&original)).unwrap();
+    let receipt_dir = data.join("agents/agent-pids");
+    fs::create_dir_all(&receipt_dir).unwrap();
+    let receipt = receipt_dir.join(format!("{}.json", core::TARGET));
+    fs::write(&receipt, b"PRIVATE_CANARY").unwrap();
+    let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(result["noTargetReceipts"], false);
+    assert_eq!(result["stoppedInitialMatches"], false);
+    fs::remove_file(&receipt).unwrap();
+    fs::remove_dir(&receipt_dir).unwrap();
+    fs::write(&receipt_dir, b"owned non-directory fixture").unwrap();
+    let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(result["receiptsReadable"], false);
+    assert_eq!(result["noTargetReceipts"], false);
+    fs::remove_file(&receipt_dir).unwrap();
+    let workspace = state.workspace_apply_lock.try_lock().unwrap();
+    assert_eq!(
+        inspect_initial_in(&handle, &|| Ok(())).err().as_deref(),
+        Some("not_ready")
+    );
+    drop(workspace);
+    for transition in [false, true] {
+        let held_transition =
+            transition.then(|| state.managed_agent_runtime_transition.lock().unwrap());
+        let held_store = (!transition).then(|| state.managed_agents_store_lock.lock().unwrap());
+        let worker_handle = handle.clone();
+        let denied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_denied = denied.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            done_tx
+                .send(inspect_initial_in(&worker_handle, &|| {
+                    if worker_denied.load(Ordering::Acquire) {
+                        Err("scope_mismatch".into())
+                    } else {
+                        Ok(())
+                    }
+                }))
+                .unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        denied.store(true, Ordering::Release);
+        drop((held_transition, held_store));
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .is_err());
+        worker.join().unwrap();
+    }
+    for fail_at in 0..4 {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = inspect_initial_in(&handle, &|| {
+            if calls.fetch_add(1, Ordering::SeqCst) == fail_at {
+                Err("invalid_request".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.err().as_deref(), Some("invalid_request"));
+    }
+    assert!(
+        state.managed_agent_processes.lock().unwrap().is_empty(),
+        "normal creation/inspection must never spawn"
     );
 }
