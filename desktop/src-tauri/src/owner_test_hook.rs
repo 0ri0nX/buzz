@@ -1,5 +1,5 @@
 //! Temporary, opt-in local bridge to the already authenticated main webview.
-//! No signing, identity storage, generic invocation or script execution surface.
+//! No key export, generic invocation or script execution surface.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -315,6 +315,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "inspect_saved_developer"
                 | "configure_saved_developer"
                 | "start_saved_developer"
+                | "create_stopped_claude_developer"
                 | "inspect_saved_connector"
                 | "prepare_saved_connector"
                 | "approve_saved_connector"
@@ -331,6 +332,10 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
     }
     if request.operation == "read_existing_test_channel" {
         validate_test_read(&request.arguments)?;
+    }
+    if request.operation == crate::commands::owner_test_claude_create::OPERATION {
+        crate::commands::owner_test_claude_create::validate_arguments(&request.arguments)
+            .map_err(|_| Code::InvalidRequest)?;
     }
     if crate::commands::owner_test_saved_connector::is_operation(&request.operation) {
         crate::commands::owner_test_saved_connector::validate_arguments(
@@ -736,6 +741,14 @@ async fn dispatch(
         Admission::Dispatch(rx) => rx,
         Admission::Return(response) => return response,
     };
+    if request.operation == crate::commands::owner_test_claude_create::OPERATION {
+        let arguments = request.arguments.clone();
+        let native_app = app.clone();
+        return dispatch_native(hook, &request, deadline, move || {
+            crate::commands::owner_test_claude_create::execute(&native_app, &arguments)
+        })
+        .await;
+    }
     if crate::commands::owner_test_saved_connector::is_operation(&request.operation) {
         if let Ok(mut ledger) = hook.ledger.lock() {
             if let Some(entry) = ledger.entries.get_mut(&request.request_id) {

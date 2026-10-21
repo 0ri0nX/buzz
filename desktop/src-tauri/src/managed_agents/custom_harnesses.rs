@@ -350,7 +350,7 @@ pub(crate) fn warm_harness_registry_locked(custom_dir: Option<&std::path::Path>)
 /// wins and misses A. Holding the lock for the write+warm pair guarantees that
 /// the registry always reflects the complete set of files on disk at the time
 /// of the warm.
-pub(super) fn persist_mutex() -> &'static std::sync::Mutex<()> {
+pub(crate) fn persist_mutex() -> &'static std::sync::Mutex<()> {
     use std::sync::{Mutex, OnceLock};
     static PERSIST: OnceLock<Mutex<()>> = OnceLock::new();
     PERSIST.get_or_init(|| Mutex::new(()))

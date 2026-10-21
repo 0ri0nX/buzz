@@ -1,6 +1,95 @@
 // Included inside owner_test_hook::tests to share the production validator and ledger fixtures.
 
 #[test]
+fn fixed_claude_create_contract_is_native_closed_expiring_and_owner_scoped() {
+    let mut r = request();
+    r.operation = "create_stopped_claude_developer".into();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    r.arguments = serde_json::json!({"expiresAt": now + 60_000})
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
+    for (field, value) in [
+        ("expiresAt", serde_json::json!(now)),
+        ("expiresAt", serde_json::json!(now + 121_000)),
+        ("expiresAt", serde_json::json!("later")),
+        ("name", serde_json::json!("Other")),
+        ("command", serde_json::json!("/bin/sh")),
+        ("provider", serde_json::json!("other")),
+        ("model", serde_json::json!("other")),
+        ("path", serde_json::json!("/tmp/other")),
+        ("recipientPubkey", serde_json::json!("f".repeat(64))),
+        ("spawnAfterCreate", serde_json::json!(true)),
+        ("startOnAppLaunch", serde_json::json!(true)),
+    ] {
+        let mut invalid = r.clone();
+        invalid.arguments.insert(field.into(), value);
+        assert!(
+            matches!(
+                validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Code::InvalidRequest)
+            ),
+            "{field}"
+        );
+    }
+    let mut missing = r.clone();
+    missing.arguments.clear();
+    assert!(matches!(
+        validate_request(&serde_json::to_vec(&missing).unwrap()),
+        Err(Code::InvalidRequest)
+    ));
+    for field in ["ownerPubkey", "architectPubkey", "relayUrl"] {
+        let mut invalid = serde_json::to_value(&r).unwrap();
+        invalid["expected"][field] = Value::String("foreign".into());
+        assert!(matches!(
+            validate_request(&serde_json::to_vec(&invalid).unwrap()),
+            Err(Code::ScopeMismatch)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fixed_claude_native_error_never_serializes_raw_error_or_secret_canary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("redaction.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    let hook = Hook {
+        ledger: Mutex::new(Ledger::default()),
+        cancel: CancellationToken::new(),
+        socket: SocketGuard {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            cleanup_attempted: AtomicBool::new(false),
+        },
+    };
+    let mut r = request();
+    r.operation = "create_stopped_claude_developer".into();
+    assert!(matches!(
+        hook.ledger.lock().unwrap().admit(&r),
+        Admission::Dispatch(_)
+    ));
+    let response = dispatch_native(
+        &hook,
+        &r,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        || Err("nsec1_PRIVATE_AGENT_KEY_AUTH_RAW_ERROR_CANARY".into()),
+    )
+    .await;
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert_eq!(response.status, Status::Unknown);
+    assert!(matches!(response.code, Some(Code::OperationFailed)));
+    assert!(!encoded.contains("nsec") && !encoded.contains("CANARY"));
+    assert!(response.result.is_none());
+}
+
+#[test]
 fn socket_cleanup_never_retries_even_when_replacement_metadata_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("one-attempt.sock");

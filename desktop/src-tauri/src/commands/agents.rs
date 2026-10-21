@@ -58,6 +58,10 @@ pub(super) fn summarize_from_disk<R: tauri::Runtime>(
 mod create_fields;
 use create_fields::{normalize_relay_mesh, resolve_created_avatar_url, trim_to_optional_string};
 
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+#[path = "owner_test_claude_create.rs"]
+pub(crate) mod owner_test_claude_create;
+
 #[cfg(feature = "mesh-llm")]
 async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
     app: &AppHandle<R>,
@@ -401,6 +405,17 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
     input: CreateManagedAgentRequest,
     app: AppHandle<R>,
     state: &AppState,
+) -> Result<CreateManagedAgentResponse, String> {
+    create_managed_agent_guarded_in(input, app, state, |_| Ok(())).await
+}
+
+// The temporary owner test supplies only a fixed-target pre-save guard. Normal
+// callers retain exactly their existing creation behavior through the no-op above.
+async fn create_managed_agent_guarded_in<R: tauri::Runtime>(
+    input: CreateManagedAgentRequest,
+    app: AppHandle<R>,
+    state: &AppState,
+    before_save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
 ) -> Result<CreateManagedAgentResponse, String> {
     let name = input.name.trim().to_string();
     let requested_persona_id = input
@@ -754,6 +769,9 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
         if let Some(level) = input.effort_level.clone() {
             super::agent_config::apply_picker_effort_level(&mut record, Some(level));
         }
+        // Fixed owner-test scope/expiry and collision checks run under the
+        // existing store lock immediately before the new record is persisted.
+        before_save(&records)?;
         records.push(record);
 
         save_managed_agents(&app, &records)?;
