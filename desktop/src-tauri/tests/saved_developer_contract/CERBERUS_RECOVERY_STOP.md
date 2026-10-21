@@ -63,9 +63,15 @@ pairState:missing|unique|ambiguous, pairScopeMatches:bool,
 scalarPidState:absent|matches|other|unavailable, stopPreflightMatches:bool
 ```
 
-The final boolean calls the actual unchanged strict Stop preflight. In particular,
-an empty saved relay is reported as `empty`, not silently treated as the fixed
-relay even though ordinary normal Stop has a legacy empty-relay path. No raw row,
+The final boolean calls the actual strict Stop preflight. An empty saved relay
+remains reported as `empty`; the fixed adapter accepts empty OR exact fixed saved
+relay only when the enclosing fixed owner/active-workspace scope, unique exact
+fixed-relay tracked pair, and scalar-PID consistency all pass. Normal Stop resolves
+the active workspace relay and ignores legacy stored pins, but this adapter stays
+stricter: every nonempty foreign value (including whitespace or trailing-slash
+variants) is refused, not normalized. No stored relay is rewritten. The guard is
+still repeated after runtime sync and authorization/expiry waits, before normal
+Stop. This correction does not reopen or retry any consumed Unknown. No raw row,
 PID, environment, paths, summary, errors or credentials are returned. Normal
 loading may hydrate/migrate internal metadata, so this is not a zero-write claim;
 inspection itself never reaps, stops, starts or publishes. The observations are

@@ -234,7 +234,10 @@ fn confined_stop(home: &Path) {
                 "other"
             }
         );
-        assert_eq!(facts["stopPreflightMatches"], relay == RELAY);
+        assert_eq!(
+            facts["stopPreflightMatches"],
+            relay.is_empty() || relay == RELAY
+        );
         assert_eq!(facts["pairState"], "unique");
         assert_eq!(facts["pairScopeMatches"], true);
         assert_eq!(facts["scalarPidState"], "absent");
@@ -261,6 +264,7 @@ fn confined_stop(home: &Path) {
         save_managed_agents(&handle, &rows).unwrap();
         let facts = inspect_in(&handle, &|| Ok(())).unwrap();
         assert_eq!(facts["stopPreflightMatches"], false, "{field}");
+        assert!(execute_in(&handle, &|| Ok(())).is_err(), "{field}");
         assert!(!serde_json::to_string(&facts).unwrap().contains("CANARY"));
     }
     save_managed_agents(&handle, &[]).unwrap();
@@ -317,7 +321,19 @@ fn confined_stop(home: &Path) {
         pairs.insert(key.clone(), runtime);
     }
 
-    // Actual transition/store waits precede authorization, never termination.
+    for relay in ["ws://127.0.0.1:9", " ", "wss://buzz.rowvia.ai:8443/"] {
+        let mut row = original.clone();
+        row.relay_url = relay.into();
+        save_managed_agents(&handle, &[row]).unwrap();
+        assert!(
+            execute_in(&handle, &|| Ok(())).is_err(),
+            "nonempty foreign relay must stay refused"
+        );
+    }
+    let mut empty = original.clone();
+    empty.relay_url.clear();
+    save_managed_agents(&handle, &[empty]).unwrap();
+    // Actual transition/store waits with an empty saved relay precede authorization, never termination.
     for (inspection, transition, error) in [
         (false, false, "scope_mismatch"),
         (false, true, "invalid_request"),
@@ -364,6 +380,7 @@ fn confined_stop(home: &Path) {
     // Optional current-config projection must not block an authorized normal
     // Stop of the exact tracked child when its saved harness is unavailable.
     let mut dangling = original.clone();
+    dangling.relay_url.clear();
     dangling.agent_command_override = None;
     dangling.runtime = Some("rowvia-inert-missing-recovery-harness".into());
     save_managed_agents(&handle, std::slice::from_ref(&dangling)).unwrap();
@@ -373,8 +390,16 @@ fn confined_stop(home: &Path) {
         &Default::default()
     )
     .is_err());
-    let result = execute_in(&handle, &|| Ok(()))
-        .expect("unavailable optional launcher projection must not prevent normal Stop");
+    let outcome = execute_in(&handle, &|| Ok(()));
+    if outcome.is_err() {
+        // Own only this fixture's inert child even when a causal RED refuses Stop.
+        if let Some(mut pair) = state.managed_agent_processes.lock().unwrap().remove(&key) {
+            let _ = pair.child.kill();
+            let _ = pair.child.wait();
+        }
+    }
+    let result = outcome
+        .expect("empty saved relay must resolve the fixed active workspace pair for normal Stop");
     assert_eq!(result["trackedChildPid"], pid);
     assert_eq!(result["trackedChildSettled"], true);
     assert_eq!(result["launcherBasis"], "current_saved_effective_config");

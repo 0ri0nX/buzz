@@ -169,10 +169,12 @@ fn check_target<'a>(
         .iter()
         .filter(|(key, _)| key.pubkey.eq_ignore_ascii_case(TARGET))
         .collect();
+    // Enclosing fixed owner/workspace authorization and the exact pair below
+    // prove the normal workspace fallback; foreign nonempty pins stay refused.
     if matches.next().is_some()
         || row.pubkey != TARGET
         || row.backend != BackendKind::Local
-        || row.relay_url != RELAY
+        || !(row.relay_url.is_empty() || row.relay_url == RELAY)
         || pairs.len() != 1
     {
         return Err("runtime_ownership_unknown".into());
