@@ -54,7 +54,9 @@ Both require exact saved env `{"BUZZ_ACP_NO_BASE_PROMPT":"true"}` and
 of that key is introduced. Descriptor user env is applied last to outer ACP;
 NO_BASE_PROMPT is a supported non-reserved behavior key, not an ambient premise.
 Both states retain legacy Python command, explicit override, `runtime:null`, no
-persona/team, default outer `buzz-acp` transport, and `startOnAppLaunch:false`.
+team, default outer `buzz-acp` transport, and `startOnAppLaunch:false`.
+Persona linkage is either absent with no source version, or the exact verified
+startup-manufactured self-definition below. No unlink/recreate is performed.
 Custom outer transports are refused rather than overwritten.
 No custom catalog registration/discovery/install is needed for setup. Raw command
 resolution has no built-in MCP command; ordinary Native explicitly supplies empty
@@ -86,13 +88,28 @@ semantic inspection. It returns exactly fixed `pubkey`, `recordState`
 (`missing|unique|ambiguous`), `contractMatches`, `stoppedInitialMatches`,
 `noTrackedPairs`, `noScalarPid`, `receiptsReadable`, `noTargetReceipts`, and
 `checks`. Checks are null unless the fixed record is unique; otherwise only
-eleven closed predicate booleans identify name/backend/transport/link/runtime,
+sixteen closed predicate booleans identify name/backend/transport/link/runtime,
 opaque binding presence, autostart, normal argv, initial/configured settings,
-and relay matches. No record/summary, environment value, command/path, key,
+and relay matches, plus `personaIsSelf`, `teamNone`, `selfDefinitionUnique`,
+`creatorSnapshotMatches`, and `sourceVersionMatches`. No record/summary,
+environment value, command/path, key,
 authorization value/digest or raw error is returned. The two authoritative
 results call the existing target contract and stopped-attachment guard, not
 an approximation built from diagnostic flags. Those guards accept initial OR
 configured-normal state; neither result means membership or runtime readiness.
+
+Normal startup backfill manufactures a keyless definition under the instance's
+public-key slug and pins its normal persona content hash. The shared guard allows
+that exact self-link only: no case-insensitive definition collision, no foreign
+persona/team/provenance, and the static original creator snapshot must match.
+That snapshot has fixed name/normal command-derived avatar, stock ACP, empty
+prompt/env/name pool, no provider/model/runtime, owner-only/empty allowlist,
+definition parallelism10 and channel session policy. Configured instance
+parallelism1 does not rewrite this original definition snapshot. Hash consistency
+alone cannot authorize a changed definition: prompt/env/provider/behavior edits
+are refused even with a recomputed matching hash. Instance prompt/model/provider,
+session/access defaults must also remain fixed. No definition bytes/hash are
+returned. All lifecycle guards and inspection share this same predicate.
 
 Inspection uses the normal `load_managed_agents` helper, which may hydrate or
 migrate internal key metadata. Ordinary Native list flows additionally perform
@@ -101,8 +118,10 @@ claim. Inspection itself does not call list/summary, reap, start, stop, edit the
 requested configuration, change membership or publish relay content. Raw rows
 are dropped before constructing the closed DTO. Existing independent channel
 readback supplies membership facts; no new membership/HTTP API is introduced.
-The confined real-creator fixture substitutes ONLY the generated public key to
-exercise the fixed metadata predicate; it is not signature/identity proof.
+The confined real-creator fixture substitutes ONLY the generated public key,
+then runs the actual normal startup backfill through a cfg(test)-only directory
+seam. It exercises metadata predicates, not signature/identity proof. The normal
+migration algorithm and production API are unchanged.
 
 Validation uses disposable isolated app-data fixtures, inert process groups and
 no actual Desktop/provider/IPC/auth state. Focused checks:

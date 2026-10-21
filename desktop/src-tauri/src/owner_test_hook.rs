@@ -1,6 +1,7 @@
 //! Temporary, opt-in local bridge to the already authenticated main webview.
 //! No key export, generic invocation or script execution surface.
 
+use crate::commands::owner_test_cerberus_recovery as recovery;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -329,6 +330,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "start_saved_claude_normal"
                 | "inspect_saved_claude_initial_state"
                 | "stop_cerberus_for_recovery"
+                | "inspect_cerberus_recovery_state"
                 | "inspect_saved_connector"
                 | "prepare_saved_connector"
                 | "approve_saved_connector"
@@ -350,9 +352,8 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
         crate::commands::owner_test_claude_create::validate_arguments(&request.arguments)
             .map_err(|_| Code::InvalidRequest)?;
     }
-    if request.operation == crate::commands::owner_test_cerberus_recovery::OPERATION {
-        crate::commands::owner_test_cerberus_recovery::validate_arguments(&request.arguments)
-            .map_err(|_| Code::InvalidRequest)?;
+    if recovery::is_operation(&request.operation) {
+        recovery::validate_arguments(&request.arguments).map_err(|_| Code::InvalidRequest)?;
     }
     if crate::commands::owner_test_claude_lifecycle::is_operation(&request.operation) {
         crate::commands::owner_test_claude_lifecycle::validate_arguments(
@@ -770,12 +771,13 @@ async fn dispatch(
         Admission::Dispatch(rx) => rx,
         Admission::Return(response) => return response,
     };
-    if request.operation == crate::commands::owner_test_cerberus_recovery::OPERATION {
+    if recovery::is_operation(&request.operation) {
+        let operation = request.operation.clone();
         let arguments = request.arguments.clone();
         let native_app = app.clone();
         let cancel = hook.cancel.clone();
         return dispatch_native(hook, &request, deadline, move || {
-            crate::commands::owner_test_cerberus_recovery::execute(&native_app, &arguments, &|| {
+            recovery::execute(&native_app, &operation, &arguments, &|| {
                 if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
                     Err("not_ready".into())
                 } else {
@@ -1033,20 +1035,25 @@ mod tests {
 
     #[test]
     fn cerberus_recovery_stop_is_native_closed_and_expiring() {
-        let mut r = request();
-        r.operation = "stop_cerberus_for_recovery".into();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        r.arguments =
-            serde_json::from_value(serde_json::json!({"expiresAt":now + 60_000})).unwrap();
-        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
-        r.arguments
-            .insert("pubkey".into(), Value::String("arbitrary".into()));
-        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
-        r.arguments = serde_json::from_value(serde_json::json!({"expiresAt":now - 1})).unwrap();
-        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+        for op in [
+            "stop_cerberus_for_recovery",
+            "inspect_cerberus_recovery_state",
+        ] {
+            let mut r = request();
+            r.operation = op.into();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            r.arguments =
+                serde_json::from_value(serde_json::json!({"expiresAt":now + 60_000})).unwrap();
+            assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
+            r.arguments
+                .insert("pubkey".into(), Value::String("arbitrary".into()));
+            assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+            r.arguments = serde_json::from_value(serde_json::json!({"expiresAt":now - 1})).unwrap();
+            assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+        }
     }
 
     #[test]

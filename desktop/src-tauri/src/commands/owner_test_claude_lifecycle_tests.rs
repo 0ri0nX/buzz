@@ -24,6 +24,13 @@ fn claude_lifecycle_target_contract_is_exact_and_private_fields_are_untouched() 
         "start_on_app_launch",
         "env_vars",
         "acp_command",
+        "prompt",
+        "model",
+        "provider",
+        "session",
+        "respond_to",
+        "allowlist",
+        "team",
     ] {
         let mut changed = original.clone();
         match field {
@@ -32,6 +39,13 @@ fn claude_lifecycle_target_contract_is_exact_and_private_fields_are_untouched() 
             "runtime" => changed.runtime = Some("claude".into()),
             "start_on_app_launch" => changed.start_on_app_launch = true,
             "acp_command" => changed.acp_command = "/bin/sh".into(),
+            "prompt" => changed.system_prompt = Some("PRIVATE_CANARY".into()),
+            "model" => changed.model = Some("PRIVATE_CANARY".into()),
+            "provider" => changed.provider = Some("PRIVATE_CANARY".into()),
+            "session" => changed.session_policy = crate::managed_agents::AcpSessionPolicy::Thread,
+            "respond_to" => changed.respond_to = crate::managed_agents::RespondTo::Anyone,
+            "allowlist" => changed.respond_to_allowlist = vec!["PRIVATE_CANARY".into()],
+            "team" => changed.team_id = Some("PRIVATE_CANARY".into()),
             _ => {
                 changed
                     .env_vars
@@ -53,8 +67,8 @@ fn claude_lifecycle_target_contract_is_exact_and_private_fields_are_untouched() 
         target_contract(std::slice::from_ref(&initial), false).is_err(),
         "initial must never start"
     );
-    assert!(target_contract_with_initial(std::slice::from_ref(&initial), false, true).is_ok());
-    assert!(target_contract_with_initial(&[initial], true, true).is_err());
+    assert!(target_contract_with_initial(std::slice::from_ref(&initial), &[], false, true).is_ok());
+    assert!(target_contract_with_initial(&[initial], &[], true, true).is_err());
     for change in ["missing", "wrong", "extra", "parallelism"] {
         let mut changed = original.clone();
         match change {
@@ -745,16 +759,173 @@ fn confined_initial_inspection(home: &Path) {
             "autostartOff",
             "bindingPresent",
             "configuredNormalSettingsMatch",
+            "creatorSnapshotMatches",
             "defaultTransport",
             "initialSettingsMatch",
             "localBackend",
             "nameMatches",
             "normalCommandMatches",
+            "personaIsSelf",
             "relayMatches",
             "runtimeUnset",
+            "selfDefinitionUnique",
+            "sourceVersionMatches",
+            "teamNone",
             "unlinked"
         ]
     );
+    let base = crate::managed_agents::managed_agents_base_dir(&handle).unwrap();
+    assert_eq!(
+        crate::migration::backfill_standalone_agents_in_dir_for_test(&base).unwrap(),
+        1
+    );
+    let backfilled = load_managed_agents(&handle)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.pubkey == core::TARGET)
+        .unwrap();
+    assert_eq!(backfilled.persona_id.as_deref(), Some(core::TARGET));
+    let backfilled_projection = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(
+        backfilled_projection["contractMatches"], true,
+        "the actual normal creator→startup-backfill snapshot must retain its fixed contract"
+    );
+    assert_eq!(backfilled_projection["stoppedInitialMatches"], true);
+    let definitions = crate::managed_agents::storage::load_agent_definitions(&handle).unwrap();
+    let manufactured = definitions
+        .iter()
+        .find(|d| d.slug.as_deref() == Some(core::TARGET))
+        .unwrap()
+        .clone();
+    for field in [
+        "foreign",
+        "persona_case",
+        "missing",
+        "duplicate",
+        "duplicate_case",
+        "prompt",
+        "model",
+        "provider",
+        "runtime",
+        "env",
+        "transport",
+        "session",
+        "respond_to",
+        "parallelism",
+        "team",
+        "stale_hash",
+        "provenance",
+    ] {
+        let mut row = backfilled.clone();
+        let mut definition = manufactured.clone();
+        match field {
+            "foreign" => row.persona_id = Some("foreign".into()),
+            "persona_case" => row.persona_id = Some(core::TARGET.to_uppercase()),
+            "prompt" => definition.system_prompt = Some("nsec1_PRIVATE_CANARY".into()),
+            "model" => definition.model = Some("PRIVATE_CANARY".into()),
+            "provider" => definition.provider = Some("PRIVATE_CANARY".into()),
+            "runtime" => definition.runtime = Some("PRIVATE_CANARY".into()),
+            "env" => {
+                definition
+                    .env_vars
+                    .insert("PRIVATE_TOKEN".into(), "nsec1_PRIVATE_CANARY".into());
+            }
+            "transport" => definition.acp_command = "/bin/sh".into(),
+            "session" => {
+                definition.session_policy = crate::managed_agents::AcpSessionPolicy::Thread
+            }
+            "respond_to" => definition.definition_respond_to = Some("all".into()),
+            "parallelism" => definition.definition_parallelism = Some(1),
+            "team" => row.team_id = Some("PRIVATE_CANARY".into()),
+            "provenance" => definition.source_team = Some("PRIVATE_CANARY".into()),
+            "stale_hash" => row.persona_source_version = Some("0".repeat(64)),
+            _ => {}
+        }
+        // Even a recomputed matching hash cannot bless an injected definition.
+        if !matches!(field, "stale_hash" | "foreign" | "persona_case") {
+            let view = definition.to_definition_view().unwrap();
+            row.persona_source_version =
+                Some(crate::managed_agents::persona_events::persona_content_hash(
+                    &crate::managed_agents::persona_events::persona_event_content(&view),
+                ));
+        }
+        let mut changed: Vec<_> = definitions
+            .iter()
+            .filter(|d| d.slug.as_deref() != Some(core::TARGET))
+            .cloned()
+            .collect();
+        if field != "missing" {
+            changed.push(definition.clone());
+        }
+        if matches!(field, "duplicate" | "duplicate_case") {
+            if field == "duplicate_case" {
+                definition.slug = Some(core::TARGET.to_uppercase());
+            }
+            changed.push(definition);
+        }
+        crate::managed_agents::storage::save_agent_definitions(&handle, &changed).unwrap();
+        save_managed_agents(&handle, &[row]).unwrap();
+        let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+        assert_eq!(result["contractMatches"], false, "{field}");
+        assert_eq!(result["stoppedInitialMatches"], false, "{field}");
+        assert!(
+            !serde_json::to_string(&result).unwrap().contains("CANARY"),
+            "{field}"
+        );
+    }
+    crate::managed_agents::storage::save_agent_definitions(&handle, &definitions).unwrap();
+    for configured in [false, true] {
+        let mut row = backfilled.clone();
+        if configured {
+            row.env_vars = core::configured_env();
+            row.parallelism = 1;
+        }
+        save_managed_agents(&handle, &[row]).unwrap();
+        let result = inspect_initial_in(&handle, &|| Ok(())).unwrap();
+        for flag in [
+            "personaIsSelf",
+            "teamNone",
+            "selfDefinitionUnique",
+            "creatorSnapshotMatches",
+            "sourceVersionMatches",
+        ] {
+            assert_eq!(result["checks"][flag], true, "{flag}");
+        }
+        assert_eq!(result["checks"]["unlinked"], false);
+        assert_eq!(result["contractMatches"], true);
+        check_attachment_in(&handle, &|| Ok(()), &|| Ok(())).unwrap();
+    }
+    save_managed_agents(&handle, std::slice::from_ref(&backfilled)).unwrap();
+    for to_setup in [true, false] {
+        let guard =
+            |rows: &[ManagedAgentRecord],
+             runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>| {
+                check_target_with_initial(&handle, rows, runtimes, !to_setup, false, to_setup)
+            };
+        super::super::super::agent_models::update_managed_agent_local_guarded_in(
+            serde_json::from_value(core::update(to_setup)).unwrap(),
+            &handle,
+            &state,
+            (&guard, &|| Ok(())),
+        )
+        .unwrap();
+        let rows = load_managed_agents(&handle).unwrap();
+        check_target(
+            &handle,
+            &rows,
+            &state.managed_agent_processes.lock().unwrap(),
+            to_setup,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rows[0].persona_id.as_deref(), Some(core::TARGET));
+        assert_eq!(
+            rows[0].persona_source_version,
+            backfilled.persona_source_version
+        );
+        assert!(!rows[0].start_on_app_launch && rows[0].runtime_pid.is_none());
+    }
+    save_managed_agents(&handle, std::slice::from_ref(&original)).unwrap();
     for field in [
         "name",
         "backend",
@@ -802,7 +973,7 @@ fn confined_initial_inspection(home: &Path) {
             _ => changed.pubkey = "f".repeat(64),
         }
         let expected =
-            target_contract_with_initial(std::slice::from_ref(&changed), false, true).is_ok();
+            target_contract_with_initial(std::slice::from_ref(&changed), &[], false, true).is_ok();
         assert!(
             !expected,
             "fixture mutation must actually fail the existing guard: {field}"

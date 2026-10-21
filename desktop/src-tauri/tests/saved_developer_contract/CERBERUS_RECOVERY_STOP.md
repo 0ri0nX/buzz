@@ -52,6 +52,28 @@ Failure may occur before termination or after termination during normal save or
 summary. Such uncertain outcomes remain consumed Unknown; never blindly retry.
 The operation does not start, configure, adopt, recover or publish anything.
 
+`inspect_cerberus_recovery_state` is a separate fixed expiresAt-only semantic
+inspection using the same owner/relay/deadline guards and canonical locks. It
+does not call Stop or waive its guards. Closed result fields are only:
+
+```text
+pubkey, recordState:missing|unique|ambiguous, recordKeyExact:bool,
+localBackend:bool, recordRelay:empty|fixed|other|unavailable,
+pairState:missing|unique|ambiguous, pairScopeMatches:bool,
+scalarPidState:absent|matches|other|unavailable, stopPreflightMatches:bool
+```
+
+The final boolean calls the actual unchanged strict Stop preflight. In particular,
+an empty saved relay is reported as `empty`, not silently treated as the fixed
+relay even though ordinary normal Stop has a legacy empty-relay path. No raw row,
+PID, environment, paths, summary, errors or credentials are returned. Normal
+loading may hydrate/migrate internal metadata, so this is not a zero-write claim;
+inspection itself never reaps, stops, starts or publishes. The observations are
+not settlement/readiness/recovery authorization and do not replay an Unknown.
+Main's existing runtime-inspection caller offers fixed `--cerberus-recovery-state`
+and `--claude-initial-state` modes with the same closed validation, not new tools
+or caller-selected targets. Existing generic inspect/ensure modes are unchanged.
+
 Tests use disposable app data and owned inert process groups, never actual Desktop,
 provider, IPC, credential state or projected files. Native checks use Main's shared
 5GiB/swap0 capped runner and the pinned offline, unprivileged Docker recipe.

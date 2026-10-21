@@ -13,6 +13,10 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 pub(crate) const OPERATION: &str = "stop_cerberus_for_recovery";
+const INSPECT: &str = "inspect_cerberus_recovery_state";
+pub(crate) fn is_operation(op: &str) -> bool {
+    matches!(op, OPERATION | INSPECT)
+}
 const TARGET: &str = "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87";
 const OWNER: &str = "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68";
 const RELAY: &str = "wss://buzz.rowvia.ai:8443";
@@ -190,15 +194,98 @@ fn public_result(pid: u32, launcher: Value) -> Map<String, Value> {
 
 pub(crate) fn execute(
     app: &AppHandle,
+    operation: &str,
     args: &Map<String, Value>,
     still_live: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Map<String, Value>, String> {
     let state = app.state::<AppState>();
-    execute_in(app, &|| {
+    let authorize = || {
         still_live()?;
         current_scope(&state, args)?;
         still_live()
-    })
+    };
+    match operation {
+        INSPECT => inspect_in(app, &authorize),
+        OPERATION => execute_in(app, &authorize),
+        _ => Err("invalid_request".into()),
+    }
+}
+
+fn inspect_in<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    authorize: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Map<String, Value>, String> {
+    let state = app.state::<AppState>();
+    let _workspace = state
+        .workspace_apply_lock
+        .try_lock()
+        .map_err(|_| "not_ready")?;
+    let _identity = state
+        .identity_mutation
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    authorize()?;
+    // Normal loading can hydrate/migrate metadata; never list/reap/start/stop.
+    let rows = crate::managed_agents::load_managed_agents(app).map_err(|_| "operation_failed")?;
+    authorize()?;
+    let runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|_| "operation_failed")?;
+    authorize()?;
+    let matches: Vec<_> = rows
+        .iter()
+        .filter(|r| r.pubkey.eq_ignore_ascii_case(TARGET))
+        .collect();
+    let pairs: Vec<_> = runtimes
+        .iter()
+        .filter(|(k, _)| k.pubkey.eq_ignore_ascii_case(TARGET))
+        .collect();
+    let cardinality = |len| match len {
+        0 => "missing",
+        1 => "unique",
+        _ => "ambiguous",
+    };
+    let row = match matches.as_slice() {
+        [row] => Some(*row),
+        _ => None,
+    };
+    let pair = match pairs.as_slice() {
+        [pair] => Some(*pair),
+        _ => None,
+    };
+    let record_state = cardinality(matches.len());
+    let pair_state = cardinality(pairs.len());
+    let record_exact = row.is_some_and(|r| r.pubkey == TARGET);
+    let local = row.is_some_and(|r| r.backend == BackendKind::Local);
+    let relay = row.map_or("unavailable", |r| match r.relay_url.as_str() {
+        "" => "empty",
+        RELAY => "fixed",
+        _ => "other",
+    });
+    let pair_scope = pair.is_some_and(|(key, _)| key.pubkey == TARGET && key.relay_url == RELAY);
+    let scalar = row.map_or("unavailable", |r| match r.runtime_pid {
+        None => "absent",
+        Some(pid) if pair.is_some_and(|(_, runtime)| runtime.child.id() == pid) => "matches",
+        Some(_) => "other",
+    });
+    let preflight = check_target(&rows, &runtimes).is_ok();
+    drop(pairs);
+    drop(matches);
+    drop(runtimes);
+    drop(rows);
+    authorize()?;
+    Ok(json!({"pubkey":TARGET,"recordState":record_state,"recordKeyExact":record_exact,
+        "localBackend":local,"recordRelay":relay,"pairState":pair_state,"pairScopeMatches":pair_scope,
+        "scalarPidState":scalar,"stopPreflightMatches":preflight}).as_object().unwrap().clone())
 }
 
 fn execute_in<R: tauri::Runtime>(

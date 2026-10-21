@@ -1393,6 +1393,8 @@ pub use fold::fold_personas_into_agent_store;
 use fold::load_persona_runtimes;
 mod backfill;
 pub use backfill::backfill_standalone_agents;
+#[cfg(test)]
+pub(crate) use backfill::backfill_standalone_agents_in_dir_for_test;
 mod detach;
 mod pollen;
 mod team_membership;

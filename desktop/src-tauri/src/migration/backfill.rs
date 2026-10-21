@@ -136,5 +136,10 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn backfill_standalone_agents_in_dir_for_test(base: &Path) -> Result<usize, String> {
+    backfill_standalone_agents_in_dir(base)
+}
+
+#[cfg(test)]
 #[path = "backfill_tests.rs"]
 mod tests;

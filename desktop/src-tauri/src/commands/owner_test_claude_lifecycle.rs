@@ -165,27 +165,115 @@ fn receipt_present<R: tauri::Runtime>(
     Ok(false)
 }
 
+#[cfg(test)]
 fn target_contract(
     rows: &[ManagedAgentRecord],
     setup: bool,
 ) -> Result<&ManagedAgentRecord, String> {
-    target_contract_with_initial(rows, setup, false)
+    target_contract_with_initial(rows, &[], setup, false)
 }
 
-fn target_contract_with_initial(
-    rows: &[ManagedAgentRecord],
+// Static creator semantics, never a snapshot derived from a mutable linked row.
+fn linkage_facts(record: &ManagedAgentRecord, definitions: &[ManagedAgentRecord]) -> [bool; 5] {
+    use crate::managed_agents::persona_events::{
+        persona_content_hash, persona_event_content, PersonaEventContent,
+    };
+    let expected = PersonaEventContent {
+        display_name: "Rowvia Developer Claude".into(),
+        system_prompt: Some(String::new()),
+        acp_command: None,
+        avatar_url: super::resolve_created_avatar_url(None, None, core::PYTHON),
+        runtime: None,
+        model: None,
+        provider: None,
+        name_pool: Vec::new(),
+        respond_to: Some("owner-only".into()),
+        respond_to_allowlist: Vec::new(),
+        parallelism: Some(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+        description: None,
+        session_policy: crate::managed_agents::AcpSessionPolicy::Channel,
+    };
+    let persona_self = record.persona_id.as_deref() == Some(core::TARGET);
+    let matches: Vec<_> = definitions
+        .iter()
+        .filter(|d| {
+            d.slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(core::TARGET))
+        })
+        .collect();
+    let definition = match matches.as_slice() {
+        [d] if persona_self && d.slug.as_deref() == Some(core::TARGET) => Some(*d),
+        _ => None,
+    };
+    let view = definition.and_then(ManagedAgentRecord::to_definition_view);
+    let snapshot = view.as_ref().is_some_and(|v| {
+        persona_event_content(v) == expected
+            && v.env_vars.is_empty()
+            && !v.is_builtin
+            && v.is_active
+            && !v.shared
+            && v.source_team.is_none()
+            && v.source_team_persona_slug.is_none()
+            && v.catalog_source.is_none()
+            && v.team_catalog_source.is_none()
+    }) && definition.is_some_and(|d| {
+        d.persona_id.is_none()
+            && d.team_id.is_none()
+            && d.auth_tag.is_none()
+            && d.private_key_nsec.is_empty()
+            && d.backend == BackendKind::Local
+            && d.agent_command.is_empty()
+            && d.agent_command_override.is_none()
+            && d.agent_args.is_empty()
+            && d.mcp_command.is_empty()
+            && d.runtime_pid.is_none()
+            && !d.start_on_app_launch
+    });
+    let version = view.as_ref().is_some_and(|v| {
+        record.persona_source_version.as_deref()
+            == Some(persona_content_hash(&persona_event_content(v)).as_str())
+    });
+    [
+        persona_self,
+        definition.is_some(),
+        snapshot,
+        version,
+        record.team_id.is_none(),
+    ]
+}
+
+fn target_contract_with_initial<'a>(
+    rows: &'a [ManagedAgentRecord],
+    definitions: &[ManagedAgentRecord],
     setup: bool,
     allow_initial: bool,
-) -> Result<&ManagedAgentRecord, String> {
+) -> Result<&'a ManagedAgentRecord, String> {
     let mut matches = rows.iter().filter(|r| r.pubkey == core::TARGET);
     let record = matches.next().ok_or("target_contract_mismatch")?;
+    let link = linkage_facts(record, definitions);
     let (command, args) = core::command(setup);
     if matches.next().is_some()
         || record.name != "Rowvia Developer Claude"
         || record.backend != BackendKind::Local
         || record.acp_command != crate::managed_agents::DEFAULT_ACP_COMMAND
-        || record.persona_id.is_some()
-        || record.team_id.is_some()
+        || !((record.persona_id.is_none() && record.persona_source_version.is_none() && link[4])
+            || link.iter().all(|v| *v))
+        || record.persona_team_dir.is_some()
+        || record.persona_name_in_team.is_some()
+        || record
+            .system_prompt
+            .as_deref()
+            .is_some_and(|p| !p.is_empty())
+        || record.model.is_some()
+        || record.provider.is_some()
+        || record.effort_level.is_some()
+        || record.relay_mesh.is_some()
+        || record.respond_to != crate::managed_agents::RespondTo::OwnerOnly
+        || !record.respond_to_allowlist.is_empty()
+        || record.session_policy != crate::managed_agents::AcpSessionPolicy::Channel
+        || record.idle_timeout_seconds.is_some()
+        || record.max_turn_duration_seconds.is_some()
         || record.runtime.is_some()
         || record.auth_tag.as_ref().is_none_or(|tag| tag.is_empty())
         || record.start_on_app_launch
@@ -222,11 +310,9 @@ fn check_target_with_initial<R: tauri::Runtime>(
     stopping: bool,
     allow_initial: bool,
 ) -> Result<(), String> {
-    let record = if allow_initial {
-        target_contract_with_initial(rows, setup, true)?
-    } else {
-        target_contract(rows, setup)?
-    };
+    let definitions = crate::managed_agents::storage::load_agent_definitions(app)
+        .map_err(|_| "operation_failed")?;
+    let record = target_contract_with_initial(rows, &definitions, setup, allow_initial)?;
     let pairs: Vec<_> = runtimes
         .keys()
         .filter(|k| k.pubkey == core::TARGET)
@@ -349,6 +435,8 @@ fn inspect_initial_in<R: tauri::Runtime>(
     authorize()?;
     // Normal loading may hydrate/migrate internal keys. Not a zero-write claim.
     let rows = crate::managed_agents::load_managed_agents(app).map_err(|_| "operation_failed")?;
+    let definitions = crate::managed_agents::storage::load_agent_definitions(app)
+        .map_err(|_| "operation_failed")?;
     authorize()?;
     let runtimes = state
         .managed_agent_processes
@@ -369,7 +457,7 @@ fn inspect_initial_in<R: tauri::Runtime>(
         _ => None,
     };
     // These actual guards remain authoritative, not the diagnostic flags below.
-    let contract = target_contract_with_initial(&rows, false, true).is_ok();
+    let contract = target_contract_with_initial(&rows, &definitions, false, true).is_ok();
     let stopped = check_target_with_initial(app, &rows, &runtimes, false, false, true).is_ok();
     let no_pairs = !runtimes.keys().any(|key| key.pubkey == core::TARGET);
     let no_scalar = row.is_some_and(|row| row.runtime_pid.is_none());
@@ -377,6 +465,7 @@ fn inspect_initial_in<R: tauri::Runtime>(
     let receipts_readable = receipts.is_ok();
     let no_receipts = matches!(receipts, Ok(false));
     let checks = row.map(|row| {
+        let link = linkage_facts(row, &definitions);
         [
             row.name == "Rowvia Developer Claude",
             row.backend == BackendKind::Local,
@@ -392,11 +481,17 @@ fn inspect_initial_in<R: tauri::Runtime>(
                 && row.parallelism == crate::managed_agents::DEFAULT_AGENT_PARALLELISM,
             row.env_vars == core::configured_env() && row.parallelism == 1,
             row.relay_url == core::RELAY,
+            link[0],
+            link[1],
+            link[2],
+            link[3],
+            link[4],
         ]
     });
     drop(matching);
     drop(runtimes);
     drop(rows);
+    drop(definitions);
     authorize()?;
     Ok(
         serde_json::json!({"pubkey":core::TARGET,"recordState":record_state,
@@ -405,7 +500,9 @@ fn inspect_initial_in<R: tauri::Runtime>(
         "checks":checks.map(|c|serde_json::json!({"nameMatches":c[0],"localBackend":c[1],
             "defaultTransport":c[2],"unlinked":c[3],"runtimeUnset":c[4],"bindingPresent":c[5],
             "autostartOff":c[6],"normalCommandMatches":c[7],"initialSettingsMatch":c[8],
-            "configuredNormalSettingsMatch":c[9],"relayMatches":c[10]}))})
+            "configuredNormalSettingsMatch":c[9],"relayMatches":c[10],
+            "personaIsSelf":c[11],"selfDefinitionUnique":c[12],
+            "creatorSnapshotMatches":c[13],"sourceVersionMatches":c[14],"teamNone":c[15]}))})
         .as_object()
         .unwrap()
         .clone(),

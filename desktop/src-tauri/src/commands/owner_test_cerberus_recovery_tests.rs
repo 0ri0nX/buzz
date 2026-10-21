@@ -205,6 +205,94 @@ fn confined_stop(home: &Path) {
         .lock()
         .unwrap()
         .insert(key.clone(), ManagedAgentPairRuntime::starting(runtime));
+    for relay in ["", RELAY, "ws://127.0.0.1:9"] {
+        let mut row = original.clone();
+        row.relay_url = relay.into();
+        save_managed_agents(&handle, &[row]).unwrap();
+        let facts = inspect_in(&handle, &|| Ok(())).unwrap();
+        assert_eq!(
+            facts.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "localBackend",
+                "pairScopeMatches",
+                "pairState",
+                "pubkey",
+                "recordKeyExact",
+                "recordRelay",
+                "recordState",
+                "scalarPidState",
+                "stopPreflightMatches"
+            ]
+        );
+        assert_eq!(
+            facts["recordRelay"],
+            if relay.is_empty() {
+                "empty"
+            } else if relay == RELAY {
+                "fixed"
+            } else {
+                "other"
+            }
+        );
+        assert_eq!(facts["stopPreflightMatches"], relay == RELAY);
+        assert_eq!(facts["pairState"], "unique");
+        assert_eq!(facts["pairScopeMatches"], true);
+        assert_eq!(facts["scalarPidState"], "absent");
+        assert!(!serde_json::to_string(&facts).unwrap().contains("CANARY"));
+    }
+    for field in ["duplicate", "case", "backend", "scalar"] {
+        let mut row = original.clone();
+        match field {
+            "case" => row.pubkey = TARGET.to_uppercase(),
+            "backend" => {
+                row.backend = BackendKind::Provider {
+                    id: "PRIVATE_CANARY".into(),
+                    config: Value::Null,
+                }
+            }
+            "scalar" => row.runtime_pid = Some(pid + 1),
+            _ => {}
+        }
+        let rows = if field == "duplicate" {
+            vec![row.clone(), row]
+        } else {
+            vec![row]
+        };
+        save_managed_agents(&handle, &rows).unwrap();
+        let facts = inspect_in(&handle, &|| Ok(())).unwrap();
+        assert_eq!(facts["stopPreflightMatches"], false, "{field}");
+        assert!(!serde_json::to_string(&facts).unwrap().contains("CANARY"));
+    }
+    save_managed_agents(&handle, &[]).unwrap();
+    let missing = inspect_in(&handle, &|| Ok(())).unwrap();
+    assert_eq!(missing["recordState"], "missing");
+    assert_eq!(missing["recordRelay"], "unavailable");
+    assert_eq!(missing["scalarPidState"], "unavailable");
+    save_managed_agents(&handle, std::slice::from_ref(&original)).unwrap();
+    for fail_at in 0..4 {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(inspect_in(&handle, &|| {
+            if calls.fetch_add(1, Ordering::SeqCst) == fail_at {
+                Err("invalid_request".into())
+            } else {
+                Ok(())
+            }
+        })
+        .is_err());
+    }
+    assert!(
+        state
+            .managed_agent_processes
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "inspection must not stop/reap the tracked child"
+    );
     assert!(check_target(
         &[original.clone(), original.clone()],
         &state.managed_agent_processes.lock().unwrap()
@@ -230,10 +318,12 @@ fn confined_stop(home: &Path) {
     }
 
     // Actual transition/store waits precede authorization, never termination.
-    for (transition, error) in [
-        (false, "scope_mismatch"),
-        (true, "invalid_request"),
-        (false, "not_ready"),
+    for (inspection, transition, error) in [
+        (false, false, "scope_mismatch"),
+        (false, true, "invalid_request"),
+        (false, false, "not_ready"),
+        (true, false, "scope_mismatch"),
+        (true, true, "invalid_request"),
     ] {
         let held_transition =
             transition.then(|| state.managed_agent_runtime_transition.lock().unwrap());
@@ -245,14 +335,19 @@ fn confined_stop(home: &Path) {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
+            let authorize = || {
+                if worker_denied.load(Ordering::Acquire) {
+                    Err(error.into())
+                } else {
+                    Ok(())
+                }
+            };
             done_tx
-                .send(execute_in(&worker_handle, &|| {
-                    if worker_denied.load(Ordering::Acquire) {
-                        Err(error.into())
-                    } else {
-                        Ok(())
-                    }
-                }))
+                .send(if inspection {
+                    inspect_in(&worker_handle, &authorize)
+                } else {
+                    execute_in(&worker_handle, &authorize)
+                })
                 .unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
