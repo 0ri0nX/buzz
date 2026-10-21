@@ -225,21 +225,26 @@ fn execute_in<R: tauri::Runtime>(
          runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>| {
             let (row, pid) = check_target(rows, runtimes)?;
             authorize()?;
-            // Saved views cannot merge/retire builtins before a later refusal.
-            let personas = crate::managed_agents::storage::load_agent_definitions(app)
-                .map_err(|_| "operation_failed")?
-                .into_iter()
-                .filter_map(|definition| definition.to_definition_view())
-                .collect::<Vec<_>>();
-            let global = crate::managed_agents::load_global_agent_config(app)
-                .map_err(|_| "operation_failed")?;
-            let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
-                row, &personas, &global,
-            )
-            .map_err(|_| "operation_failed")?;
-            let launcher =
-                launcher_projection(&row.acp_command, &descriptor.command, &descriptor.args);
-            drop(descriptor); // layered env never reaches the public result
+            // Optional saved views cannot merge/retire builtins or block Stop.
+            // Read/resolution errors and layered env never reach the result.
+            let launcher = (|| {
+                let personas = crate::managed_agents::storage::load_agent_definitions(app)
+                    .ok()?
+                    .into_iter()
+                    .filter_map(|definition| definition.to_definition_view())
+                    .collect::<Vec<_>>();
+                let global = crate::managed_agents::load_global_agent_config(app).ok()?;
+                let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+                    row, &personas, &global,
+                )
+                .ok()?;
+                Some(launcher_projection(
+                    &row.acp_command,
+                    &descriptor.command,
+                    &descriptor.args,
+                ))
+            })()
+            .unwrap_or_else(|| launcher_projection("", "", &[]));
             authorize()?;
             *captured.lock().map_err(|_| "operation_failed")? = Some((pid, launcher));
             Ok(())

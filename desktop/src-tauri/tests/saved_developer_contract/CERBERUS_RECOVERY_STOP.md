@@ -17,10 +17,15 @@ are not rewritten; ordinary Stop retains its normal status/storage bookkeeping.
 Its existing post-Stop summary may merge builtin definitions; the projection
 adds no such pre-Stop materialization.
 
-Strict normal descriptor resolution over read-only saved definition views (no
-pre-Stop builtin merge/retirement) provides a **current saved configuration**
-pointer, not attestation of the old process's argv. Its layered environment and
-the full normal summary/errors are dropped, never serialized. Success has only:
+Best-effort normal descriptor resolution over read-only saved definition views
+(no pre-Stop builtin merge/retirement) provides a **current saved configuration**
+pointer, not attestation of the old process's argv. If saved definition/config
+reads or effective harness resolution fail, the optional launcher projection is
+`{outerProgram:null,agentProgram:null,sourcePaths:[],configPaths:[]}` and the
+authorized guarded normal Stop continues. Authority, ownership, scope, expiry,
+lock and post-synchronization rechecks still apply. Layered environment,
+resolution errors and the full normal summary/errors are dropped, never
+serialized. Success has only:
 
 ```text
 pubkey, relayUrl, stopCompleted:true, trackedChildPid, trackedChildSettled:true,

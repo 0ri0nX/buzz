@@ -205,21 +205,6 @@ fn confined_stop(home: &Path) {
         .lock()
         .unwrap()
         .insert(key.clone(), ManagedAgentPairRuntime::starting(runtime));
-    // Projection refusal must not materialize/retire definitions before Stop.
-    // This fresh store has not run the normal post-Stop summary/merge yet.
-    let mut dangling = original.clone();
-    dangling.agent_command_override = None;
-    dangling.runtime = Some("rowvia-inert-missing-recovery-harness".into());
-    save_managed_agents(&handle, std::slice::from_ref(&dangling)).unwrap();
-    let store = data.join("agents/managed-agents.json");
-    let before = fs::read(&store).unwrap();
-    assert!(execute_in(&handle, &|| Ok(())).is_err());
-    assert!(
-        fs::read(&store).unwrap() == before,
-        "refused projection must not write definitions/config"
-    );
-    assert!(Path::new(&format!("/proc/{pid}")).exists());
-    save_managed_agents(&handle, std::slice::from_ref(&original)).unwrap();
     assert!(check_target(
         &[original.clone(), original.clone()],
         &state.managed_agent_processes.lock().unwrap()
@@ -281,9 +266,29 @@ fn confined_stop(home: &Path) {
         worker.join().unwrap();
         assert!(Path::new(&format!("/proc/{pid}")).exists());
     }
-    let result = execute_in(&handle, &|| Ok(())).unwrap();
+    // Optional current-config projection must not block an authorized normal
+    // Stop of the exact tracked child when its saved harness is unavailable.
+    let mut dangling = original.clone();
+    dangling.agent_command_override = None;
+    dangling.runtime = Some("rowvia-inert-missing-recovery-harness".into());
+    save_managed_agents(&handle, std::slice::from_ref(&dangling)).unwrap();
+    assert!(crate::managed_agents::resolve_effective_harness_descriptor(
+        &dangling,
+        &[],
+        &Default::default()
+    )
+    .is_err());
+    let result = execute_in(&handle, &|| Ok(()))
+        .expect("unavailable optional launcher projection must not prevent normal Stop");
     assert_eq!(result["trackedChildPid"], pid);
     assert_eq!(result["trackedChildSettled"], true);
+    assert_eq!(result["launcherBasis"], "current_saved_effective_config");
+    assert_eq!(
+        result["launcher"],
+        serde_json::json!({
+            "outerProgram":null,"agentProgram":null,"sourcePaths":[],"configPaths":[]
+        })
+    );
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
     assert!(state.managed_agent_processes.lock().unwrap().is_empty());
     let mut saved = load_managed_agents(&handle)
@@ -297,7 +302,7 @@ fn confined_stop(home: &Path) {
     saved.last_exit_code = original.last_exit_code;
     assert_eq!(
         serde_json::to_value(saved).unwrap(),
-        serde_json::to_value(original).unwrap()
+        serde_json::to_value(dangling).unwrap()
     );
     let bytes = serde_json::to_string(&result).unwrap();
     for private in ["CANARY", "nsec", "env", "auth", "private_key"] {
