@@ -327,6 +327,7 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "start_saved_claude_setup"
                 | "stop_restore_saved_claude_normal"
                 | "start_saved_claude_normal"
+                | "stop_cerberus_for_recovery"
                 | "inspect_saved_connector"
                 | "prepare_saved_connector"
                 | "approve_saved_connector"
@@ -346,6 +347,10 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
     }
     if request.operation == crate::commands::owner_test_claude_create::OPERATION {
         crate::commands::owner_test_claude_create::validate_arguments(&request.arguments)
+            .map_err(|_| Code::InvalidRequest)?;
+    }
+    if request.operation == crate::commands::owner_test_cerberus_recovery::OPERATION {
+        crate::commands::owner_test_cerberus_recovery::validate_arguments(&request.arguments)
             .map_err(|_| Code::InvalidRequest)?;
     }
     if crate::commands::owner_test_claude_lifecycle::is_operation(&request.operation) {
@@ -764,6 +769,21 @@ async fn dispatch(
         Admission::Dispatch(rx) => rx,
         Admission::Return(response) => return response,
     };
+    if request.operation == crate::commands::owner_test_cerberus_recovery::OPERATION {
+        let arguments = request.arguments.clone();
+        let native_app = app.clone();
+        let cancel = hook.cancel.clone();
+        return dispatch_native(hook, &request, deadline, move || {
+            crate::commands::owner_test_cerberus_recovery::execute(&native_app, &arguments, &|| {
+                if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                    Err("not_ready".into())
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await;
+    }
     if request.operation == crate::commands::owner_test_claude_create::OPERATION {
         let arguments = request.arguments.clone();
         let native_app = app.clone();
@@ -1009,6 +1029,24 @@ mod tests {
     }
 
     include!("owner_test_hook_message_tests.rs");
+
+    #[test]
+    fn cerberus_recovery_stop_is_native_closed_and_expiring() {
+        let mut r = request();
+        r.operation = "stop_cerberus_for_recovery".into();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        r.arguments =
+            serde_json::from_value(serde_json::json!({"expiresAt":now + 60_000})).unwrap();
+        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
+        r.arguments
+            .insert("pubkey".into(), Value::String("arbitrary".into()));
+        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+        r.arguments = serde_json::from_value(serde_json::json!({"expiresAt":now - 1})).unwrap();
+        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_err());
+    }
 
     #[test]
     fn rejects_oversize_operation_and_scope() {

@@ -13,6 +13,8 @@ mod agent_settings;
 mod agent_update_rollback;
 mod agents;
 #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+pub(crate) use agents::owner_test_cerberus_recovery;
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
 pub(crate) use agents::owner_test_claude_create;
 #[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
 pub(crate) use agents::owner_test_claude_lifecycle;

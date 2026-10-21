@@ -66,6 +66,10 @@ pub(crate) mod owner_test_claude_create;
 #[path = "owner_test_claude_lifecycle.rs"]
 pub(crate) mod owner_test_claude_lifecycle;
 
+#[cfg(all(unix, feature = "rowvia-owner-test-hook"))]
+#[path = "owner_test_cerberus_recovery.rs"]
+pub(crate) mod owner_test_cerberus_recovery;
+
 pub(super) type ManagedAgentOperationGuard<'a> = dyn Fn(
         &[ManagedAgentRecord],
         &std::collections::HashMap<
@@ -1193,6 +1197,8 @@ pub(super) fn stop_managed_agent_guarded_in<R: tauri::Runtime>(
         state.clear_agent_session_caches(pubkey);
     }
 
+    // Fixed guarded callers must not fall through to legacy/no-pair Stop after sync.
+    guard(&records, &runtimes)?;
     {
         let record = find_managed_agent_mut(&mut records, pubkey)?;
         // Remote agents are stopped via !shutdown @mention from the frontend,
