@@ -223,4 +223,33 @@ Rowvia supplies Memory, connectors, credentials and grants. Claude is deferred.
   earlier source/control review.
   No production artifact/deployment or new UI acceptance is inferred.
 
+- Successor deployment —2026-10-22: source9581b68931bc3299f3339861b70c001f6f19b395
+  completes the unchanged Git-archive live builder, release45m59s under5GiB/
+  swap0. Exactly two Rust warnings match2526; no Cargo--locked claim. Desktop
+  lock canonical ordering changes only rustix/rustls, no package/version/checksum
+  changes. Fresh independent review accepts ELF3d98feccc46dd98b70bba4fd88aada115c137784af33dbe781c39b57cb6e18b1,
+  provenance1492a2a375b0412a2687d18a02081d561982733257b46cfc31de20fed9a22140,
+  exact source/image/live/owner-hook/custody/host-loader and four-field v2 pin.
+  Actual Desktop-only preflight/install pass, PID3094590 uses native-root-r2;
+  post-switch retained bindings/selected SHA/backup-h9bzs7s_ baseline pass.
+  Original Codex25206/1661814 and supervisor219171 retain ticks51595/
+  20260056/50216802; Paseo1706710 is unchanged. The independently failed
+  original adapter was recovered beforehand via its existing frozen-config
+  route to PID2950386, without Codex restart or replay. No cause is inferred.
+  Fresh strict-array registry projection uses start_on_app_launch (missing
+  defaults true), not the first projection's incorrect autostart field:
+  16records/pending0/effectiveAutostart0/missingFields0; ordered public-key
+  fingerprint16627895d844c3857e61359f44330e90d7f1eab16378035572bac5e116f0fc36
+  is unchanged across activation, including eight existing empty legacy keys.
+  Optional all-hex/nonempty inventory assertions refused before any mutation;
+  they are not product guards and no product validation was weakened.
+  Owner hook ready/sends0; existing scoped ensure starts the same Cerberus to
+  listeningPID3098420. No approval, Save, provider/model task or publication
+  is fabricated. Genuine Linux Desktop owner flow remains mandatory.
+  Hosted39834005531 Linux Core is terminal green: native3528passed/0failed/
+  19ignored, Mesh and compiled-flag verification pass. Windows13 failures and
+  the one narrow-window relay E2E layout failure exactly match7069; dependency
+  advisories/GHCR export failures also remain. Whole CI is not green and draft
+  PR11 is not promoted to human-accepted/completed.
+
 ## Done
