@@ -1,3 +1,4 @@
+use super::super::tests::node_for_test;
 use super::*;
 use crate::commands::agents::rowvia_saved_agent::{
     ConfirmedRowviaSavedAgentPreparationAck, RowviaSavedAgentNativeScope,
@@ -110,7 +111,7 @@ impl C2Boundary for Boundary {
 }
 fn fixture() -> FixedInstallation {
     FixedInstallation {
-        node: File::open("/usr/bin/node").unwrap(),
+        node: node_for_test().unwrap(),
         entrypoint: Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/commands/rowvia_saved_agent_owner_host_fixture.mjs"),
         working_directory: "/".into(),

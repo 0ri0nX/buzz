@@ -4,6 +4,58 @@ use super::super::super::rowvia_saved_agent::{
 use super::super::*;
 use super::*;
 use serde_json::{json, Value};
+use std::{ffi::OsStr, os::unix::fs::PermissionsExt};
+
+#[path = "rowvia_saved_agent_prepare_deadline_tests.rs"]
+mod deadline_tests;
+
+fn node_from_command(command: &OsStr) -> io::Result<File> {
+    // PATH may select a Hermit launcher. Hold Node itself for the fixture's
+    // environment-cleared FD spawn, rather than holding that launcher.
+    let output = std::process::Command::new(command)
+        .args(["--print", "process.execPath"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("Node test executable lookup failed"));
+    }
+    let executable = String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let path = PathBuf::from(executable.trim_end_matches(['\r', '\n']));
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Node test executable path must be absolute",
+        ));
+    }
+    File::open(path.canonicalize()?)
+}
+
+pub(super) fn node_for_test() -> io::Result<File> {
+    node_from_command(OsStr::new("node"))
+}
+
+#[test]
+fn native_prepare_test_node_lookup_rejects_missing_executable_and_resolves_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert_eq!(
+        node_from_command(missing.as_os_str()).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    let launcher = root.path().join("node-launcher");
+    std::fs::write(&launcher, b"#!/bin/sh\nexec node \"$@\"\n").unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let direct = node_for_test().unwrap();
+    let held = node_from_command(launcher.as_os_str()).unwrap();
+    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", held.as_raw_fd())).unwrap();
+    assert_eq!(
+        resolved,
+        std::fs::read_link(format!("/proc/self/fd/{}", direct.as_raw_fd())).unwrap()
+    );
+    assert_ne!(resolved, launcher.canonicalize().unwrap());
+    std::fs::write(&launcher, b"#!/bin/sh\nexit 1\n").unwrap();
+    assert!(node_from_command(launcher.as_os_str()).is_err());
+}
 
 fn original() -> RowviaSavedAgentPreparation {
     RowviaSavedAgentPreparation {
@@ -181,7 +233,7 @@ impl WholeContext for FakeContext {
         Ok(ValidatedInvocation {
             original: selection,
             installation: FixedInstallation {
-                node: File::open("/usr/bin/node").map_err(|_| ())?,
+                node: node_for_test().map_err(|_| ())?,
                 entrypoint: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("src/commands/rowvia_saved_agent_prepare_fixture.mjs"),
                 working_directory: PathBuf::from("/"),
@@ -643,7 +695,7 @@ fn native_prepare_high_descriptor_copies_exclude_fixed_remap_targets() {
     let (reader, writer) = pipe().unwrap();
     let reader = high_fd(reader).unwrap();
     let writer = high_fd(writer).unwrap();
-    let executable = high_fd(File::open("/usr/bin/node").unwrap()).unwrap();
+    let executable = high_fd(node_for_test().unwrap()).unwrap();
     let source = high_fd(
         File::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

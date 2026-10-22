@@ -148,9 +148,79 @@ Rowvia supplies Memory, connectors, credentials and grants. Claude is deferred.
   six-file correction removes redundant references/terminal returns, aliases
   the unchanged tuple type, iterates the same three event flags in order and
   borrows singleton test slices. Rust1.95 formatting and scoped whitespace
-  pass; independent review and actual Clippy/test execution remain pending.
+  pass; fresh independent source review confirms all12 corrections with no
+  behavior change. Commit7069a2399 is pushed; CI39811963233 passes Desktop
+  Clippy, Desktop unit tests, frontend build and Native Tauri check. Native
+  tests finish3512pass/11fail/19ignored: all11 failures trace to test-only
+  hardcoded /usr/bin/node absent on the runner. A minimal launcher-aware
+  fixture correction has fresh source review; execution remains pending.
+  Other suites retain unrelated failures; the full CI is not green.
   No authorization/FD/schema checks or lint rules are weakened. The ongoing
   isolated production build remains exactly2526bb58 and cannot qualify these
   later source changes. Full CI also retains dependency-policy failures.
+- The existing2526bb58 live builder completes: optimized release45m43s with
+  two pre-existing dead-code warnings, no OOM. Independent canonical ownership,
+  ELF, SHA/provenance and host ldd-r checks pass for DesktopSHA
+  57b06d9ec88bad4fbfc93d6bf8aa30673ca81631d13b767a61e6475e3ea757da.
+  The source archive/container are removed and public cache retained. No
+  Cargo--locked or later7069/dd3 artifact claim is made.
+- Existing Desktop-only installer preflight/install pass; DesktopPID2459614
+  matches the selected executable and owner socket/relay status is ready.
+  Retained sidecars/bindings and exact backup-sz2uy_6q rollback source pass
+  post-install audit. An install-only preflight recheck correctly refuses the
+  now-replaced baseline; no repeat install or guard weakening follows.
+  Original Codex25206/1661814, supervisor219171 and pre-install adapter2269626
+  retain their generations. All16 saved identities remain; old autostarts stay
+  disabled. Existing scoped Cerberus Start reaches listeningPID2463874.
+  No genuine proposal/owner approval/new Codex response has been accepted.
+  The optional proposal-UI diagnostic returns invalid_request; it is not an
+  authority path and is not expanded to manufacture a human action.
+
+- Owner reports Saved Codex registration unavailable; registry still16 with
+  zero pending registrations, so no blind Save retry or approval is attempted.
+  All204 public installation pins and read-only SDK/Python host qualification
+  pass. One continuous exact-Rust scan → fixed Node bootstrap/five-FD read-only
+  preflight → current/held revalidation takes23.166s, all digests matching,
+  without Save/registration/model execution. The outer15s starts before this
+  qualification and rejects afterward, before Save: a demonstrated budget
+  defect, not a captured UI invocation. WAL-aware read-only localStorage
+  selected relay is already canonical; live Native override/input remain
+  unobserved. Implement separate45s qualification/30s operation allowances,
+  retaining15s child exchanges,500ms cleanup and every custody/hash/approval
+  check; check expiry after final revalidation before final C2. Add causal
+  deadline regressions and independent review before build/deployment.
+- Fresh production/test source review passes after adding an explicit final
+  installation-revalidation counter assertion. Rust1.95 scoped formatting and
+  whitespace pass. The isolated RED/GREEN control has separate fresh review:
+  RED retains original caller/host semantics plus the test-only duration seam;
+  four exact causal assertion failures are required, not compile/transport
+  errors. GREEN contains only the five reviewed Rust overlays and requires91
+  selected passes with no ignored cases. Actual execution is in progress under
+  the existing20-minute/5GiB/zero-swap/one-job/25GiB limits; no outcome or new
+  Desktop artifact is claimed yet. First RED attempt reaches its20-minute
+  compile bound at17:53:31Z with541 compiler artifacts, no diagnostics, no
+  build-finished event and zero tests. This is NOT causal RED. OOM is false,
+  owned container is removed, source guard remains exact and cache is retained
+  below25GiB. One unchanged capped warm RED continuation is admitted with a
+  separate raw log; GREEN may follow only after four exact causal failures.
+  Warm continuation1 likewise reaches18:14:19Z compile bound:895 artifacts,
+  543 fresh, no diagnostics/build-finished/tests, no OOM; owned cleanup/source
+  exactness pass, cache remains below25GiB. This is still NOT causal RED.
+  A second unchanged capped warm continuation is admitted, with an early
+  cache-freshness check to refuse repeated dependency work if progress was not
+  retained. Continuation2 finishes18:30:19Z with strict causal RED: Cargo build
+  has zero warnings/errors, exact91 inventory and Node control passes; all four
+  deadline tests fail at their expected assertion locations/values, including
+  the final C2 call after exactly one installation revalidation. No OOM, owned
+  cleanup and source guard pass. GREEN91 is now running against the reviewed
+  correction. GREEN completes18:41:38Z:91/91 pass, zero failures/ignored,
+  exact89 selected+2 ratchets over18 groups, including Node portability and
+  all four deadline regressions. Compiler succeeds with zero warnings/errors;
+  no OOM, owned cleanup/source guard pass, cache+control remain below25GiB.
+  Fresh result review independently verifies strict RED, all91 unique GREEN
+  names/results, exact five-file source, unchanged control and absence of all
+  excluded dirty diagnostics; no blocking finding. This is separate from the
+  earlier source/control review.
+  No production artifact/deployment or new UI acceptance is inferred.
 
 ## Done

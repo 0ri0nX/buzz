@@ -33,7 +33,13 @@ const FRAME_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const TRAFFIC_LIMIT: usize = 1024 * 1024;
 const CLEANUP_LIMIT: Duration = Duration::from_millis(500);
-const INVOCATION_LIMIT: Duration = Duration::from_secs(15);
+// The qualified public closure takes ~15s across three digest scans, plus
+// ~8s in the read-only child. Allow roughly 2x qualification time, separately
+// from effects. A child remains capped at 15s; the 30s effect budget also covers
+// ~10s of final digest scans and synchronous Native callbacks.
+const QUALIFICATION_LIMIT: Duration = Duration::from_secs(45);
+const INVOCATION_LIMIT: Duration = Duration::from_secs(30);
+const CHILD_EXCHANGE_LIMIT: Duration = Duration::from_secs(15);
 // Fixed child-only bootstrap: restore the named entrypoint's cwd/argv without
 // ambient shell lookup, global desktop chdir, or caller-supplied source text.
 const NODE_BOOTSTRAP: &str = "process.chdir(process.argv[1]); process.argv.splice(1, 1); await import((await import('node:url')).pathToFileURL(process.argv[1]).href);";
@@ -274,8 +280,9 @@ struct ValidatedInvocation {
 /// Private and indivisible: no production fallback is available to fake tests.
 /// Preflight must complete installation/source checks BEFORE native save. It
 /// derives UUIDv7, all authority values and paths from trusted public context.
-/// The 15s deadline is cooperative around these synchronous operations and C2:
-/// it detects overruns on return, but cannot interrupt a blocked implementation.
+/// Qualification and invocation deadlines are cooperative around synchronous
+/// operations and C2: they detect overruns on return, but cannot interrupt a
+/// blocked implementation. Qualification must not spend the effect budget.
 trait WholeContext {
     type Boundary: C2Boundary;
     fn preflight(&mut self, request: &OwnerSaveRequest) -> Result<ValidatedInvocation, ()>;
@@ -347,11 +354,21 @@ fn run_with(
     context: &mut impl WholeContext,
     request: &OwnerSaveRequest,
 ) -> Result<PreparedProposal, PrepareFailure> {
-    let deadline = Instant::now() + INVOCATION_LIMIT;
+    run_with_limits(context, request, QUALIFICATION_LIMIT, INVOCATION_LIMIT)
+}
+
+fn run_with_limits(
+    context: &mut impl WholeContext,
+    request: &OwnerSaveRequest,
+    qualification_limit: Duration,
+    invocation_limit: Duration,
+) -> Result<PreparedProposal, PrepareFailure> {
+    let qualification_deadline = Instant::now() + qualification_limit;
     let invocation = context
         .preflight(request)
         .map_err(|_| PrepareFailure::Unavailable)?;
-    remaining(deadline).map_err(|_| PrepareFailure::Unavailable)?;
+    remaining(qualification_deadline).map_err(|_| PrepareFailure::Unavailable)?;
+    let deadline = Instant::now() + invocation_limit;
     // From this call onwards all failures are uncertain. Never retry a save,
     // callback retain, or transport delivery, including after read-only errors.
     let prepared = context
@@ -382,6 +399,7 @@ fn run_with(
         if !context.revalidate_installation(&invocation.installation) {
             return Err(());
         }
+        remaining(deadline)?;
         holder
             .finalize_prepared_with(
                 &result.operation_id,
@@ -613,6 +631,7 @@ impl OwnedNode {
         mut holder: Option<&mut NativeRegistrationCallbacks>,
         boundary: &mut impl C2Boundary,
     ) -> Result<Vec<u8>, ()> {
+        let deadline = deadline.min(Instant::now() + CHILD_EXCHANGE_LIMIT);
         checked_frame(startup)?;
         let mut budget = TrafficBudget::default();
         budget.outbound(startup.len())?;

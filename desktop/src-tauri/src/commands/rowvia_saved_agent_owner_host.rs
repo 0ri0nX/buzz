@@ -339,7 +339,7 @@ impl<'a, R: tauri::Runtime> WholeContext for SaveContext<'a, R> {
             "displayName": request.display_name, "systemPrompt": request.system_prompt,
             "channelId": request.channel_id, "recipe": request.recipe } }),
         )?;
-        let deadline = Instant::now() + INVOCATION_LIMIT;
+        let deadline = Instant::now() + CHILD_EXCHANGE_LIMIT;
         let mut child = OwnedNode::spawn(&fixed)?;
         let result = child.exchange_inner(&startup, deadline, None, &mut self.boundary);
         let settled = child.settle();
@@ -455,6 +455,7 @@ impl<'a, R: tauri::Runtime> ProductionOwnerBoundary<'a, R> {
         kind: &str,
         authorization: Option<&owner::SavedAgentAuthorization>,
     ) -> Result<(Vec<u8>, SettledProcessFamily), ()> {
+        let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
         if !revalidate(&self.fixed) {
             return Err(());
         }
@@ -469,6 +470,10 @@ impl<'a, R: tauri::Runtime> ProductionOwnerBoundary<'a, R> {
                 "result": authorization });
         }
         let startup = frame(&startup)?;
+        remaining(qualification_deadline)?;
+        if authorization.is_some_and(|value| value.expires_at <= chrono::Utc::now()) {
+            return Err(());
+        }
         let deadline = Instant::now() + INVOCATION_LIMIT;
         let mut holder =
             NativeRegistrationCallbacks::from_resumed(s, &resumed.prepared, &resumed.ack)
@@ -525,10 +530,15 @@ impl<'a, R: tauri::Runtime> ProductionOwnerBoundary<'a, R> {
             .map_err(|_| owner::Failure::Unknown)?;
         let proof = RegisteredHostProof::checked(bytes, family, resumed)
             .map_err(|_| owner::Failure::Unknown)?;
+        let qualification_deadline = Instant::now() + QUALIFICATION_LIMIT;
         if !revalidate(&self.fixed) || authorization.expires_at <= chrono::Utc::now() {
             return Err(owner::Failure::Unknown);
         }
         owner::revalidate_native(self.app, resumed).map_err(|_| owner::Failure::Unknown)?;
+        remaining(qualification_deadline).map_err(|_| owner::Failure::Unknown)?;
+        if authorization.expires_at <= chrono::Utc::now() {
+            return Err(owner::Failure::Unknown);
+        }
         native::registration_completion_from_host(preparation, proof)
             .map_err(|_| owner::Failure::Unknown)
     }
