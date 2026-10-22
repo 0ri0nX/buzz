@@ -76,6 +76,11 @@ pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        if let Some(error) =
+            crate::managed_agents::storage::pending_saved_registration_refusal(record)
+        {
+            return Err(error);
+        }
         let (provider_id, config) = match &record.backend {
             BackendKind::Provider { id, config } => (id.clone(), config.clone()),
             BackendKind::Local => return Err(format!("agent {pubkey} is not provider-backed")),

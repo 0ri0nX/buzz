@@ -111,6 +111,9 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
 /// Returns an unsigned `EventBuilder` — the caller signs and submits. The
 /// `d_tag` is the agent's pubkey.
 pub fn build_agent_event(record: &ManagedAgentRecord) -> Result<EventBuilder, String> {
+    if let Some(error) = super::storage::pending_saved_registration_refusal(record) {
+        return Err(error);
+    }
     super::validate_managed_agent_definition_text(
         &record.name,
         record.persona_id.as_deref(),
@@ -171,6 +174,7 @@ mod tests {
             persona_id: Some("persona-1".to_string()),
             private_key_nsec: "nsec1secretdonotpublish".to_string(),
             auth_tag: Some("authtagsecret".to_string()),
+            pending_saved_registration: None,
             relay_url: "wss://relay.example".to_string(),
             avatar_url: Some("https://example.com/a.png".to_string()),
             acp_command: "buzz-acp".to_string(),

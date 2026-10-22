@@ -98,9 +98,8 @@ fn normalizes_buzz_agent_args_to_empty() {
 fn explicit_path_resolution_ignores_non_executable_files() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = std::env::temp_dir().join(format!("buzz-discovery-path-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let bin = dir.join("buzz-acp");
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let bin = dir.path().join("buzz-acp");
     std::fs::write(&bin, "").expect("write placeholder");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644))
         .expect("chmod placeholder");
@@ -116,8 +115,6 @@ fn explicit_path_resolution_ignores_non_executable_files() {
         super::resolve_workspace_command(bin.to_str().expect("utf8 path")),
         Some(bin.clone())
     );
-
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -218,6 +215,7 @@ fn record_with(
         persona_id: persona_id.map(str::to_string),
         private_key_nsec: String::new(),
         auth_tag: None,
+        pending_saved_registration: None,
         relay_url: String::new(),
         avatar_url: None,
         acp_command: String::new(),

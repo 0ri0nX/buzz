@@ -19,11 +19,11 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, discovery_env_with_baked_floor, find_managed_agent_mut,
-        known_acp_runtime, load_global_agent_config, load_managed_agents, load_personas,
-        managed_agent_avatar_url, missing_command_message, normalize_agent_args, resolve_command,
-        save_managed_agents, sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo,
-        AgentModelsResponse, ManagedAgentRecord, UpdateManagedAgentRequest,
-        UpdateManagedAgentResponse, DEFAULT_ACP_COMMAND,
+        known_acp_runtime, load_global_agent_config, load_personas, managed_agent_avatar_url,
+        missing_command_message, normalize_agent_args, resolve_command, save_managed_agents,
+        sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo, AgentModelsResponse,
+        ManagedAgentRecord, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
+        DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
 };
@@ -33,9 +33,9 @@ use crate::{
 /// Spawns a short-lived subprocess (no relay connection needed). The subprocess
 /// starts the agent, queries its model catalog, and exits. ~2-5s total.
 #[tauri::command]
-pub async fn get_agent_models(
+pub async fn get_agent_models<R: tauri::Runtime>(
     pubkey: String,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
     let (resolved_acp, agent_command, discovery) = {
@@ -43,7 +43,10 @@ pub async fn get_agent_models(
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        let mut records =
+            crate::managed_agents::storage::load_managed_agents_for_ordinary_operation(
+                &app, &pubkey,
+            )?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()

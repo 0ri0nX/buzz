@@ -47,6 +47,7 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         persona_id: persona_id.map(|s| s.to_string()),
         private_key_nsec: String::new(),
         auth_tag: None,
+        pending_saved_registration: None,
         relay_url: TEST_RELAY.to_string(),
         avatar_url: None,
         acp_command: String::new(),

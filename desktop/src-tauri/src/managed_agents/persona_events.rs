@@ -320,8 +320,8 @@ pub async fn flush_active_pending_events<R: tauri::Runtime>(
     flush_pending_events_at(&scope.db_path, state, &scope.relay_url, &scope.owner_keys).await
 }
 
-pub fn active_pending_event(
-    app: &tauri::AppHandle,
+pub fn active_pending_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &AppState,
     kind: u32,
     d_tag: &str,

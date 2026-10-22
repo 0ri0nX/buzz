@@ -238,6 +238,24 @@ export function useAgentManagement() {
     }
   }
 
+  async function submitSavedCodex(
+    name: string,
+    prompt: string,
+    save: (name: string, prompt: string, channelId: string) => Promise<boolean>,
+  ): Promise<boolean> {
+    if (request?.action !== "create") return false;
+    setError(null);
+    try {
+      assertAgentCanActFromOrigin(request.request.channelId);
+      return await save(name, prompt, request.request.channelId);
+    } catch {
+      setError(
+        "An agent can only manage agents from a channel you both belong to.",
+      );
+      return false;
+    }
+  }
+
   function dismiss() {
     pendingRequestId.current = null;
     sourceAgentPubkey.current = null;
@@ -272,6 +290,7 @@ export function useAgentManagement() {
   }, [currentPersona, error, matchingPersonas.length, request]);
 
   return {
+    submitSavedCodex,
     request,
     createInitialValues,
     editInitialValues,

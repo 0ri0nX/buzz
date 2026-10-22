@@ -127,6 +127,7 @@ pub(crate) fn load_pending_profile_reconciliations(
     let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
     Ok(records
         .iter()
+        .filter(|record| record.pending_saved_registration.is_none())
         // A queue write deliberately precedes the migrated agent-store write.
         // If the process dies between them, retain (but do not execute) the
         // stale item until the next boot finishes renaming the record.
@@ -197,6 +198,9 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     data: &ProfileReconcileData,
 ) -> Result<ProfileReconcileOutcome, String> {
     use crate::relay::query_agent_profile;
+
+    // A stale queued task must not publish a privately prepared identity.
+    super::refuse_pending_saved_agent(app, agent_pubkey)?;
 
     // Resolved ONCE and used for both the read and the write-back. A pinned
     // `target_relay_url` wins unconditionally — see `resolve_reconcile_relay`.

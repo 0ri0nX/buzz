@@ -119,6 +119,8 @@ type AgentDefinitionDialogProps = {
   createRunSection?: (effortOptions: EffortOptions) => React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
+  /** Fixed Native Save path; exposes no runtime/provider/command knobs. */
+  onSaveCodex?: (displayName: string, systemPrompt: string) => Promise<boolean>;
 };
 export type AgentDefinitionSubmitOptions = {
   publishCatalogUpdates: boolean;
@@ -142,7 +144,10 @@ export function AgentDefinitionDialog({
   publishCatalogUpdatesOnSave = false,
   createRunSection,
   createSubmitBlocked = false,
+  onSaveCodex,
 }: AgentDefinitionDialogProps) {
+  const [saveKind, setSaveKind] = React.useState("generic");
+  const savedCodex = Boolean(onSaveCodex && saveKind === "saved-codex");
   const runtimesLoading = runtimeCatalogStatus === "loading";
   const acpCommandsQuery = useAcpCommandsQuery({ enabled: open });
   const [displayName, setDisplayName] = React.useState("");
@@ -325,6 +330,12 @@ export function AgentDefinitionDialog({
     onOpenChange(next);
   }
   async function handleSubmit() {
+    if (savedCodex && onSaveCodex) {
+      if (!canSubmit) return;
+      if (await onSaveCodex(displayName.trim(), systemPrompt))
+        onOpenChange(false);
+      return;
+    }
     // D1: the same localModeSatisfied gate as canSubmit prevents form-submit
     // (Enter) from bypassing a missing credential.
     if (!initialValues || !localModeSatisfied || !canSubmit) return;
@@ -490,19 +501,22 @@ export function AgentDefinitionDialog({
     selectedRuntime?.availability === "available";
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
-  const canSubmit =
-    canSubmitPersonaDialog({ displayName, isPending }) &&
-    (!isCreateMode || runtime.trim().length > 0) &&
-    (!isCreateMode || selectedRuntimeIsAvailable) &&
-    (!isCreateMode || !createSubmitBlocked) &&
-    // Crash-loop guard, create AND edit: an empty allowlist would crash
-    // every instance minted from this definition at startup.
-    personaBehaviorDraftValid(behaviorDraft) &&
-    // D1: localModeSatisfied covers both missingNormalizedFields AND
-    // missingEnvKeys — credential env keys now block submit, not just display.
-    localModeSatisfied &&
-    customAiPairSatisfied &&
-    !isAvatarUploadPending;
+  const canSubmit = savedCodex
+    ? canSubmitPersonaDialog({ displayName, isPending }) &&
+      displayName.trim().length <= 128 &&
+      systemPrompt.length <= 4096
+    : canSubmitPersonaDialog({ displayName, isPending }) &&
+      (!isCreateMode || runtime.trim().length > 0) &&
+      (!isCreateMode || selectedRuntimeIsAvailable) &&
+      (!isCreateMode || !createSubmitBlocked) &&
+      // Crash-loop guard, create AND edit: an empty allowlist would crash
+      // every instance minted from this definition at startup.
+      personaBehaviorDraftValid(behaviorDraft) &&
+      // D1: localModeSatisfied covers both missingNormalizedFields AND
+      // missingEnvKeys — credential env keys now block submit, not just display.
+      localModeSatisfied &&
+      customAiPairSatisfied &&
+      !isAvatarUploadPending;
 
   // Merge global env as the base layer so credential keys satisfied via global
   // config are available to model discovery — same rationale as in AgentInstanceEditDialog.
@@ -741,39 +755,82 @@ export function AgentDefinitionDialog({
       isPending={isPending}
       onCancel={() => handleOpenChange(false)}
       publishesCatalogUpdates={publishCatalogUpdatesOnSave && hasUserChanges}
-      submitLabel={submitLabel}
+      submitLabel={savedCodex ? "Save for registration review" : submitLabel}
     />
   );
   const form = (
     <form
-      className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]"
+      className={
+        savedCodex
+          ? "grid gap-5"
+          : "grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]"
+      }
       id="persona-dialog-form"
       onChangeCapture={() => setHasUserChanges(true)}
       onSubmit={handleSubmitForm}
     >
-      <AgentCreationPreview
-        avatarUrl={previewAvatarUrl}
-        disabled={isPending || isAvatarUploadPending}
-        label={previewLabel}
-        onClearAvatar={() => {
-          setHasUserChanges(true);
-          setAvatarUrl("");
-        }}
-        onUploadPendingChange={setIsAvatarUploadPending}
-        onSelectAvatar={(nextAvatarUrl) => {
-          setHasUserChanges(true);
-          setAvatarUrl(nextAvatarUrl);
-        }}
-      />
+      {savedCodex ? null : (
+        <AgentCreationPreview
+          avatarUrl={previewAvatarUrl}
+          disabled={isPending || isAvatarUploadPending}
+          label={previewLabel}
+          onClearAvatar={() => {
+            setHasUserChanges(true);
+            setAvatarUrl("");
+          }}
+          onUploadPendingChange={setIsAvatarUploadPending}
+          onSelectAvatar={(nextAvatarUrl) => {
+            setHasUserChanges(true);
+            setAvatarUrl(nextAvatarUrl);
+          }}
+        />
+      )}
 
       <div className="space-y-5">
-        <AgentIdentityFields
-          description={descriptionDraft}
-          disabled={isPending}
-          displayName={displayName}
-          onDescriptionChange={setDescriptionDraft}
-          onDisplayNameChange={setDisplayName}
-        />
+        {onSaveCodex ? (
+          <label className="grid gap-2 text-sm font-medium">
+            Save type
+            <select
+              className="rounded-md border bg-background p-2"
+              value={saveKind}
+              disabled={isPending}
+              onChange={(event) => setSaveKind(event.target.value)}
+            >
+              <option value="generic">Standard agent</option>
+              <option value="saved-codex">
+                Saved Codex · development, Memory, Git read
+              </option>
+            </select>
+          </label>
+        ) : null}
+        {savedCodex ? (
+          <>
+            <p className="text-sm text-muted-foreground">
+              The fixed Native recipe selects the workspace, model, and runtime.
+              Save opens owner registration review.
+            </p>
+            <label
+              className="grid gap-2 text-sm font-medium"
+              htmlFor="saved-codex-name"
+            >
+              Name
+              <Input
+                id="saved-codex-name"
+                value={displayName}
+                disabled={isPending}
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+            </label>
+          </>
+        ) : (
+          <AgentIdentityFields
+            description={descriptionDraft}
+            disabled={isPending}
+            displayName={displayName}
+            onDescriptionChange={setDescriptionDraft}
+            onDisplayNameChange={setDisplayName}
+          />
+        )}
 
         <div className="space-y-1.5">
           <label
@@ -797,7 +854,7 @@ export function AgentDefinitionDialog({
           </div>
         </div>
 
-        {modelFieldVisible ? (
+        {modelFieldVisible && !savedCodex ? (
           <AgentAiConfigurationModeField
             mode={aiConfigurationMode}
             needsProviderSelection={runtimeCanChooseLlmProvider}
@@ -806,6 +863,7 @@ export function AgentDefinitionDialog({
         ) : null}
 
         <div
+          hidden={savedCodex}
           className="space-y-5"
           data-testid={`agent-${aiConfigurationMode}-configuration-section`}
         >
@@ -931,17 +989,17 @@ export function AgentDefinitionDialog({
 
         <AgentDefaultsDialog
           onOpenChange={setAiDefaultsOpen}
-          open={runtimeCanChooseLlmProvider && aiDefaultsOpen}
+          open={!savedCodex && runtimeCanChooseLlmProvider && aiDefaultsOpen}
           returnFocusRef={aiDefaultsTriggerRef}
         />
 
         <AddCustomHarnessDialog
           onOpenChange={setIsAddHarnessOpen}
           onSaved={selectSavedHarness}
-          open={isAddHarnessOpen}
+          open={!savedCodex && isAddHarnessOpen}
         />
 
-        <div className="space-y-3">
+        <div className="space-y-3" hidden={savedCodex}>
           <button
             aria-expanded={showAdvancedFields}
             className="inline-flex h-9 items-center gap-1.5 text-sm font-medium text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"

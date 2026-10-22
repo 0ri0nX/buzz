@@ -58,4 +58,89 @@ Integrate the exact upstream `desktop-v0.5.27` tag (`7a2fb3cc2d401e91e67d9819741
 - Root post-install native status returned `validated-ready`; keyring metadata is unlocked. Actual rollback custody is `/home/orionx/.local/state/rowvia-buzz-native-install/backups/backup-ig8j37i9`, validated without restoring or exposing payloads. Old root is retained, shared keyring is untouched; relay/relay database/Paseo were not changed.
 - BUILD and DEPLOY are Done. Interactive GUI/TTC/owner-operation observation remains separate and open; PR #9 remains draft pending human confirmation.
 
+## Saved Codex owner registration — first functional slice
+
+### Goal
+
+Join Cerberus proposal, genuine Buzz owner approval, saved registration and
+ordinary managed Codex Start/reply. Paseo retains provider/session lifecycle;
+Rowvia supplies Memory, connectors, credentials and grants. Claude is deferred.
+
+### Scope
+
+- Port the existing reviewed Native/UI contract, not a second orchestrator or
+  provider sandbox. Reuse the current fixed installation once; do not add a
+  parallel manifest/evidence framework.
+- Keep canonical owner review, consume-once registration, fresh read-only graph
+  checks, uncertain-outcome refusal and stopped completion before separate Start.
+- Preserve unrelated dirty owner-hook and diagnostic work. Original Architekt
+  remains running; component tests do not prove a new agent's live acceptance.
+
+### Approach
+
+1. Promote the existing bounded FD/Native and owner-review UI seams.
+2. Independently review critical boundaries, run focused actual-checkout tests,
+   then build/install the committed Desktop through the existing tooling.
+3. Exercise the genuine first owner flow before extending the same agent to
+   progress/deduplication, development, Memory, GitLab268/revocation and restart.
+
+### Implementation Notes
+
+- Main register-once/read-only-inspect and development workspace recipe are
+  committed separately. The actual held SDK can read stock Paseo0.11.1 status
+  and zero agents; this is not provider execution or owner-flow acceptance.
+- Promoted UI passes49 controls, TypeScript/Biome and fresh independent review;
+  five regressions cover Cancel/recovery, late inventory and operation-bound
+  guard release. Actual Native/Desktop interaction is still unverified.
+- Fixed supplier literals and203 public source pins are filled and pass fresh
+  physical admission review; no credentials or private auth files enter this
+  pin table. A separate77-path Git-index audit found no dependency on excluded
+  local diagnostic changes; this is source closure, not archive compilation.
+- Replaced16 newly introduced raw-FFI unsafe sites with already locked safe
+  nix/rustix APIs, preserving child FD0–4, nonreaped leader custody, group
+  settlement and post-dispatch no-replay. New child-only Node bootstrap preserves
+  fixed cwd/argv without changing the Desktop process working directory.
+- Rust source formatting/syntax and independent safe-transport review pass. The
+  first84-case gate reached its20-minute bound during dependency compilation;
+  no tests ran, no OOM, owned container removed, source exact and cache retained.
+  Compile-time constants are now split into a private819-line file, leaving
+  the754-line parent. Equivalent existing tempfile/env fixtures satisfy the
+  oversized-file ratchets; fresh source review passed. The bounded cached
+  continuation reached Native compilation and failed on two Wry-only helper
+  signatures and one unused reexport. No selected test ran; no OOM, exact
+  source/cleanup checks passed and the dependency cache is retained. Fix only
+  those signatures/export, independently review, then continue the86-case gate.
+  That minimal fix passed fresh review and actual release libtest compilation
+  in10m32s. All18 owner tests pass; the next host group passes four and fails
+  four because its fixture opens /usr/bin/node, absent from the image. Remaining
+  groups did not run; source exact, no OOM, owned container removed. Seven new
+  visibility/dead-code warnings remain. Fresh review recommends
+  narrowing visibility and removing uncalled alternate helpers, keeping all
+  reachable retained-ACK/final-C2/CAS checks. No warning suppression or authority
+  widening is admitted. These four-file edits are reviewed and staged. A finite
+  probe passes with existing Node22 plus29 exact read-only public library files;
+  no image core library or production pin changes. The reviewed next gate
+  compiles once, selects the exact Cargo-reported binary and runs the unchanged
+  86 controls under the same20-minute cap.
+- Saved Start omitted normal channel membership: six regressions reproduce it.
+  A narrow repair attaches the exact reviewed key/channel through the existing
+  owner/relay-scoped API before explicit Start, preserving stopped state on
+  attachment failure. All49 UI/API controls pass; fresh review independently
+  reran eight membership/Start cases without failure or skip.
+- First-slice installation channel now matches existing Cerberus channelfd0;
+  no operation/ACK was created under the superseded319 selection. All203 pins,
+  Node and the updated seal passed fresh physical admission review. The overall
+  size gate still reports an unrelated committed relayClientSession.ts violation;
+  this change introduces no Native size violation. No Native build, installation, genuine owner
+  approval, managed Codex model call or Buzz reply is claimed by this checkpoint.
+- Final current-source Native gate passes: release libtest compilation14m36s,
+  zero warnings/errors, all86 selected cases pass with zero failures/ignored
+  cases and exact84+2 inventory. Actual pipe/bootstrap, descendant settlement,
+  retained ACK, owner approval and CAS controls run. Corrected one new JSON
+  fixture to include the existing required agent_args:[] field; no serde/default
+  weakening. Test-only Node22 uses30 exact read-only public files; compile-once
+  execution and multiline-output counting pass fresh control review. Exit0,
+  no OOM, source66 unchanged and owned container removed. This is actual source
+  qualification, not a deployable Desktop or genuine human workflow result.
+
 ## Done

@@ -6,6 +6,10 @@ mod build_identity;
 mod builderlab;
 mod channel_head_cache;
 mod commands;
+pub use commands::{
+    prepare_rowvia_saved_agent, PreparedRowviaSavedAgent, RowviaSavedAgentPreparation,
+};
+pub use managed_agents::SavedAgentRecipe;
 mod deep_link;
 mod egress_guard;
 mod event_sync;
@@ -909,6 +913,11 @@ pub fn run() {
             rowvia_create_management_proposal,
             rowvia_retry_management_proposal,
             rowvia_approve_management_proposal,
+            rowvia_review_saved_agent_preparation,
+            rowvia_authorize_saved_agent,
+            rowvia_list_saved_agent_pending,
+            rowvia_save_codex_agent,
+            rowvia_approve_saved_agent_registration,
             rowvia_retry_management_approval,
             rowvia_get_management_operation,
             set_prevent_sleep_active,

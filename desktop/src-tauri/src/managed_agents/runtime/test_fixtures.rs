@@ -43,6 +43,7 @@ pub(super) fn fixture(
         persona_id: None,
         private_key_nsec: "nsec1fake".into(),
         auth_tag,
+        pending_saved_registration: None,
         relay_url: "ws://localhost:3000".into(),
         avatar_url: None,
         acp_command: "buzz-acp".into(),

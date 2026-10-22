@@ -540,10 +540,10 @@ pub fn render_dynamic_section(
     // Every managed agent is eligible on every community — `relay_url` is a
     // legacy creation-era field that `effective_agent_relay_url()` deliberately
     // ignores, and snapshot-imported records store it empty by design. The only
-    // roster filter is identity-archive.
+    // roster filters are identity-archive and private, unapproved preparation.
     let live: Vec<&ManagedAgentRecord> = agents
         .iter()
-        .filter(|a| !is_archived(a, archived))
+        .filter(|a| a.pending_saved_registration.is_none() && !is_archived(a, archived))
         .collect();
     let active_agents = if live.is_empty() {
         "## Active Agents\n\n*(No agents deployed yet. Add agents in the Buzz desktop app.)*"

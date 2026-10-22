@@ -29,6 +29,33 @@ const API_PREFIX: &str = "v1/buzz/management";
 const CANDIDATE_TTL_SECONDS: i64 = 120;
 const OPERATIONS: [&str; 2] = ["gmail.message.read", "gmail.message.search"];
 
+/// Saved-agent approval uses this existing transport, not connector journals.
+/// The caller supplies only its internally serialized exact Core body. Keys
+/// must be captured by the explicit owner action, never by readonly review.
+pub(in crate::commands) async fn post_saved_agent_authorization(
+    keys: &Keys,
+    expected_owner: &str,
+    expected_source: &str,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    if option_env!("BUZZ_DESKTOP_BUILD_ROWVIA_OWNER_PUBKEY") != Some(expected_owner)
+        || option_env!("BUZZ_DESKTOP_BUILD_ROWVIA_SOURCE_INSTANCE") != Some(expected_source)
+        || keys.public_key().to_hex() != expected_owner
+        || configured_cerberus()? == expected_owner
+    {
+        return Err("saved agent owner unavailable".into());
+    }
+    let client = ManagementClient::configured()?;
+    client
+        .request_raw(
+            keys,
+            Method::POST,
+            &["saved-agent-authorizations"],
+            Some(body),
+        )
+        .await
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagementAction {

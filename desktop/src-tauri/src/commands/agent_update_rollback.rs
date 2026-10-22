@@ -85,8 +85,8 @@ fn restore_agent_update(
     Ok(())
 }
 
-pub(super) fn rollback_failed_agent_update(
-    app: &AppHandle,
+pub(super) fn rollback_failed_agent_update<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     rollback: AgentUpdateRollback,

@@ -910,6 +910,9 @@ pub fn start_managed_agent_process<R: tauri::Runtime>(
     admitted: &super::Admitted<'_>,
     replay_floor_unix: Option<u64>,
 ) -> Result<(), String> {
+    if let Some(error) = super::storage::pending_saved_registration_refusal(record) {
+        return Err(error);
+    }
     let key = bound_runtime_key(record, workspace_relay)?;
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime

@@ -2,6 +2,7 @@
 
 ## Active
 
+- [-] BUZZ-CODEX-OWNER — Promote and qualify existing Native/UI approval-registration join; compile/build/install, then verify genuine owner-approved saved Codex Start and signed Buzz reply. No component-only completion claim.
 - [-] BUZZ-527-LIVE — Installed Desktop passes native owner/relay readiness and keyring metadata checks; interactive GUI/TTC/owner-operation acceptance still awaits human observation. Draft PR remains draft.
 
 ## After MVP

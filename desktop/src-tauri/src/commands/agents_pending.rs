@@ -27,6 +27,9 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
     state: &AppState,
     record: &ManagedAgentRecord,
 ) {
+    if record.pending_saved_registration.is_some() {
+        return;
+    }
     use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
 
     let result = (|| -> Result<(), String> {
@@ -53,8 +56,8 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
 /// `pending_sync = 1`. The `d_tag` is the agent's pubkey. Best-effort: a
 /// failure is logged and swallowed so a retention hiccup never blocks the
 /// disk-authoritative delete.
-pub(crate) fn tombstone_managed_agent_pending(
-    app: &AppHandle,
+pub(crate) fn tombstone_managed_agent_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     agent_pubkey: &str,
 ) {
