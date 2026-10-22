@@ -676,8 +676,8 @@ impl OwnedNode {
             // Drain all three readable streams each turn, including while a
             // callback response is blocked. A second request during an in-flight
             // response is refused by the qualified holder before dispatch.
-            for index in 0..3 {
-                if !events[index].intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            for (index, event) in events.iter().take(3).enumerate() {
+                if !event.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
                     continue;
                 }
                 let mut bytes = [0u8; 4096];

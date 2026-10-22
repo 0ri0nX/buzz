@@ -143,4 +143,14 @@ Rowvia supplies Memory, connectors, credentials and grants. Claude is deferred.
   no OOM, source66 unchanged and owned container removed. This is actual source
   qualification, not a deployable Desktop or genuine human workflow result.
 
+- Hosted CI39808206855 passes Desktop lint/format, unit tests and frontend
+  build, but Native Clippy identifies12 introduced style diagnostics. The
+  six-file correction removes redundant references/terminal returns, aliases
+  the unchanged tuple type, iterates the same three event flags in order and
+  borrows singleton test slices. Rust1.95 formatting and scoped whitespace
+  pass; independent review and actual Clippy/test execution remain pending.
+  No authorization/FD/schema checks or lint rules are weakened. The ongoing
+  isolated production build remains exactly2526bb58 and cannot qualify these
+  later source changes. Full CI also retains dependency-policy failures.
+
 ## Done

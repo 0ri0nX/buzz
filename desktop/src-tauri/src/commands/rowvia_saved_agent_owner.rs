@@ -439,7 +439,7 @@ async fn authorize_reviewed<B: OwnerBoundary>(
     })
     .map_err(|_| Failure::Unavailable)?;
     boundary.preflight()?;
-    boundary.revalidate(&resumed)?;
+    boundary.revalidate(resumed)?;
     // Every failure after handing bytes to the signing/HTTP boundary is unknown.
     // No raw transport/JSON diagnostics, status inference or retry escapes.
     let bytes = boundary
@@ -459,9 +459,7 @@ async fn authorize_reviewed<B: OwnerBoundary>(
         return Err(Failure::Unknown);
     }
     boundary.preflight().map_err(|_| Failure::Unknown)?;
-    boundary
-        .revalidate(&resumed)
-        .map_err(|_| Failure::Unknown)?;
+    boundary.revalidate(resumed).map_err(|_| Failure::Unknown)?;
     Ok(result)
 }
 
@@ -629,10 +627,10 @@ pub async fn rowvia_save_codex_agent(
                 prepare_caller::PrepareFailure::Unknown => Failure::Unknown.public(),
             },
         )?;
-        return Ok(SavedAgentSaveResult {
+        Ok(SavedAgentSaveResult {
             version: 1,
             operation_id: result.operation_id().into(),
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -669,7 +667,7 @@ pub async fn rowvia_approve_saved_agent_registration(
                 .map_err(|_| Failure::Unknown)
         })
         .map_err(|e| e.public())?;
-        return Ok(SavedAgentApproval::RegisteredStopped {
+        Ok(SavedAgentApproval::RegisteredStopped {
             completion: SavedAgentRegistrationCompletion {
                 version: 1,
                 operation_id: input.operation_id,
@@ -680,7 +678,7 @@ pub async fn rowvia_approve_saved_agent_registration(
                 bindings_ready: true,
                 runtime_ready: false,
             },
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {

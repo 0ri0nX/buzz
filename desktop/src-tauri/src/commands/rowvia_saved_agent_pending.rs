@@ -142,20 +142,24 @@ mod tests {
     fn pending_inventory_is_scoped_bounded_and_exports_only_five_public_fields() {
         let record = record();
         let owner = "b".repeat(64);
-        let result = project(&[record.clone()], &owner, "wss://relay.example").unwrap();
+        let result = project(std::slice::from_ref(&record), &owner, "wss://relay.example").unwrap();
         assert_eq!(result.len(), 1);
         let json = serde_json::to_value(&result[0]).unwrap();
         assert_eq!(json.as_object().unwrap().len(), 5);
         let text = serde_json::to_string(&result).unwrap();
         assert!(!text.contains("PRIVATE") && !text.contains("workspace") && !text.contains("auth"));
+        assert!(project(
+            std::slice::from_ref(&record),
+            &"9".repeat(64),
+            "wss://relay.example"
+        )
+        .unwrap()
+        .is_empty());
         assert!(
-            project(&[record.clone()], &"9".repeat(64), "wss://relay.example")
+            project(std::slice::from_ref(&record), &owner, "wss://other.example")
                 .unwrap()
                 .is_empty()
         );
-        assert!(project(&[record.clone()], &owner, "wss://other.example")
-            .unwrap()
-            .is_empty());
         assert!(project(
             &[record.clone(), record.clone()],
             &owner,

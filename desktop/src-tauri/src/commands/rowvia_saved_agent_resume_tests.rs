@@ -407,7 +407,7 @@ fn confined_resume(home: &Path) {
     let record = fixture_record(&owner);
     fs::write(
         &store,
-        serde_json::to_vec_pretty(&[record.clone()]).unwrap(),
+        serde_json::to_vec_pretty(std::slice::from_ref(&record)).unwrap(),
     )
     .unwrap();
     let before = fingerprint(&store);

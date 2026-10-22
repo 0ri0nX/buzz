@@ -660,6 +660,8 @@ pub(crate) struct RegisteredHostProof {
     family: SettledProcessFamily,
     closure: &'static str,
 }
+type NativeRegistrationResult = (u8, String, String, String, String, bool, bool, bool);
+
 impl RegisteredHostProof {
     fn checked(
         bytes: Vec<u8>,
@@ -724,7 +726,7 @@ impl RegisteredHostProof {
         self,
         expected: &native::RowviaSavedAgentScopeExpectation,
         ack: &SavedAgentPreparationAck,
-    ) -> Result<(u8, String, String, String, String, bool, bool, bool), ()> {
+    ) -> Result<NativeRegistrationResult, ()> {
         let r = self.result;
         if self.family.leader == 0
             || self.closure != SHARED_GROUP_CLOSURE_SHA256

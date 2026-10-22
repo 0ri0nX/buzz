@@ -74,10 +74,10 @@ fn native_finalize_completion_tuple_is_closed_and_exact() {
 #[test]
 fn native_finalize_checked_target_rejects_pending_config_auth_scope_duplicates_and_live_state() {
     let original = fixture_record(&"a".repeat(64));
-    let proof = completion(&[original.clone()]);
+    let proof = completion(std::slice::from_ref(&original));
     let empty = HashMap::<_, ()>::new();
     assert_eq!(
-        checked_registration_completion_target(&[original.clone()], &empty, &proof),
+        checked_registration_completion_target(std::slice::from_ref(&original), &empty, &proof),
         Ok(0)
     );
     for mutation in 0..30 {
