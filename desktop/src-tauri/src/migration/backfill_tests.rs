@@ -39,6 +39,274 @@ fn base(dir: &Path) -> std::path::PathBuf {
     dir.join("agents")
 }
 
+// The saved-owner preparation fixture has Unix absolute paths. Its production
+// owner-host lane is Linux-only; ordinary backfill tests below stay portable.
+#[cfg(unix)]
+fn pending_agent() -> ManagedAgentRecord {
+    crate::commands::pending_saved_agent_fixture(&"a".repeat(64))
+}
+
+// Historical B5 output, including its two instance changes. This synthetic
+// fixture never mints an identity, grants authority, or loads a real store.
+#[cfg(unix)]
+fn historical_pending_backfill(mut instance: ManagedAgentRecord) -> Vec<ManagedAgentRecord> {
+    let mut source = instance.clone();
+    source.slug = Some(instance.pubkey.clone());
+    source.definition_respond_to = Some(instance.respond_to.as_str().to_string());
+    source.definition_respond_to_allowlist = instance.respond_to_allowlist.clone();
+    source.definition_parallelism = Some(instance.parallelism);
+    let view = source.to_definition_view().unwrap();
+    let version = crate::managed_agents::persona_events::persona_content_hash(
+        &crate::managed_agents::persona_events::persona_event_content(&view),
+    );
+    instance.persona_id = Some(instance.pubkey.clone());
+    instance.persona_source_version = Some(version);
+    vec![instance, view.into_agent_record()]
+}
+
+#[test]
+#[cfg(unix)]
+fn pending_saved_registration_is_not_backfilled_or_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = pending_agent();
+    write_agents_json(dir.path(), &serde_json::json!([original]));
+    let before = std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap();
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap(),
+        before,
+    );
+    assert!(!base(dir.path())
+        .join("managed-agents.json.pre-backfill.bak")
+        .exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn exact_historical_pending_backfill_restores_original_without_new_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = pending_agent();
+    let rows = historical_pending_backfill(original.clone());
+    let definition = rows[1].clone();
+    write_agents_json(dir.path(), &serde_json::json!(rows));
+    let before = std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap();
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        1
+    );
+    let restored = load_typed(dir.path());
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap(),
+        serde_json::json!([original, definition])
+    );
+    assert_eq!(
+        std::fs::read(base(dir.path()).join("managed-agents.json.pre-backfill.bak")).unwrap(),
+        before,
+    );
+    let first = std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap();
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap(),
+        first
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pending_backfill_repair_refuses_drift_ambiguity_and_foreign_links_without_writes() {
+    for mutation in [
+        "prompt",
+        "acp",
+        "command",
+        "coordinated-command",
+        "override",
+        "args",
+        "team",
+        "source-team",
+        "source-slug",
+        "source-version",
+        "foreign-link",
+        "owner",
+        "relay",
+        "source",
+        "channel",
+        "model",
+        "workspace",
+        "capsule",
+        "auth",
+        "digest",
+        "ack",
+        "missing-ack",
+        "definition-prompt",
+        "definition-command",
+        "definition-builtin",
+        "definition-shared",
+        "instance-shared",
+        "definition-team",
+        "definition-slug",
+        "duplicate-definition",
+        "shared-link",
+        "duplicate-instance",
+        "duplicate-operation",
+        "live",
+        "autostart",
+        "auto-restart",
+        "instance-model",
+        "provider",
+        "recipe",
+        "definition-version",
+        "definition-created",
+        "definition-key",
+        "runtime",
+        "definition-quad",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let original = pending_agent();
+        let mut rows = serde_json::json!(historical_pending_backfill(original.clone()));
+        let pending = "pending_saved_registration";
+        match mutation {
+            "prompt" => rows[0]["system_prompt"] = "Changed prompt".into(),
+            "acp" => rows[0]["acp_command"] = "changed-acp".into(),
+            "command" => rows[0]["agent_command"] = "/changed/command".into(),
+            "coordinated-command" => {
+                let mut changed = original.clone();
+                changed.acp_command = "changed-acp".into();
+                changed.agent_command = "/changed/command".into();
+                changed.agent_command_override = Some("/changed/command".into());
+                rows = serde_json::json!(historical_pending_backfill(changed));
+            }
+            "override" => rows[0]["agent_command_override"] = "/changed/command".into(),
+            "args" => rows[0]["agent_args"] = serde_json::json!(["changed"]),
+            "team" => rows[0]["team_id"] = "foreign-team".into(),
+            "source-team" => rows[0]["source_team"] = "foreign-team".into(),
+            "source-slug" => rows[0]["source_team_persona_slug"] = "foreign-persona".into(),
+            "source-version" => rows[0]["persona_source_version"] = "changed".into(),
+            "foreign-link" => rows[0]["persona_id"] = "foreign-persona".into(),
+            "owner" => rows[0][pending]["owner_pubkey"] = "c".repeat(64).into(),
+            "relay" => rows[0][pending]["relay_url"] = "ws://127.0.0.1:10".into(),
+            "source" => rows[0][pending]["source_instance"] = "foreign-native".into(),
+            "channel" => {
+                rows[0][pending]["channel_id"] = "019a5432-1234-4abc-8def-0123456789ac".into()
+            }
+            "model" => rows[0][pending]["model"] = "changed-model".into(),
+            "workspace" => rows[0][pending]["workspace"] = "/changed/workspace".into(),
+            "capsule" => rows[0][pending]["capsule_run"] = "/changed/run".into(),
+            "auth" => rows[0]["auth_tag"] = "changed-synthetic-auth".into(),
+            "digest" => rows[0][pending]["native_config_sha256"] = "5".repeat(64).into(),
+            "ack" => rows[0][pending]["prepared_ack"]["nativeConfigSha256"] = "5".repeat(64).into(),
+            "missing-ack" => rows[0][pending]["prepared_ack"] = serde_json::Value::Null,
+            "definition-prompt" => rows[1]["system_prompt"] = "Changed prompt".into(),
+            "definition-command" => rows[1]["acp_command"] = "changed-acp".into(),
+            "definition-builtin" => rows[1]["is_builtin"] = true.into(),
+            "definition-shared" => rows[1]["shared"] = true.into(),
+            "instance-shared" => rows[0]["shared"] = true.into(),
+            "definition-team" => rows[1]["source_team"] = "foreign-team".into(),
+            "definition-slug" => rows[1]["slug"] = "foreign-persona".into(),
+            "duplicate-definition" => {
+                let duplicate = rows[1].clone();
+                rows.as_array_mut().unwrap().push(duplicate);
+            }
+            "shared-link" => {
+                let mut linked = serde_json::to_value(&original).unwrap();
+                linked["pubkey"] = "c".repeat(64).into();
+                linked["persona_id"] = original.pubkey.clone().into();
+                linked[pending] = serde_json::Value::Null;
+                rows.as_array_mut().unwrap().push(linked);
+            }
+            "duplicate-instance" | "duplicate-operation" => {
+                let mut duplicate = rows[0].clone();
+                if mutation == "duplicate-operation" {
+                    duplicate["pubkey"] = "c".repeat(64).into();
+                    duplicate["persona_id"] = "unrelated-definition".into();
+                }
+                rows.as_array_mut().unwrap().push(duplicate);
+            }
+            "live" => rows[0]["runtime_pid"] = 42.into(),
+            "autostart" => rows[0]["start_on_app_launch"] = true.into(),
+            "auto-restart" => rows[0]["auto_restart_on_config_change"] = true.into(),
+            "instance-model" => rows[0]["model"] = "changed-model".into(),
+            "provider" => rows[0]["provider"] = "changed-provider".into(),
+            "recipe" => rows[0][pending]["recipe"] = "claude-local-v1".into(),
+            "definition-version" => rows[1]["persona_source_version"] = "changed".into(),
+            "definition-created" => rows[1]["created_at"] = "changed".into(),
+            "definition-key" => rows[1]["private_key_nsec"] = "invalid-synthetic-key".into(),
+            "runtime" => rows[0]["runtime"] = "changed-runtime".into(),
+            "definition-quad" => rows[0]["definition_parallelism"] = 7.into(),
+            _ => unreachable!(),
+        }
+        // Every negative row must reach the recovery classifier. Malformed
+        // serde input would only prove parsing failed, not cohort refusal.
+        let parsed: Vec<ManagedAgentRecord> = serde_json::from_value(rows.clone()).unwrap();
+        if mutation == "coordinated-command" {
+            assert_eq!(
+                parsed[0].pending_saved_registration,
+                original.pending_saved_registration
+            );
+            assert_eq!(parsed[0].auth_tag, original.auth_tag);
+            assert_ne!(
+                parsed[0].persona_source_version,
+                historical_pending_backfill(original.clone())[0].persona_source_version,
+            );
+        }
+        write_agents_json(dir.path(), &rows);
+        let before = std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap();
+        assert_eq!(
+            backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+            0,
+            "{mutation}"
+        );
+        assert_eq!(
+            std::fs::read(base(dir.path()).join("managed-agents.json")).unwrap(),
+            before,
+            "{mutation}"
+        );
+        assert!(
+            !base(dir.path())
+                .join("managed-agents.json.pre-backfill.bak")
+                .exists(),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pending_backfill_repair_preserves_unrelated_records_and_pristine_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = pending_agent();
+    let mut rows = historical_pending_backfill(original.clone());
+    let definition = rows[1].clone();
+    let mut unrelated = original.clone();
+    unrelated.pubkey = "c".repeat(64);
+    unrelated.persona_id = Some("unrelated-definition".into());
+    unrelated.pending_saved_registration = None;
+    rows.insert(0, unrelated.clone());
+    write_agents_json(dir.path(), &serde_json::json!(rows));
+    std::fs::write(
+        base(dir.path()).join("managed-agents.json.pre-backfill.bak"),
+        b"earlier pristine backup",
+    )
+    .unwrap();
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        1
+    );
+    assert_eq!(
+        load_typed(dir.path()),
+        vec![unrelated, original, definition]
+    );
+    assert_eq!(
+        std::fs::read(base(dir.path()).join("managed-agents.json.pre-backfill.bak")).unwrap(),
+        b"earlier pristine backup"
+    );
+}
+
 #[test]
 fn backfill_links_standalone_agent_to_manufactured_definition() {
     let dir = tempfile::tempdir().unwrap();

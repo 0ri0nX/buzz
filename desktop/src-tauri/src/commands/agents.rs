@@ -60,6 +60,9 @@ use create_fields::{normalize_relay_mesh, resolve_created_avatar_url, trim_to_op
 
 #[path = "rowvia_saved_agent.rs"]
 mod rowvia_saved_agent;
+#[cfg(all(test, unix))]
+pub(crate) use rowvia_saved_agent::resume_tests::fixture_record as pending_saved_agent_fixture;
+pub(crate) use rowvia_saved_agent::saved_agent_backfill_restore_is_original;
 #[path = "rowvia_saved_agent_owner.rs"]
 mod rowvia_saved_agent_owner;
 pub use rowvia_saved_agent_owner::{

@@ -1,5 +1,5 @@
 //! B5 (unified agent model): one-time backfill of standalone agents into
-//! definition-linked records. Every keyed record with `persona_id: None`
+//! definition-linked records. Every non-pending keyed record with `persona_id: None`
 //! gets a key-less definition manufactured from its own settings, retiring
 //! the standalone-create pattern (Wes's Option 2: backfill, not grandfather).
 
@@ -10,9 +10,96 @@ use crate::managed_agents::{
     ManagedAgentRecord,
 };
 
+fn standalone_definition(record: &ManagedAgentRecord) -> Option<(ManagedAgentRecord, String)> {
+    let mut source = record.clone();
+    source.slug = Some(record.pubkey.clone());
+    source.definition_respond_to = Some(record.respond_to.as_str().to_string());
+    source.definition_respond_to_allowlist = record.respond_to_allowlist.clone();
+    source.definition_parallelism = Some(record.parallelism);
+    let view = source.to_definition_view()?;
+    let version = persona_content_hash(&persona_event_content(&view));
+    Some((view.into_agent_record(), version))
+}
+
+fn original_pending_backfill(
+    records: &[ManagedAgentRecord],
+    index: usize,
+) -> Option<ManagedAgentRecord> {
+    let record = records.get(index)?;
+    let pending = record.pending_saved_registration.as_ref()?;
+    if record.persona_id.as_deref() != Some(record.pubkey.as_str())
+        || records
+            .iter()
+            .filter(|item| item.pubkey.eq_ignore_ascii_case(&record.pubkey))
+            .count()
+            != 1
+        || records
+            .iter()
+            .filter(|item| item.persona_id.as_deref() == Some(record.pubkey.as_str()))
+            .count()
+            != 1
+        || records
+            .iter()
+            .filter(|item| {
+                item.pending_saved_registration
+                    .as_ref()
+                    .is_some_and(|other| {
+                        other.operation_id == pending.operation_id
+                            || other.capsule_run == pending.capsule_run
+                    })
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let mut definitions = records
+        .iter()
+        .filter(|item| item.slug.as_deref() == Some(record.pubkey.as_str()));
+    let definition = definitions.next()?;
+    if definitions.next().is_some() || !definition.pubkey.is_empty() || definition.shared {
+        return None;
+    }
+    // Restore only what this migration wrote. Never adopt a fresh digest or
+    // modify the held ACK, owner scope, identity, instructions or commands.
+    let mut original = record.clone();
+    original.persona_id = None;
+    original.persona_source_version = None;
+    if !crate::commands::saved_agent_backfill_restore_is_original(&original) {
+        return None;
+    }
+    let (expected_definition, version) = standalone_definition(&original)?;
+    if record.persona_source_version.as_ref() != Some(&version)
+        || *definition != expected_definition
+    {
+        return None;
+    }
+    Some(original)
+}
+
+fn restore_pending_backfills(records: &mut [ManagedAgentRecord]) -> usize {
+    let mut restored = 0;
+    for index in 0..records.len() {
+        if records[index].pending_saved_registration.is_none()
+            || records[index].persona_id.is_none()
+        {
+            continue;
+        }
+        if let Some(original) = original_pending_backfill(records, index) {
+            records[index] = original;
+            restored += 1;
+        } else {
+            eprintln!("buzz-desktop: standalone-backfill: pending registration repair refused; original preparation or exact definition is unavailable");
+        }
+    }
+    // The derived definition can have authoritative catalog or team references
+    // outside this snapshot. Preserve it even after restoring the pending link.
+    restored
+}
+
 /// Manufacture definitions for standalone agents (B5 backfill).
 ///
-/// For each keyed record with `persona_id: None`, append a key-less
+/// For each non-pending keyed record with `persona_id: None`, append a key-less
 /// definition record snapshotting the agent's own config and link the agent
 /// to it. Safety rails (pinned in the B5 review gates):
 /// - **Idempotent**: linked records are skipped, so a second run is a no-op.
@@ -37,17 +124,15 @@ pub fn backfill_standalone_agents(app: &tauri::AppHandle) {
     };
     match backfill_standalone_agents_in_dir(&base_dir) {
         Ok(0) => {}
-        Ok(backfilled) => {
-            eprintln!(
-                "buzz-desktop: standalone-backfill: {backfilled} agents linked to manufactured definitions"
-            );
+        Ok(changed) => {
+            eprintln!("buzz-desktop: standalone-backfill: {changed} agent records reconciled");
         }
         Err(e) => eprintln!("buzz-desktop: standalone-backfill: {e}"),
     }
 }
 
 /// Core backfill logic, decoupled from the Tauri `AppHandle` for testing.
-/// Returns the number of records backfilled (0 = nothing to do).
+/// Returns the number of instances backfilled or restored (0 = nothing to do).
 fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
     let agents_path = base_dir.join("managed-agents.json");
     if !agents_path.exists() {
@@ -58,9 +143,13 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
     let mut all: Vec<ManagedAgentRecord> = serde_json::from_str(&content)
         .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?;
 
-    let needs_backfill =
-        |record: &ManagedAgentRecord| !record.pubkey.is_empty() && record.persona_id.is_none();
-    if !all.iter().any(needs_backfill) {
+    let restored = restore_pending_backfills(&mut all);
+    let needs_backfill = |record: &ManagedAgentRecord| {
+        !record.pubkey.is_empty()
+            && record.persona_id.is_none()
+            && record.pending_saved_registration.is_none()
+    };
+    if restored == 0 && !all.iter().any(needs_backfill) {
         return Ok(0);
     }
 
@@ -100,14 +189,7 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
         // heal source old devices hard-require) folded into a key-less
         // definition record. Quad + env come along so future instances
         // minted from this definition inherit a working config.
-        let mut view_source = record.clone();
-        view_source.slug = Some(record.pubkey.clone());
-        // Standalone agents have no definition-level quad — the INSTANCE
-        // fields are the author's intent; copy them up.
-        view_source.definition_respond_to = Some(record.respond_to.as_str().to_string());
-        view_source.definition_respond_to_allowlist = record.respond_to_allowlist.clone();
-        view_source.definition_parallelism = Some(record.parallelism);
-        let Some(persona_view) = view_source.to_definition_view() else {
+        let Some((definition, source_version)) = standalone_definition(record) else {
             eprintln!(
                 "buzz-desktop: standalone-backfill: agent {} produced no persona view — skipped",
                 record.pubkey
@@ -115,24 +197,21 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
             continue;
         };
 
-        // Link the record BEFORE computing the version so the hash covers the
-        // definition exactly as manufactured.
-        let source_version = persona_content_hash(&persona_event_content(&persona_view));
-        let definition = persona_view.into_agent_record();
+        // Link using the exact manufactured definition's content hash.
         record.persona_id = Some(record.pubkey.clone());
         record.persona_source_version = Some(source_version);
         manufactured.push(definition);
         backfilled += 1;
     }
 
-    if backfilled == 0 {
+    if backfilled == 0 && restored == 0 {
         return Ok(0);
     }
     all.extend(manufactured);
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|e| format!("failed to serialize unified store: {e}"))?;
     crate::managed_agents::atomic_write_json_restricted(&agents_path, &payload)?;
-    Ok(backfilled)
+    Ok(backfilled + restored)
 }
 
 #[cfg(test)]

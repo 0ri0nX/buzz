@@ -396,6 +396,50 @@ fn checked_resume_target<T>(
     })
 }
 
+/// Pure admission for undoing the two standalone-backfill link fields. The
+/// caller must separately prove the exact manufactured definition and unique
+/// references. Existing retained digests and ACK remain the only authority.
+pub(crate) fn saved_agent_backfill_restore_is_original(record: &ManagedAgentRecord) -> bool {
+    if record.persona_id.is_some()
+        || record.persona_source_version.is_some()
+        || record.team_id.is_some()
+        || record.persona_team_dir.is_some()
+        || record.persona_name_in_team.is_some()
+        || record.source_team.is_some()
+        || record.source_team_persona_slug.is_some()
+        || record.catalog_source.is_some()
+        || record.team_catalog_source.is_some()
+        || record.slug.is_some()
+        || record.runtime.is_some()
+        || record.display_name.is_some()
+        || !record.name_pool.is_empty()
+        || record.definition_respond_to.is_some()
+        || !record.definition_respond_to_allowlist.is_empty()
+        || record.definition_parallelism.is_some()
+        || record.is_builtin
+        || !record.is_active
+        || record.shared
+        || record.start_on_app_launch
+        || record.auto_restart_on_config_change
+        || record.backend != BackendKind::Local
+        || record.backend_agent_id.is_some()
+        || record.provider_policy_pending
+        || record.provider_binary_path.is_some()
+        || record.relay_mesh.is_some()
+    {
+        return false;
+    }
+    let Some(pending) = record.pending_saved_registration.as_ref() else {
+        return false;
+    };
+    checked_resume_target(
+        std::slice::from_ref(record),
+        &std::collections::HashMap::<_, ()>::new(),
+        &pending.operation_id,
+    )
+    .is_ok()
+}
+
 /// Read only recovery of existing C2 evidence. The operation UUIDv7 is the only
 /// selector; no key hydration, signing, retention, repair or store creation.
 pub(crate) fn resume_rowvia_saved_agent_preparation<R: tauri::Runtime>(
