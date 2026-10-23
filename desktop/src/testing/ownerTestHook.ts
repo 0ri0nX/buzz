@@ -20,6 +20,7 @@ import {
   type OwnerTestPhaseReporter,
 } from "./ownerTestHookPhases";
 import {
+  OWNER_TEST_EXISTING_PAIR,
   OWNER_TEST_SCHEMA,
   ownerTestRequestSchema,
   ownerTestRuntimeProjectionSchema,
@@ -36,7 +37,7 @@ class HookFailure extends Error {
   }
 }
 
-/** A session-local allowlist; only hook-created private streams are accessible. */
+/** Session-local access to hook-created streams and the fixed CERBERUS test pair. */
 export function createOwnerTestHandler(
   reportPhase: OwnerTestPhaseReporter = reportOwnerTestPhase,
 ) {
@@ -47,6 +48,8 @@ export function createOwnerTestHandler(
     string,
     { channelId: string; rootEventId: string }
   >();
+  // Only successful native sends establish readable existing-channel inputs.
+  const existingInputs = new Map<string, string>();
   const channels = new Map<
     string,
     { channel: Channel; expected: string; added: boolean }
@@ -59,6 +62,7 @@ export function createOwnerTestHandler(
     fenced = true;
     channels.clear();
     sentEvents.clear();
+    existingInputs.clear();
   };
   const dispose = relayClient.subscribeToConnectionState((state) => {
     if (boundScope !== null && (state === "idle" || state === "disconnected")) {
@@ -185,6 +189,113 @@ export function createOwnerTestHandler(
         added: false,
       });
       return { channelId: channel.id };
+    }
+    if (
+      request.operation === "send_existing_test_message" ||
+      request.operation === "read_existing_test_channel"
+    ) {
+      const target = request.arguments;
+      if (
+        request.operation === "read_existing_test_channel" &&
+        existingInputs.size === 0
+      )
+        throw new HookFailure("channel_not_owned");
+      const scope = {
+        ownerPubkey: request.expected.ownerPubkey,
+        relayUrl: request.expected.relayUrl,
+      };
+      const membership = await relayClient.fetchEvents(
+        { kinds: [39002], "#d": [target.channelId], limit: 1 },
+        scope,
+      );
+      await assertScope(request);
+      if (
+        membership.length !== 1 ||
+        membership[0].kind !== 39002 ||
+        !membership[0].tags.some(
+          (tag) => tag[0] === "d" && tag[1] === target.channelId,
+        ) ||
+        ![scope.ownerPubkey, target.recipientPubkey].every((pubkey) =>
+          membership[0].tags.some((tag) => tag[0] === "p" && tag[1] === pubkey),
+        )
+      )
+        throw new HookFailure("membership_failed");
+      if (request.operation === "send_existing_test_message") {
+        // Recheck after the membership await; queued or delayed requests expire.
+        if (request.arguments.expiresAt <= Date.now())
+          throw new HookFailure("invalid_request");
+        markMutation();
+        const result = await sendChannelMessage(
+          target.channelId,
+          request.arguments.content,
+          null,
+          undefined,
+          [OWNER_TEST_EXISTING_PAIR.recipientPubkey],
+          9,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          scope.relayUrl,
+          scope.ownerPubkey,
+        );
+        await assertScope(request);
+        if (
+          typeof result.eventId !== "string" ||
+          !/^[0-9a-f]{64}$/.test(result.eventId) ||
+          existingInputs.has(result.eventId) ||
+          result.parentEventId !== null ||
+          result.rootEventId !== null
+        )
+          throw new HookFailure("operation_failed");
+        existingInputs.set(result.eventId, request.arguments.content);
+        return { eventId: result.eventId };
+      }
+      const events = await relayClient.fetchEvents(
+        {
+          kinds: [9],
+          "#h": [target.channelId],
+          limit: request.arguments.limit,
+          ...(request.arguments.since === undefined
+            ? {}
+            : { since: request.arguments.since }),
+        },
+        scope,
+      );
+      await assertScope(request);
+      const bounded = events.slice(0, request.arguments.limit);
+      if (
+        bounded.some(
+          (event) =>
+            event.kind !== 9 ||
+            !event.tags.some(
+              (tag) => tag[0] === "h" && tag[1] === target.channelId,
+            ),
+        )
+      )
+        throw new HookFailure("operation_failed");
+      const correlated = bounded.filter(
+        (event) =>
+          (event.pubkey === scope.ownerPubkey &&
+            existingInputs.has(event.id) &&
+            existingInputs.get(event.id) === event.content) ||
+          (event.pubkey === target.recipientPubkey &&
+            event.tags.some(
+              (tag) =>
+                tag[0] === "e" &&
+                tag[3] === "reply" &&
+                existingInputs.has(tag[1]),
+            )),
+      );
+      if (
+        correlated.some(
+          (event) =>
+            new TextEncoder().encode(JSON.stringify(event)).length > 16_384,
+        ) ||
+        new TextEncoder().encode(JSON.stringify(correlated)).length > 245_760
+      )
+        throw new HookFailure("response_too_large");
+      return { events: correlated };
     }
     const entry = channels.get(request.arguments.channelId);
     if (!entry || entry.expected !== JSON.stringify(request.expected))

@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 const SCHEMA: &str = "rowvia.buzz.owner-test/v1";
 const OWNER: &str = "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68";
 const ARCHITECT: &str = "05d1901b020205f04db1ee6c434d4cd69211af3dbc1d2a46e0e1e93f81f6dd20";
+const EXISTING_CHANNEL: &str = "fd0cc15d-c216-442f-bac2-837dd6fddbbd";
+const EXISTING_RECIPIENT: &str = "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87";
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 256 * 1024;
 const MAX_PENDING: usize = 8;
@@ -220,6 +222,47 @@ fn valid_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
 }
 
+fn valid_existing_arguments(request: &Request) -> bool {
+    let args = &request.arguments;
+    if args.get("channelId").and_then(Value::as_str) != Some(EXISTING_CHANNEL)
+        || args.get("recipientPubkey").and_then(Value::as_str) != Some(EXISTING_RECIPIENT)
+    {
+        return false;
+    }
+    if request.operation == "read_existing_test_channel" {
+        return args.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "channelId" | "recipientPubkey" | "limit" | "since"
+            )
+        }) && args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .is_some_and(|limit| (1..=20).contains(&limit))
+            && args
+                .get("since")
+                .is_none_or(|since| since.as_u64().is_some_and(|n| n <= 9_007_199_254_740_991));
+    }
+    let Some(content) = args.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some((marker, _)) = content.split_once('\n') else {
+        return false;
+    };
+    let valid_marker = regex::Regex::new(r"^ROWVIA_E2E_[A-Za-z0-9_]{1,48}_[a-f0-9]{32}$")
+        .is_ok_and(|pattern| pattern.is_match(marker));
+    let Some(expires_at) = args.get("expiresAt").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    args.len() == 4 && content.len() <= 1024 && valid_marker
+        && content == format!("{marker}\nReply exactly once by calling rowvia_buzz_publish_reply with content=\"{marker}\" and reply_to=\"current_message\". Do not call any other tool; do not use connectors, management proposals, shell/CLI, or file writes. If delivery fails or is uncertain, stop without retrying. This is a bounded message-only readiness diagnostic.")
+        && u128::from(expires_at) > now.as_millis()
+        && u128::from(expires_at) <= now.as_millis() + 120_000
+}
+
 fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
     if bytes.len() > MAX_REQUEST {
         return Err(Code::InvalidRequest);
@@ -234,6 +277,8 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
                 | "add_architect"
                 | "send_message"
                 | "read_channel"
+                | "send_existing_test_message"
+                | "read_existing_test_channel"
                 | "inspect_managed_agent_runtime"
                 | "ensure_managed_agent_runtime"
         )
@@ -251,6 +296,13 @@ fn validate_request(bytes: &[u8]) -> Result<Request, Code> {
         )
     {
         return Err(Code::ScopeMismatch);
+    }
+    if matches!(
+        request.operation.as_str(),
+        "send_existing_test_message" | "read_existing_test_channel"
+    ) && !valid_existing_arguments(&request)
+    {
+        return Err(Code::InvalidRequest);
     }
     Ok(request)
 }
@@ -670,6 +722,95 @@ mod tests {
             assert_eq!(
                 checked_phase("main", true, false, rejected),
                 Err("invalid_phase")
+            );
+        }
+    }
+
+    #[test]
+    fn existing_pair_contract_rejects_extra_targets_content_and_expiry() {
+        let mut r = request();
+        r.operation = "send_existing_test_message".into();
+        let marker = format!("ROWVIA_E2E_CERBERUS_{}", "c".repeat(32));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        r.arguments = serde_json::json!({
+            "channelId": "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+            "recipientPubkey": "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+            "content": format!("{marker}\nReply exactly once by calling rowvia_buzz_publish_reply with content=\"{marker}\" and reply_to=\"current_message\". Do not call any other tool; do not use connectors, management proposals, shell/CLI, or file writes. If delivery fails or is uncertain, stop without retrying. This is a bounded message-only readiness diagnostic."),
+            "expiresAt": now + 60_000,
+        }).as_object().unwrap().clone();
+        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
+        for (field, value) in [
+            (
+                "channelId",
+                serde_json::json!("31986c38-6676-4d6f-a4ba-ed833926d0d5"),
+            ),
+            ("recipientPubkey", serde_json::json!(ARCHITECT)),
+            ("content", serde_json::json!("ROWVIA_E2E_arbitrary")),
+            (
+                "content",
+                serde_json::json!(format!(
+                    "{}\nextra",
+                    r.arguments["content"].as_str().unwrap()
+                )),
+            ),
+            ("expiresAt", serde_json::json!(now - 1)),
+            ("expiresAt", serde_json::json!(now + 121_000)),
+            ("expiresAt", serde_json::json!(1.5)),
+            ("parentEventId", serde_json::json!("f".repeat(64))),
+            ("kind", serde_json::json!(9)),
+        ] {
+            let mut invalid = r.clone();
+            invalid.arguments.insert(field.into(), value);
+            assert!(
+                matches!(
+                    validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                    Err(Code::InvalidRequest)
+                ),
+                "{field}"
+            );
+        }
+        // The unchanged native ledger caches Unknown instead of dispatching again.
+        let mut ledger = Ledger::default();
+        assert!(matches!(ledger.admit(&r), Admission::Dispatch(_)));
+        ledger
+            .complete(Response::failure(
+                &r.request_id,
+                Status::Unknown,
+                Code::Timeout,
+            ))
+            .unwrap();
+        let Admission::Return(cached) = ledger.admit(&r) else {
+            panic!("redispatched")
+        };
+        assert_eq!(cached.status, Status::Unknown);
+        r.operation = "read_existing_test_channel".into();
+        r.arguments.remove("content");
+        r.arguments.remove("expiresAt");
+        r.arguments.insert("limit".into(), serde_json::json!(20));
+        r.arguments.insert("since".into(), serde_json::json!(1));
+        assert!(validate_request(&serde_json::to_vec(&r).unwrap()).is_ok());
+        for (field, value) in [
+            ("limit", serde_json::json!(21)),
+            ("limit", serde_json::json!(0)),
+            ("since", serde_json::json!(-1)),
+            (
+                "channelId",
+                serde_json::json!("31986c38-6676-4d6f-a4ba-ed833926d0d5"),
+            ),
+            ("recipientPubkey", serde_json::json!(ARCHITECT)),
+            ("eventId", serde_json::json!("f".repeat(64))),
+        ] {
+            let mut invalid = r.clone();
+            invalid.arguments.insert(field.into(), value);
+            assert!(
+                matches!(
+                    validate_request(&serde_json::to_vec(&invalid).unwrap()),
+                    Err(Code::InvalidRequest)
+                ),
+                "{field}"
             );
         }
     }

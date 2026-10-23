@@ -2,7 +2,14 @@
 
 ## Active
 
-- [-] BUZZ-CODEX-OWNER — Exact9581 Desktop is installed and verified; Cerberus is listening under the same identity. Still requires genuine owner approval/registration/Start and signed saved-Codex reply; neither source tests nor deployment closes that flow.
+- [-] BUZZ-OWNER-CERBERUS-PAIR — Add the fixed existing Cerberus message-only
+  send/read operations to the temporary owner hook. Source/mechanical review,
+  49 frontend and42 Native tests pass; immutable Desktop installation and signed
+  live readback remain. No registration approval or generic publication operation.
+- [-] BUZZ-CODEX-OWNER — Exactfdd082ecd Desktop is installed and verified; the
+  original pending operation is restored with authorization0/registration0.
+  Still requires genuine owner approval/registration/Start and signed saved-Codex
+  reply; neither source tests nor deployment closes that flow.
 - [-] BUZZ-527-LIVE — Installed Desktop passes native owner/relay readiness and keyring metadata checks; interactive GUI/TTC/owner-operation acceptance still awaits human observation. Draft PR remains draft.
 
 ## After MVP

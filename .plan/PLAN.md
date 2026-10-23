@@ -86,6 +86,22 @@ Rowvia supplies Memory, connectors, credentials and grants. Claude is deferred.
 
 ### Implementation Notes
 
+- Autonomous diagnostic parity: the installed temporary hook cannot accept the
+  existing Main helper's fixed Cerberus send/read operations. The four-file
+  successor admits only that channel/recipient and exact bounded diagnostic;
+  normal reply uses the sole allowed publisher tool. Native owner/relay scope,
+  latest membership,120s expiry, confirmed-source-only readback and no uncertain
+  replay remain.49 frontend tests, formatting/lint,TypeScript and fresh source
+  review pass;42 distinct Native tests pass after actual optimized compilation.
+  Fresh mechanical review confirms exact source and allowed lock normalization.
+  First control failed on a transient du race; second exhausted its1200s bound.
+  Third compiled in16m58s and all42 tests/container exit0/OOMfalse pass, while its
+  wrapper returns1 for four ordinary ignored Tauri-generated schemas. Independent
+  data review confirms these are the sole additions and no existing source entry
+  changed; this is not a raw-wrapper exit0 claim. Build/install and the actual
+  signed exchange are still pending.
+  Unrelated diagnostic edits in the same files are preserved but excluded from
+  the clean candidate. This diagnostic supplies no owner approval or Codex acceptance.
 - Main register-once/read-only-inspect and development workspace recipe are
   committed separately. The actual held SDK can read stock Paseo0.11.1 status
   and zero agents; this is not provider execution or owner-flow acceptance.
