@@ -125,6 +125,7 @@ impl AgentDefinition {
             persona_id: None,
             private_key_nsec: String::new(),
             auth_tag: None,
+            pending_saved_registration: None,
             relay_url: String::new(),
             avatar_url: self.avatar_url,
             acp_command: self
@@ -243,6 +244,153 @@ pub struct RelayAgentInfo {
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
 }
+
+/// Closed local recipe recorded while saved-agent registration is pending.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedAgentRecipe {
+    /// Version one of the local Codex recipe.
+    CodexLocalV1,
+    /// Fixed Codex development recipe with Rowvia Memory and Git read access.
+    CodexDevelopmentMemoryGitReadV1,
+    /// Version one of the local Claude recipe.
+    ClaudeLocalV1,
+}
+
+/// Public historical preparation evidence, never owner approval or runtime readiness.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SavedAgentPreparationAck {
+    pub version: u8,
+    pub operation_id: String,
+    pub agent_pubkey: String,
+    pub native_config_sha256: String,
+    pub saved_authorization_sha256: String,
+    pub recipe_sha256: String,
+    pub request_sha256: String,
+    pub canonical21_sha256: String,
+    pub prepared_receipt_sha256: String,
+}
+
+impl<'de> Deserialize<'de> for SavedAgentPreparationAck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AckObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AckObjectVisitor {
+            type Value = SavedAgentPreparationAck;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a preparation ACK object")
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                // Derive keeps missing/unknown/duplicate/type checks intact,
+                // while the outer visitor deliberately has no sequence path.
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct AckObject {
+                    version: u8,
+                    operation_id: String,
+                    agent_pubkey: String,
+                    native_config_sha256: String,
+                    saved_authorization_sha256: String,
+                    recipe_sha256: String,
+                    request_sha256: String,
+                    canonical21_sha256: String,
+                    prepared_receipt_sha256: String,
+                }
+
+                let ack =
+                    AckObject::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(SavedAgentPreparationAck {
+                    version: ack.version,
+                    operation_id: ack.operation_id,
+                    agent_pubkey: ack.agent_pubkey,
+                    native_config_sha256: ack.native_config_sha256,
+                    saved_authorization_sha256: ack.saved_authorization_sha256,
+                    recipe_sha256: ack.recipe_sha256,
+                    request_sha256: ack.request_sha256,
+                    canonical21_sha256: ack.canonical21_sha256,
+                    prepared_receipt_sha256: ack.prepared_receipt_sha256,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(AckObjectVisitor)
+    }
+}
+
+impl SavedAgentPreparationAck {
+    /// Check exact pending operation/pubkey/config/auth bindings without side effects.
+    ///
+    /// The four host hashes are checked for shape only. This establishes neither
+    /// their provenance nor authority. Later retention must compare the entire
+    /// ACK using exact equality, not just these pending cohort bindings.
+    pub fn validate_pending_cohort(
+        &self,
+        pending: &PendingSavedAgentRegistration,
+        agent_pubkey: &str,
+    ) -> Result<(), String> {
+        let invalid = "invalid saved agent preparation ACK";
+        let operation = uuid::Uuid::parse_str(&self.operation_id).map_err(|_| invalid)?;
+        if self.version != 1
+            || operation.get_version_num() != 7
+            || operation.get_variant() != uuid::Variant::RFC4122
+            || operation.to_string() != self.operation_id
+            || [
+                self.agent_pubkey.as_str(),
+                self.native_config_sha256.as_str(),
+                self.saved_authorization_sha256.as_str(),
+                self.recipe_sha256.as_str(),
+                self.request_sha256.as_str(),
+                self.canonical21_sha256.as_str(),
+                self.prepared_receipt_sha256.as_str(),
+            ]
+            .iter()
+            .any(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || value.bytes().all(|b| b == b'0')
+            })
+            || self.operation_id != pending.operation_id
+            || self.agent_pubkey != agent_pubkey
+            || self.native_config_sha256 != pending.native_config_sha256
+            || self.saved_authorization_sha256 != pending.saved_authorization_sha256
+        {
+            return Err(invalid.into());
+        }
+        Ok(())
+    }
+}
+
+/// Pending registration metadata; this record does not grant authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingSavedAgentRegistration {
+    pub operation_id: String,
+    pub owner_pubkey: String,
+    pub relay_url: String,
+    pub source_instance: String,
+    pub channel_id: String,
+    pub model: String,
+    pub workspace: String,
+    pub capsule_run: String,
+    pub saved_authorization_sha256: String,
+    pub native_config_sha256: String,
+    pub recipe: SavedAgentRecipe,
+    /// Optional public preparation evidence; absence preserves legacy bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_ack: Option<SavedAgentPreparationAck>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
@@ -270,6 +418,9 @@ pub struct ManagedAgentRecord {
     /// Re-attestation requires agent recreation (v2 migration scope).
     #[serde(default)]
     pub auth_tag: Option<String>,
+    /// Private pending registration metadata, absent for existing agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_saved_registration: Option<PendingSavedAgentRegistration>,
     pub relay_url: String,
     /// Avatar URL resolved at creation time (user-supplied input, else the
     /// command-based fallback). Persisted so startup reconciliation compares

@@ -1,4 +1,7 @@
-use super::{AgentDefinition, CatalogSource, ManagedAgentRecord};
+use super::{
+    AgentDefinition, CatalogSource, ManagedAgentRecord, PendingSavedAgentRegistration,
+    SavedAgentPreparationAck, SavedAgentRecipe,
+};
 use crate::managed_agents::AcpSessionPolicy;
 use std::path::PathBuf;
 
@@ -470,6 +473,411 @@ fn stored_record_unknown_or_null_session_policy_degrades_to_channel() {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].session_policy, AcpSessionPolicy::Channel);
+    }
+}
+
+#[test]
+fn legacy_record_without_pending_saved_registration_preserves_serialized_bytes() {
+    let record = sample_agent_record();
+    assert_eq!(record.pending_saved_registration, None);
+
+    let legacy_bytes = concat!(
+        r#"{"pubkey":"abcd1234","name":"test-agent","persona_id":null,"private_key_nsec":"nsec1fake","#,
+        r#""auth_tag":null,"relay_url":"wss://localhost:3000","avatar_url":null,"acp_command":"buzz-acp","#,
+        r#""agent_command":"goose","agent_command_override":null,"agent_args":[],"mcp_command":"","turn_timeout_seconds":320,"#,
+        r#""idle_timeout_seconds":null,"max_turn_duration_seconds":null,"parallelism":10,"system_prompt":null,"model":null,"provider":null,"persona_source_version":null,"#,
+        r#""start_on_app_launch":true,"auto_restart_on_config_change":true,"runtime_pid":null,"backend":{"type":"local"},"backend_agent_id":null,"provider_policy_pending":false,"provider_binary_path":null,"#,
+        r#""created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","last_started_at":null,"last_stopped_at":null,"last_exit_code":null,"last_error":null,"last_error_code":null,"#,
+        r#""respond_to":"owner-only","respond_to_allowlist":[],"is_builtin":false,"is_active":true}"#,
+    );
+    assert_eq!(
+        serde_json::to_vec(&record).expect("serialize legacy record"),
+        legacy_bytes.as_bytes()
+    );
+}
+
+fn pending_saved_registration(recipe: SavedAgentRecipe) -> PendingSavedAgentRegistration {
+    PendingSavedAgentRegistration {
+        operation_id: "019a5432-1234-7abc-8def-0123456789ab".into(),
+        owner_pubkey: "a".repeat(64),
+        relay_url: "wss://relay.invalid".into(),
+        source_instance: "test-instance".into(),
+        channel_id: "test-channel".into(),
+        model: "test-model".into(),
+        workspace: "/synthetic/workspace".into(),
+        capsule_run: "test-run".into(),
+        saved_authorization_sha256: "b".repeat(64),
+        native_config_sha256: "c".repeat(64),
+        recipe,
+        prepared_ack: None,
+    }
+}
+
+#[test]
+fn pending_saved_registration_round_trips_with_closed_recipe_wire_values() {
+    for (recipe, wire) in [
+        (SavedAgentRecipe::CodexLocalV1, "codex-local-v1"),
+        (SavedAgentRecipe::ClaudeLocalV1, "claude-local-v1"),
+    ] {
+        let mut record = sample_agent_record();
+        record.pending_saved_registration = Some(pending_saved_registration(recipe));
+        let value = serde_json::to_value(&record).expect("serialize pending record");
+        assert_eq!(value["pending_saved_registration"]["recipe"], wire);
+        let restored: ManagedAgentRecord =
+            serde_json::from_value(value).expect("deserialize pending record");
+        assert_eq!(restored, record);
+    }
+}
+
+#[test]
+fn pending_saved_registration_rejects_unknown_recipes_and_fields() {
+    let valid = serde_json::to_value(pending_saved_registration(SavedAgentRecipe::CodexLocalV1))
+        .expect("serialize pending registration");
+    for recipe in ["future-local-v1", "CodexLocalV1", "codex-local-v2"] {
+        let mut value = valid.clone();
+        value["recipe"] = serde_json::json!(recipe);
+        assert!(serde_json::from_value::<PendingSavedAgentRegistration>(value).is_err());
+    }
+
+    let mut value = valid;
+    value["authority"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<PendingSavedAgentRegistration>(value).is_err());
+}
+
+fn preparation_ack() -> SavedAgentPreparationAck {
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    SavedAgentPreparationAck {
+        version: 1,
+        operation_id: pending.operation_id,
+        agent_pubkey: "d".repeat(64),
+        native_config_sha256: pending.native_config_sha256,
+        saved_authorization_sha256: pending.saved_authorization_sha256,
+        recipe_sha256: "e".repeat(64),
+        request_sha256: "f".repeat(64),
+        canonical21_sha256: "1".repeat(64),
+        prepared_receipt_sha256: "2".repeat(64),
+    }
+}
+
+#[test]
+fn pending_without_preparation_ack_preserves_pre_ack_bytes() {
+    let legacy_bytes = concat!(
+        r#"{"operation_id":"019a5432-1234-7abc-8def-0123456789ab","#,
+        r#""owner_pubkey":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+        r#""relay_url":"wss://relay.invalid","source_instance":"test-instance","channel_id":"test-channel","#,
+        r#""model":"test-model","workspace":"/synthetic/workspace","capsule_run":"test-run","#,
+        r#""saved_authorization_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","#,
+        r#""native_config_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recipe":"codex-local-v1"}"#,
+    );
+    let pending: PendingSavedAgentRegistration =
+        serde_json::from_str(legacy_bytes).expect("legacy pending without ACK");
+    assert_eq!(pending.prepared_ack, None);
+    assert_eq!(
+        serde_json::to_vec(&pending).expect("serialize pending without ACK"),
+        legacy_bytes.as_bytes()
+    );
+
+    let mut record = sample_agent_record();
+    let ordinary_bytes = serde_json::to_string(&record).expect("ordinary record");
+    record.pending_saved_registration = Some(pending);
+    let expected = ordinary_bytes.replacen(
+        "\"auth_tag\":null,",
+        &format!("\"auth_tag\":null,\"pending_saved_registration\":{legacy_bytes},"),
+        1,
+    );
+    assert_eq!(
+        serde_json::to_string(&record).expect("pending record without ACK"),
+        expected
+    );
+
+    let mut value: serde_json::Value = serde_json::from_str(legacy_bytes).unwrap();
+    value["prepared_ack"] = serde_json::Value::Null;
+    let explicit_none: PendingSavedAgentRegistration = serde_json::from_value(value).unwrap();
+    assert_eq!(explicit_none.prepared_ack, None);
+    assert_eq!(serde_json::to_string(&explicit_none).unwrap(), legacy_bytes);
+}
+
+#[test]
+fn preparation_ack_round_trips_with_exactly_nine_host_keys_on_same_pending_record() {
+    let ack = preparation_ack();
+    let value = serde_json::to_value(&ack).expect("serialize ACK");
+    let mut keys: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agentPubkey",
+            "canonical21Sha256",
+            "nativeConfigSha256",
+            "operationId",
+            "preparedReceiptSha256",
+            "recipeSha256",
+            "requestSha256",
+            "savedAuthorizationSha256",
+            "version",
+        ]
+    );
+    assert_eq!(value["version"], serde_json::json!(1));
+    let mut record = sample_agent_record();
+    let mut pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    pending.prepared_ack = Some(ack.clone());
+    record.pending_saved_registration = Some(pending);
+    let serialized = serde_json::to_value(&record).expect("record with ACK");
+    assert_eq!(
+        serialized["pending_saved_registration"]["prepared_ack"],
+        value
+    );
+    let restored: ManagedAgentRecord = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored, record);
+    assert_eq!(
+        restored.pending_saved_registration.unwrap().prepared_ack,
+        Some(ack)
+    );
+}
+
+#[test]
+fn preparation_ack_dto_rejects_missing_extra_duplicate_and_wrong_typed_fields() {
+    let valid = serde_json::to_value(preparation_ack()).unwrap();
+    for (key, original) in valid.as_object().unwrap() {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<SavedAgentPreparationAck>(missing).is_err(),
+            "missing {key}"
+        );
+        let wrong_values = if key == "version" {
+            vec![
+                serde_json::json!("1"),
+                serde_json::json!(-1),
+                serde_json::json!(256),
+                serde_json::json!(1.0),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ]
+        } else {
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(false),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ]
+        };
+        for wrong in wrong_values.into_iter().chain([serde_json::Value::Null]) {
+            let mut value = valid.clone();
+            value[key] = wrong;
+            assert!(
+                serde_json::from_value::<SavedAgentPreparationAck>(value).is_err(),
+                "wrong type for {key}"
+            );
+        }
+        let bytes = serde_json::to_string(&valid).unwrap();
+        let duplicate = format!("{{\"{key}\":{original},{}", &bytes[1..]);
+        assert!(
+            serde_json::from_str::<SavedAgentPreparationAck>(&duplicate).is_err(),
+            "duplicate {key}"
+        );
+    }
+    for key in [
+        "approved",
+        "runtimeReady",
+        "operation_id",
+        "pubkey",
+        "tenthField",
+    ] {
+        let mut value = valid.clone();
+        value[key] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<SavedAgentPreparationAck>(value).is_err(),
+            "extra {key}"
+        );
+    }
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!("ACK"),
+    ] {
+        assert!(serde_json::from_value::<SavedAgentPreparationAck>(value).is_err());
+    }
+}
+
+#[test]
+fn preparation_ack_rejects_well_shaped_nine_element_sequences_direct_and_nested() {
+    let ack = preparation_ack();
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    assert!(ack
+        .validate_pending_cohort(&pending, &ack.agent_pubkey)
+        .is_ok());
+    let sequence = serde_json::json!([
+        ack.version,
+        ack.operation_id,
+        ack.agent_pubkey,
+        ack.native_config_sha256,
+        ack.saved_authorization_sha256,
+        ack.recipe_sha256,
+        ack.request_sha256,
+        ack.canonical21_sha256,
+        ack.prepared_receipt_sha256,
+    ]);
+    assert_eq!(sequence.as_array().unwrap().len(), 9);
+    let sequence_bytes = serde_json::to_string(&sequence).unwrap();
+    assert!(serde_json::from_str::<SavedAgentPreparationAck>(&sequence_bytes).is_err());
+    assert!(serde_json::from_value::<SavedAgentPreparationAck>(sequence.clone()).is_err());
+
+    let mut pending_value = serde_json::to_value(pending).unwrap();
+    pending_value["prepared_ack"] = sequence;
+    let pending_bytes = serde_json::to_string(&pending_value).unwrap();
+    assert!(serde_json::from_str::<PendingSavedAgentRegistration>(&pending_bytes).is_err());
+    assert!(serde_json::from_value::<PendingSavedAgentRegistration>(pending_value).is_err());
+}
+
+#[test]
+fn preparation_ack_validator_requires_version_one_and_canonical_v7_rfc_operation() {
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    let ack = preparation_ack();
+    assert!(ack
+        .validate_pending_cohort(&pending, &ack.agent_pubkey)
+        .is_ok());
+    for version in [0, 2, u8::MAX] {
+        let mut changed = ack.clone();
+        changed.version = version;
+        assert!(changed
+            .validate_pending_cohort(&pending, &ack.agent_pubkey)
+            .is_err());
+    }
+    for operation in [
+        "invalid",
+        "00000000-0000-0000-0000-000000000000",
+        "019a5432-1234-4abc-8def-0123456789ab",
+        "019a5432-1234-7abc-7def-0123456789ab",
+        "019a5432-1234-7abc-cdef-0123456789ab",
+        "019A5432-1234-7ABC-8DEF-0123456789AB",
+        "019a543212347abc8def0123456789ab",
+        "urn:uuid:019a5432-1234-7abc-8def-0123456789ab",
+        "{019a5432-1234-7abc-8def-0123456789ab}",
+        " 019a5432-1234-7abc-8def-0123456789ab",
+    ] {
+        let mut changed = ack.clone();
+        changed.operation_id = operation.into();
+        // Matching malformed expectations must not mask the syntax guard.
+        let mut changed_pending = pending.clone();
+        changed_pending.operation_id = operation.into();
+        assert!(
+            changed
+                .validate_pending_cohort(&changed_pending, &ack.agent_pubkey)
+                .is_err(),
+            "{operation}"
+        );
+    }
+}
+
+#[test]
+fn preparation_ack_validator_requires_nonzero_lowerhex64_for_pubkey_and_every_hash() {
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    let ack = preparation_ack();
+    for field in [
+        "agentPubkey",
+        "nativeConfigSha256",
+        "savedAuthorizationSha256",
+        "recipeSha256",
+        "requestSha256",
+        "canonical21Sha256",
+        "preparedReceiptSha256",
+    ] {
+        for bad in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            "0".repeat(64),
+            format!(" {}", "a".repeat(63)),
+            "é".repeat(32),
+        ] {
+            let mut value = serde_json::to_value(&ack).unwrap();
+            value[field] = serde_json::json!(&bad);
+            let changed: SavedAgentPreparationAck = serde_json::from_value(value).unwrap();
+            // Match expected cohort values too, so shape checks stand alone.
+            let mut changed_pending = pending.clone();
+            changed_pending.native_config_sha256 = changed.native_config_sha256.clone();
+            changed_pending.saved_authorization_sha256 = changed.saved_authorization_sha256.clone();
+            assert!(
+                changed
+                    .validate_pending_cohort(&changed_pending, &changed.agent_pubkey)
+                    .is_err(),
+                "{field}: {bad}"
+            );
+        }
+    }
+}
+
+#[test]
+fn preparation_ack_validator_requires_exact_pending_cohort() {
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    let ack = preparation_ack();
+    for field in [
+        "operationId",
+        "agentPubkey",
+        "nativeConfigSha256",
+        "savedAuthorizationSha256",
+    ] {
+        let mut value = serde_json::to_value(&ack).unwrap();
+        value[field] = if field == "operationId" {
+            serde_json::json!("019a5432-1234-7abc-8def-0123456789ac")
+        } else {
+            serde_json::json!("3".repeat(64))
+        };
+        let changed: SavedAgentPreparationAck = serde_json::from_value(value).unwrap();
+        assert!(
+            changed
+                .validate_pending_cohort(&pending, &ack.agent_pubkey)
+                .is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn preparation_ack_host_hashes_are_shape_only_and_tuple_equality_is_exact() {
+    let pending = pending_saved_registration(SavedAgentRecipe::CodexLocalV1);
+    let ack = preparation_ack();
+    for field in [
+        "recipeSha256",
+        "requestSha256",
+        "canonical21Sha256",
+        "preparedReceiptSha256",
+    ] {
+        let mut value = serde_json::to_value(&ack).unwrap();
+        value[field] = serde_json::json!("3".repeat(64));
+        let changed: SavedAgentPreparationAck = serde_json::from_value(value).unwrap();
+        assert!(changed
+            .validate_pending_cohort(&pending, &ack.agent_pubkey)
+            .is_ok());
+        assert_ne!(changed, ack, "retention must distinguish changed {field}");
+    }
+    assert_eq!(ack.clone(), ack);
+}
+
+#[test]
+fn preparation_ack_equality_distinguishes_every_closed_tuple_field() {
+    let ack = preparation_ack();
+    let valid = serde_json::to_value(&ack).unwrap();
+    for field in valid.as_object().unwrap().keys() {
+        let mut value = valid.clone();
+        value[field] = if field == "version" {
+            serde_json::json!(2)
+        } else if field == "operationId" {
+            serde_json::json!("019a5432-1234-7abc-8def-0123456789ac")
+        } else {
+            serde_json::json!("3".repeat(64))
+        };
+        let changed: SavedAgentPreparationAck = serde_json::from_value(value).unwrap();
+        assert_ne!(changed, ack, "exact tuple equality must compare {field}");
     }
 }
 

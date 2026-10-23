@@ -40,6 +40,7 @@ type AgentDialogCreateProps = {
   isDefinitionPending: boolean;
   runtimes: AcpRuntimeCatalogEntry[];
   runtimeCatalogStatus: "loading" | "ready" | "error";
+  onSaveCodex?: (displayName: string, systemPrompt: string) => Promise<boolean>;
   onSubmitDefinition: (
     input: CreatePersonaInput | UpdatePersonaInput,
     intent: AgentCreateIntent,
@@ -136,6 +137,7 @@ function AgentCreateDialogRouter({
   submitLabel,
   onDirtyChange,
   onSubmitDefinition,
+  onSaveCodex,
 }: AgentDialogCreateProps) {
   const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
   const [effortLevel, setEffortLevel] = React.useState<string | null>(null);
@@ -153,6 +155,7 @@ function AgentCreateDialogRouter({
     // because it owns the "Run on" draft.
     <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
       <AgentDefinitionDialog
+        onSaveCodex={onSaveCodex}
         createRunSection={(effortOptions) => (
           <>
             <WhereToRunSection

@@ -610,6 +610,7 @@ pub async fn confirm_agent_snapshot_import(
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
+            pending_saved_registration: None,
             relay_url: String::new(), // resolves to workspace relay at runtime
             avatar_url: effective_avatar.clone(),
             // Only the validated portable ACP alias crosses the snapshot boundary.

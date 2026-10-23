@@ -203,7 +203,11 @@ async fn restore_managed_agents_on_launch<R: tauri::Runtime>(
 
         let candidates: Vec<String> = records
             .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+            .filter(|record| {
+                record.start_on_app_launch
+                    && record.backend == BackendKind::Local
+                    && record.pending_saved_registration.is_none()
+            })
             .map(|record| record.pubkey.clone())
             .collect();
 

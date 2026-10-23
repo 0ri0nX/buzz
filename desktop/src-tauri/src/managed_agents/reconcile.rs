@@ -127,6 +127,10 @@ pub(crate) fn retain_agent_record(
     keys: &nostr::Keys,
     record: &ManagedAgentRecord,
 ) -> Result<bool, String> {
+    // Preparation is private local state, not an owner publication decision.
+    if record.pending_saved_registration.is_some() {
+        return Ok(false);
+    }
     let owner_pubkey = keys.public_key().to_hex();
     let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
 

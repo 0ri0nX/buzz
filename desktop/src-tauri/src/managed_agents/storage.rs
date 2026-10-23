@@ -233,13 +233,19 @@ fn migrate_inline_key(store: &impl KeyStore, record: &ManagedAgentRecord) -> Key
     }
 }
 
-/// Refuse to spawn an agent whose private key is unavailable. Returns
-/// `Some(error)` when `private_key_nsec` is empty — after [`hydrate_keys`] an
-/// empty key means a keyring outage or a genuinely absent secret, NOT a
-/// deliberately keyless agent. Spawning anyway would inject an empty
-/// `BUZZ_PRIVATE_KEY`/`NOSTR_PRIVATE_KEY`, launching with no identity. Callers
-/// (the spawn path) must fail closed (Wes storage.rs:158).
+/// Pending preparation is never authority to start or deploy a native agent.
+pub(crate) fn pending_saved_registration_refusal(record: &ManagedAgentRecord) -> Option<String> {
+    if record.pending_saved_registration.is_some() {
+        return Some("saved agent registration is pending; refusing to start".into());
+    }
+    None
+}
+
+/// Refuse pending registration or unavailable identity before any process work.
 pub(crate) fn spawn_key_refusal(record: &ManagedAgentRecord) -> Option<String> {
+    if let Some(error) = pending_saved_registration_refusal(record) {
+        return Some(error);
+    }
     record.private_key_nsec.is_empty().then(|| {
         format!(
             "agent {} has no private key available — the OS keyring may be unreachable. \
@@ -273,6 +279,201 @@ fn load_agent_store<R: tauri::Runtime>(
     })
 }
 
+/// A raw same-path snapshot. Unlike the ordinary loader, this never creates a
+/// directory, hydrates a key, backs up invalid JSON, or defaults a missing store.
+pub(crate) struct SavedAgentStoreSnapshot {
+    pub(crate) records: Vec<ManagedAgentRecord>,
+    path: PathBuf,
+    resolved: PathBuf,
+}
+
+pub(crate) fn load_agent_store_readonly<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<SavedAgentStoreSnapshot, String> {
+    let unavailable = "saved agent scope unavailable";
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| unavailable)?
+        .join("agents")
+        .join("managed-agents.json");
+    let resolved = fs::canonicalize(&path).map_err(|_| unavailable)?;
+    let bytes = fs::read(&path).map_err(|_| unavailable)?;
+    let records = serde_json::from_slice(&bytes).map_err(|_| unavailable)?;
+    if fs::canonicalize(&path).map_err(|_| unavailable)? != resolved {
+        return Err(unavailable.into());
+    }
+    Ok(SavedAgentStoreSnapshot {
+        records,
+        path,
+        resolved,
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationAckWriteFault {
+    BeforeCommit,
+    AfterCommit,
+    Readback,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREPARATION_ACK_WRITE_FAULT: std::cell::Cell<Option<PreparationAckWriteFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The only mutation offered by this seam is None -> the entire exact ACK.
+/// Caller holds workspace, identity, transition, store and process-map guards.
+/// Failure after a possible commit is deliberately unknown: never repair/retry.
+pub(crate) fn retain_saved_agent_preparation_ack<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    snapshot: SavedAgentStoreSnapshot,
+    target: usize,
+    ack: &crate::managed_agents::SavedAgentPreparationAck,
+) -> Result<SavedAgentStoreSnapshot, String> {
+    let unknown = "saved agent preparation retention unknown";
+    let current = load_agent_store_readonly(app).map_err(|_| unknown)?;
+    if current.path != snapshot.path
+        || current.resolved != snapshot.resolved
+        || current.records != snapshot.records
+    {
+        return Err(unknown.into());
+    }
+    let mut expected = snapshot.records;
+    let record = expected.get_mut(target).ok_or(unknown)?;
+    let pending = record.pending_saved_registration.as_mut().ok_or(unknown)?;
+    ack.validate_pending_cohort(pending, &record.pubkey)
+        .map_err(|_| unknown)?;
+    match pending.prepared_ack.as_ref() {
+        Some(prior) if prior == ack => return Ok(current),
+        Some(_) => return Err("saved agent preparation ACK differs".into()),
+        None => pending.prepared_ack = Some(ack.clone()),
+    }
+    let (mut definitions, instances): (Vec<_>, Vec<_>) = expected
+        .into_iter()
+        .partition(|record| record.pubkey.is_empty());
+    definitions.sort_by(|left, right| left.slug.cmp(&right.slug));
+    definitions.extend(instances);
+    let expected = definitions;
+    let payload = serde_json::to_vec_pretty(&expected).map_err(|_| unknown)?;
+    #[cfg(test)]
+    let fault = PREPARATION_ACK_WRITE_FAULT.with(|fault| fault.take());
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::BeforeCommit) {
+        return Err(unknown.into());
+    }
+    // Existing primitive: restricted permissions before bytes, temp-file fsync,
+    // atomic rename and parent-directory fsync; configured symlink is retained.
+    atomic_write_json_restricted(&snapshot.path, &payload).map_err(|_| unknown)?;
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::AfterCommit) {
+        return Err(unknown.into());
+    }
+    let retained = load_agent_store_readonly(app).map_err(|_| unknown)?;
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::Readback) {
+        return Err(unknown.into());
+    }
+    if retained.path != snapshot.path
+        || retained.resolved != snapshot.resolved
+        || retained.records != expected
+    {
+        return Err(unknown.into());
+    }
+    Ok(retained)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FINALIZATION_WRITE_FAULT: std::cell::Cell<Option<PreparationAckWriteFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static FINALIZATION_CONFIGURED_ALIAS_RETARGET: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Exact pending+ACK -> None only. Caller holds the five native guards; this
+/// compares the entire raw typed snapshot again immediately before writing.
+/// No missing-pending success, normalization, sorting, retry or rollback.
+/// This is a Native-locked snapshot CAS, not atomic against arbitrary hostile
+/// same-UID replacement of the resolved leaf or its parents.
+pub(crate) fn finalize_saved_agent_registration<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    snapshot: SavedAgentStoreSnapshot,
+    target: usize,
+    expected_pending: &crate::managed_agents::PendingSavedAgentRegistration,
+) -> Result<SavedAgentStoreSnapshot, String> {
+    let unknown = "saved agent registration finalization unknown";
+    let current = load_agent_store_readonly(app).map_err(|_| unknown)?;
+    if current.path != snapshot.path
+        || current.resolved != snapshot.resolved
+        || current.records != snapshot.records
+    {
+        return Err(unknown.into());
+    }
+    let mut expected = snapshot.records;
+    let record = expected.get_mut(target).ok_or(unknown)?;
+    if record.pending_saved_registration.as_ref() != Some(expected_pending)
+        || record.runtime_pid.is_some()
+        || record.start_on_app_launch
+        || record.auto_restart_on_config_change
+    {
+        return Err(unknown.into());
+    }
+    expected_pending
+        .prepared_ack
+        .as_ref()
+        .ok_or(unknown)?
+        .validate_pending_cohort(expected_pending, &record.pubkey)
+        .map_err(|_| unknown)?;
+    record.pending_saved_registration = None;
+    let payload = serde_json::to_vec_pretty(&expected).map_err(|_| unknown)?;
+    // Refuse lossy serialization (including legacy skip_serializing fields)
+    // rather than silently changing another field while removing pending.
+    let roundtrip: Vec<ManagedAgentRecord> =
+        serde_json::from_slice(&payload).map_err(|_| unknown)?;
+    if roundtrip != expected {
+        return Err(unknown.into());
+    }
+    #[cfg(test)]
+    let fault = FINALIZATION_WRITE_FAULT.with(|fault| fault.take());
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::BeforeCommit) {
+        return Err(unknown.into());
+    }
+    #[cfg(all(test, unix))]
+    if let Some(replacement) =
+        FINALIZATION_CONFIGURED_ALIAS_RETARGET.with(|slot| slot.borrow_mut().take())
+    {
+        fs::remove_file(&snapshot.path).map_err(|_| unknown)?;
+        std::os::unix::fs::symlink(replacement, &snapshot.path).map_err(|_| unknown)?;
+    }
+    // Never resolve the configured alias again for writing: an alias retarget
+    // after comparison must not overwrite the unverified replacement store.
+    atomic_write_json_restricted(&snapshot.resolved, &payload).map_err(|_| unknown)?;
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::AfterCommit) {
+        return Err(unknown.into());
+    }
+    let retained = load_agent_store_readonly(app).map_err(|_| unknown)?;
+    #[cfg(test)]
+    if fault == Some(PreparationAckWriteFault::Readback) {
+        return Err(unknown.into());
+    }
+    if retained.path != snapshot.path
+        || retained.resolved != snapshot.resolved
+        || retained.records != expected
+    {
+        return Err(unknown.into());
+    }
+    Ok(retained)
+}
+
 /// Load the keyed agent *instances*. Key-less definitions (former personas,
 /// folded into the same store) are filtered out so every pre-fold call site
 /// keeps seeing exactly the records it always did.
@@ -283,6 +484,61 @@ pub fn load_managed_agents<R: tauri::Runtime>(
     records.retain(|record| !record.pubkey.is_empty());
     hydrate_keys(&mut records);
     Ok(records)
+}
+
+/// Read preparation metadata without hydrating or migrating existing keys.
+pub(crate) fn load_unhydrated_managed_agents<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let mut records = load_agent_store(app)?;
+    records.retain(|record| !record.pubkey.is_empty());
+    Ok(records)
+}
+
+/// Load ordinary operations' records, refusing a pending target before hydration.
+/// The caller holds the store lock; the SAME checked snapshot is hydrated.
+pub(crate) fn load_managed_agents_for_ordinary_operation<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    pubkey: &str,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let mut records = load_unhydrated_managed_agents(app)?;
+    if let Some(record) = records.iter().find(|record| record.pubkey == pubkey) {
+        if let Some(error) = pending_saved_registration_refusal(record) {
+            return Err(error);
+        }
+    }
+    hydrate_keys(&mut records);
+    Ok(records)
+}
+
+/// Append only the new pending key, preserving existing key custody unchanged.
+/// The caller holds the managed-agent store lock.
+pub(crate) fn append_prepared_managed_agent<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    mut record: ManagedAgentRecord,
+) -> Result<(), String> {
+    let pending = record
+        .pending_saved_registration
+        .as_ref()
+        .ok_or("preparation missing")?;
+    let mut all = load_agent_store(app)?;
+    if all.iter().any(|prior| {
+        prior.pubkey == record.pubkey
+            || prior.name == record.name
+            || prior
+                .pending_saved_registration
+                .as_ref()
+                .is_some_and(|old| {
+                    old.operation_id == pending.operation_id
+                        || old.capsule_run == pending.capsule_run
+                })
+    }) {
+        return Err("prepared agent already exists".into());
+    }
+    persist_agent_keys(std::slice::from_mut(&mut record));
+    all.push(record);
+    let (definitions, instances) = all.into_iter().partition(|record| record.pubkey.is_empty());
+    write_agent_store(app, definitions, instances)
 }
 
 /// Load the key-less agent *definitions* (former personas) from the unified
@@ -514,7 +770,7 @@ pub fn migrate_agent_keys_to_dev_service(app: &tauri::AppHandle) {
 /// Its presence means all agent keys that existed in the prod service at
 /// migration time have been copied; subsequent dev boots skip the migration
 /// entirely (no prod keyring access).
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const DEV_MIGRATION_MARKER: &str = "_dev_migration_v1";
 
 /// Testable core of [`migrate_agent_keys_to_dev_service`]: copy `agent:<pubkey>`
@@ -535,7 +791,7 @@ const DEV_MIGRATION_MARKER: &str = "_dev_migration_v1";
 /// may have rotated their key in the dev service after initial migration).
 /// New agents (pubkey not in `src`) are silently skipped — they will mint a
 /// fresh key on their next onboarding run.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn copy_agent_keys_between_stores(pubkeys: &[String], src: &impl KeyStore, dst: &impl KeyStore) {
     // One read of the dev blob. If the migration-complete marker is present,
     // all prior agent keys are already in the dev service — skip entirely.
@@ -1005,3 +1261,7 @@ pub fn meaningful_agent_error_from_log(path: &Path) -> Option<AgentLogError> {
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "storage_saved_agent_finalization_tests.rs"]
+mod finalization_tests;

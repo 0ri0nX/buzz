@@ -8,6 +8,12 @@ export const OWNER_TEST_ENSURE_TARGET_PUBKEYS = [
   "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
   "fa17b69969fa097c40b105bfd85b383101b2e918827ce0f67958f7c7197da2dc",
 ] as const;
+/** The sole existing channel/recipient pair available to this temporary lane. */
+export const OWNER_TEST_EXISTING_PAIR = {
+  channelId: "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+  recipientPubkey:
+    "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+} as const;
 const pubkey = z.string().regex(/^[0-9a-f]{64}$/);
 const eventId = z.string().regex(/^[0-9a-f]{64}$/);
 const channelId = z.string().uuid();
@@ -27,8 +33,64 @@ const base = {
   }),
 };
 
+const existingBase = {
+  ...base,
+  expected: z.strictObject({
+    ownerPubkey: z.literal(
+      "89af092923ad49e3b9916b0c9f28c6b9237d8fcab4461cb7ddd12afe354f0d68",
+    ),
+    architectPubkey: z.literal(
+      "05d1901b020205f04db1ee6c434d4cd69211af3dbc1d2a46e0e1e93f81f6dd20",
+    ),
+    relayUrl: relayUrl.refine((value) => value === "wss://buzz.rowvia.ai:8443"),
+  }),
+};
+const existingPair = {
+  channelId: z.literal(OWNER_TEST_EXISTING_PAIR.channelId),
+  recipientPubkey: z.literal(OWNER_TEST_EXISTING_PAIR.recipientPubkey),
+};
+const existingContent = z
+  .string()
+  .max(1024)
+  .refine((content) => {
+    const marker = content.split("\n", 1)[0];
+    return (
+      /^ROWVIA_E2E_[A-Za-z0-9_]{1,48}_[a-f0-9]{32}$/.test(marker) &&
+      content ===
+        `${marker}\nReply exactly once by calling rowvia_buzz_publish_reply with content="${marker}" and reply_to="current_message". Do not call any other tool; do not use connectors, management proposals, shell/CLI, or file writes. If delivery fails or is uncertain, stop without retrying. This is a bounded message-only readiness diagnostic.` &&
+      new TextEncoder().encode(content).length <= 1024
+    );
+  });
+
 /** Strict validation rejects extra arguments and unrestricted operations. */
 export const ownerTestRequestSchema = z.discriminatedUnion("operation", [
+  z.strictObject({
+    ...existingBase,
+    operation: z.literal("send_existing_test_message"),
+    arguments: z.strictObject({
+      ...existingPair,
+      content: existingContent,
+      expiresAt: z
+        .number()
+        .int()
+        .nonnegative()
+        .refine((value) => {
+          const now = Date.now();
+          return (
+            Number.isSafeInteger(value) && value > now && value <= now + 120000
+          );
+        }),
+    }),
+  }),
+  z.strictObject({
+    ...existingBase,
+    operation: z.literal("read_existing_test_channel"),
+    arguments: z.strictObject({
+      ...existingPair,
+      limit: z.number().int().min(1).max(20),
+      since: z.number().int().nonnegative().optional(),
+    }),
+  }),
   z.strictObject({
     ...base,
     operation: z.literal("status"),

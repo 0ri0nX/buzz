@@ -140,9 +140,9 @@ pub(crate) async fn flush_managed_agent_policy<R: tauri::Runtime>(
 /// policy changes stop active local pairs before saving and restart those exact
 /// pairs after the relay policy is flushed.
 #[tauri::command]
-pub async fn update_managed_agent(
+pub async fn update_managed_agent<R: tauri::Runtime>(
     input: UpdateManagedAgentRequest,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
     // Captured before Phase 1 stops the runtime for an access-policy change: a
@@ -154,7 +154,11 @@ pub async fn update_managed_agent(
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        let mut records =
+            crate::managed_agents::storage::load_managed_agents_for_ordinary_operation(
+                &app,
+                &input.pubkey,
+            )?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()

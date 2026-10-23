@@ -319,6 +319,10 @@ async fn fetch_starter_channel_metadata(
 }
 
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri command arguments preserve the existing flat IPC contract"
+)]
 pub async fn create_channel(
     name: String,
     channel_type: String,

@@ -224,11 +224,11 @@ pub async fn list_managed_agent_runtimes(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-pub(crate) fn start_managed_agent_runtime_pair_lazy(
+pub(crate) fn start_managed_agent_runtime_pair_lazy<R: tauri::Runtime>(
     pubkey: String,
     relay_url: String,
     admission: &super::AdmissionSnapshot,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     start_pair(pubkey, relay_url, true, None, admission, app)
 }
@@ -266,6 +266,9 @@ fn start_pair<R: tauri::Runtime>(
         .map_err(|e| e.to_string())?;
     let mut records = load_managed_agents(&app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
+    if let Some(error) = super::storage::pending_saved_registration_refusal(record) {
+        return Err(error);
+    }
     if record.backend != BackendKind::Local {
         return Err("managed runtime pairs require a local agent".into());
     }
@@ -420,6 +423,19 @@ fn restart_pair<R: tauri::Runtime>(
     app: AppHandle<R>,
     stop: impl FnOnce() -> Result<(), String>,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    {
+        let state = app.state::<AppState>();
+        let _store = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let records = super::storage::load_unhydrated_managed_agents(&app)?;
+        if let Some(record) = records.iter().find(|record| record.pubkey == pubkey) {
+            if let Some(error) = super::storage::pending_saved_registration_refusal(record) {
+                return Err(error);
+            }
+        }
+    }
     // Captured before the stop, so a removal landing between the two refuses the start.
     let admission = super::AdmissionSnapshot::capture(&app.state::<AppState>());
     stop()?;
@@ -508,9 +524,11 @@ pub async fn reconcile_managed_agent_runtimes(
     let records = load_managed_agents(&app)?;
     let mut jobs = Vec::new();
     for community in communities {
-        for record in records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+        for record in records.iter().filter(|record| {
+            record.start_on_app_launch
+                && record.backend == BackendKind::Local
+                && record.pending_saved_registration.is_none()
+        })
         // The legacy per-record relay pin is deliberately ignored here — see
         // `effective_agent_relay_url`. Every local auto-start agent fans out
         // to every configured community.

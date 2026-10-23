@@ -4,7 +4,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        current_instance_id, find_managed_agent_mut, load_managed_agents, save_managed_agents,
+        current_instance_id, find_managed_agent_mut, save_managed_agents,
         sync_managed_agent_processes, ManagedAgentSummary,
     },
     util::now_iso,
@@ -18,10 +18,10 @@ pub fn set_agent_managed_profiles(enabled: bool, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-pub async fn set_managed_agent_start_on_app_launch(
+pub async fn set_managed_agent_start_on_app_launch<R: tauri::Runtime>(
     pubkey: String,
     start_on_app_launch: bool,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -29,7 +29,10 @@ pub async fn set_managed_agent_start_on_app_launch(
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        let mut records =
+            crate::managed_agents::storage::load_managed_agents_for_ordinary_operation(
+                &app, &pubkey,
+            )?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -62,10 +65,10 @@ pub async fn set_managed_agent_start_on_app_launch(
 }
 
 #[tauri::command]
-pub async fn set_managed_agent_auto_restart(
+pub async fn set_managed_agent_auto_restart<R: tauri::Runtime>(
     pubkey: String,
     auto_restart_on_config_change: bool,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<ManagedAgentSummary, String> {
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -73,7 +76,10 @@ pub async fn set_managed_agent_auto_restart(
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        let mut records =
+            crate::managed_agents::storage::load_managed_agents_for_ordinary_operation(
+                &app, &pubkey,
+            )?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()

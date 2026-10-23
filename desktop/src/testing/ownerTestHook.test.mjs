@@ -1623,3 +1623,355 @@ test("scoped ordinary publisher refuses retry through a replacement relay", asyn
   assert.equal(frames.length, 1);
   assert.equal(client.pendingEvents.size, 0);
 });
+
+const cerberusPair = {
+  channelId: "fd0cc15d-c216-442f-bac2-837dd6fddbbd",
+  recipientPubkey:
+    "9d3972d809d53ce8a87003ca7f631009963d9414739188cea6209ced88365c87",
+};
+const cerberusMarker = `ROWVIA_E2E_CERBERUS_${"c".repeat(32)}`;
+const cerberusContent = `${cerberusMarker}\nReply exactly once by calling rowvia_buzz_publish_reply with content="${cerberusMarker}" and reply_to="current_message". Do not call any other tool; do not use connectors, management proposals, shell/CLI, or file writes. If delivery fails or is uncertain, stop without retrying. This is a bounded message-only readiness diagnostic.`;
+function existingRequest(operation = "send_existing_test_message", args = {}) {
+  const payload = nativeStatusRequest();
+  payload.operation = operation;
+  payload.arguments =
+    operation === "send_existing_test_message"
+      ? {
+          ...cerberusPair,
+          content: cerberusContent,
+          expiresAt: Date.now() + 60000,
+          ...args,
+        }
+      : { ...cerberusPair, limit: 20, ...args };
+  return payload;
+}
+function existingMembership(payload) {
+  return {
+    kind: 39002,
+    tags: [
+      ["d", cerberusPair.channelId],
+      ["p", payload.expected.ownerPubkey],
+      ["p", cerberusPair.recipientPubkey],
+    ],
+  };
+}
+function mockExistingHistory(payload, messageEvents = []) {
+  relayClient.fetchHistory = async (filter, scope) => {
+    calls.push({ command: "history", args: filter, scope });
+    return filter.kinds[0] === 39002
+      ? [existingMembership(payload)]
+      : messageEvents;
+  };
+}
+
+test("existing CERBERUS route rejects arbitrary targets, content, extras and expiry before IO", async () => {
+  for (const args of [
+    { channelId },
+    { recipientPubkey: architectPubkey },
+    { content: "ROWVIA_E2E_arbitrary" },
+    { content: `${cerberusContent}\nextra` },
+    {
+      content: cerberusContent.replaceAll(
+        cerberusMarker,
+        `ROWVIA_E2E_${"a".repeat(49)}_${"c".repeat(32)}`,
+      ),
+    },
+    { expiresAt: Date.now() - 1 },
+    { expiresAt: Date.now() + 121000 },
+    { expiresAt: 1.5 },
+    { parentEventId: "f".repeat(64) },
+    { kind: 9 },
+  ]) {
+    reset();
+    const handler = createOwnerTestHandler(() => {});
+    try {
+      assert.equal(
+        (await handler(existingRequest(undefined, args))).code,
+        "invalid_request",
+      );
+      assert.equal(calls.length, 0);
+    } finally {
+      handler.dispose();
+    }
+  }
+  for (const change of [{ ownerPubkey }, { architectPubkey }, { relayUrl }]) {
+    reset();
+    const handler = createOwnerTestHandler(() => {});
+    const payload = existingRequest();
+    Object.assign(payload.expected, change);
+    try {
+      assert.equal((await handler(payload)).code, "invalid_request");
+      assert.equal(calls.length, 0);
+    } finally {
+      handler.dispose();
+    }
+  }
+});
+
+test("existing CERBERUS send checks membership and sends once via the owner-scoped native kind9 wrapper", async () => {
+  reset();
+  const payload = existingRequest();
+  setNativeScope(payload);
+  mockExistingHistory(payload);
+  const handler = createOwnerTestHandler(() => {});
+  try {
+    const response = await handler(payload);
+    assert.equal(response.status, "ok");
+    assert.equal((await handler(payload)).code, "duplicate_request");
+    const sends = calls.filter(
+      ({ command }) => command === "send_channel_message",
+    );
+    assert.equal(sends.length, 1);
+    assert.deepEqual(sends[0].args, {
+      channelId: cerberusPair.channelId,
+      content: cerberusContent,
+      parentEventId: null,
+      rootEventId: null,
+      mediaTags: null,
+      emojiTags: null,
+      mentionTags: null,
+      linkPreviewTags: undefined,
+      sentFromThreadTag: null,
+      mentionPubkeys: [cerberusPair.recipientPubkey],
+      kind: 9,
+      expectedRelayUrl: "wss://buzz.rowvia.ai:8443",
+      expectedSignerPubkey: payload.expected.ownerPubkey,
+    });
+    const membership = calls.find(({ command }) => command === "history");
+    assert.deepEqual(membership.args, {
+      kinds: [39002],
+      "#d": [cerberusPair.channelId],
+      limit: 1,
+    });
+    assert.deepEqual(membership.scope, {
+      ownerPubkey: payload.expected.ownerPubkey,
+      relayUrl: "wss://buzz.rowvia.ai:8443",
+    });
+    assert.ok(
+      !calls.some(({ command }) =>
+        [
+          "sign_event",
+          "publish",
+          "create_channel",
+          "add_channel_members",
+          "start_managed_agent_runtime",
+        ].includes(command),
+      ),
+    );
+  } finally {
+    handler.dispose();
+  }
+});
+
+test("existing CERBERUS sends fail closed on membership, expired waits, wrong scope and uncertain native outcome", async () => {
+  for (const mode of [
+    "missing-owner",
+    "missing-recipient",
+    "wrong-channel",
+    "wrong-kind",
+    "empty",
+    "scope",
+    "expired",
+    "native-error",
+    "bad-result",
+  ]) {
+    reset();
+    const payload = existingRequest();
+    setNativeScope(payload);
+    const handler = createOwnerTestHandler(() => {});
+    const originalNow = Date.now;
+    relayClient.fetchHistory = async () => {
+      const membership = existingMembership(payload);
+      if (mode === "missing-owner") membership.tags.splice(1, 1);
+      if (mode === "missing-recipient") membership.tags.pop();
+      if (mode === "wrong-channel") membership.tags[0][1] = channelId;
+      if (mode === "wrong-kind") membership.kind = 9;
+      if (mode === "scope") identity = ownerPubkey;
+      if (mode === "expired") Date.now = () => payload.arguments.expiresAt + 1;
+      return mode === "empty" ? [] : [membership];
+    };
+    if (mode === "native-error")
+      nativeOverrides.set("send_channel_message", () => {
+        throw new Error("private");
+      });
+    if (mode === "bad-result")
+      nativeOverrides.set("send_channel_message", () => ({ event_id: "bad" }));
+    try {
+      const response = await handler(payload);
+      assert.equal(
+        response.status,
+        ["native-error", "bad-result"].includes(mode) ? "unknown" : "error",
+        mode,
+      );
+      assert.equal(
+        calls.filter(({ command }) => command === "send_channel_message")
+          .length,
+        ["native-error", "bad-result"].includes(mode) ? 1 : 0,
+        mode,
+      );
+      Date.now = originalNow;
+      assert.equal((await handler(payload)).code, "duplicate_request");
+      assert.equal(
+        (await handler(existingRequest("read_existing_test_channel"))).status,
+        "error",
+      );
+    } finally {
+      Date.now = originalNow;
+      handler.dispose();
+    }
+  }
+});
+
+test("existing CERBERUS history requires this handler's confirmed input and exposes only bound kind9 source/replies", async () => {
+  reset();
+  const payload = existingRequest();
+  setNativeScope(payload);
+  mockExistingHistory(payload);
+  const handler = createOwnerTestHandler(() => {});
+  try {
+    for (const args of [
+      {},
+      { limit: 21 },
+      { since: -1 },
+      { recipientPubkey: architectPubkey },
+      { eventId: "c".repeat(64) },
+    ]) {
+      const response = await handler(
+        existingRequest("read_existing_test_channel", args),
+      );
+      assert.equal(response.status, "error");
+    }
+    assert.equal(
+      calls.filter(({ command }) => command === "history").length,
+      0,
+    );
+    const sent = await handler(payload);
+    assert.equal(sent.status, "ok");
+    const source = {
+      id: sent.result.eventId,
+      pubkey: payload.expected.ownerPubkey,
+      kind: 9,
+      content: cerberusContent,
+      tags: [["h", cerberusPair.channelId]],
+    };
+    const reply = {
+      id: "d".repeat(64),
+      pubkey: cerberusPair.recipientPubkey,
+      kind: 9,
+      content: cerberusMarker,
+      tags: [
+        ["h", cerberusPair.channelId],
+        ["e", source.id, "", "reply"],
+      ],
+    };
+    mockExistingHistory(payload, [
+      source,
+      reply,
+      { ...reply, id: "e".repeat(64), pubkey: architectPubkey },
+      {
+        ...reply,
+        id: "f".repeat(64),
+        tags: [
+          ["h", cerberusPair.channelId],
+          ["e", "f".repeat(64), "", "reply"],
+        ],
+      },
+    ]);
+    const read = await handler(
+      existingRequest("read_existing_test_channel", { since: 1 }),
+    );
+    assert.equal(read.status, "ok");
+    assert.deepEqual(read.result.events, [source, reply]);
+    const filter = calls
+      .filter(({ command }) => command === "history")
+      .at(-1).args;
+    assert.deepEqual(filter, {
+      kinds: [9],
+      "#h": [cerberusPair.channelId],
+      limit: 20,
+      since: 1,
+    });
+    relayClient.connectionStateEmitter.set("disconnected");
+    relayClient.connectionStateEmitter.set("connected");
+    assert.equal(
+      (await handler(existingRequest("read_existing_test_channel"))).code,
+      "scope_mismatch",
+    );
+  } finally {
+    handler.dispose();
+  }
+});
+
+test("existing CERBERUS uncertain completion and cross-handler history never gain confirmed-input access", async () => {
+  for (const mode of ["scope-drift", "disconnect", "bad-thread"]) {
+    reset();
+    const payload = existingRequest();
+    setNativeScope(payload);
+    mockExistingHistory(payload);
+    const handler = createOwnerTestHandler(() => {});
+    onNativeSend = (result) => {
+      if (mode === "scope-drift") identity = ownerPubkey;
+      if (mode === "disconnect")
+        relayClient.connectionStateEmitter.set("disconnected");
+      if (mode === "bad-thread") result.parent_event_id = "f".repeat(64);
+    };
+    try {
+      assert.equal((await handler(payload)).status, "unknown", mode);
+      identity = payload.expected.ownerPubkey;
+      relayClient.connectionStateEmitter.set("connected");
+      assert.equal(
+        (await handler(existingRequest("read_existing_test_channel"))).status,
+        "error",
+        mode,
+      );
+      assert.equal(
+        calls.filter(({ command }) => command === "send_channel_message")
+          .length,
+        1,
+        mode,
+      );
+    } finally {
+      handler.dispose();
+    }
+  }
+  reset();
+  const payload = existingRequest();
+  setNativeScope(payload);
+  mockExistingHistory(payload);
+  const first = createOwnerTestHandler(() => {}),
+    second = createOwnerTestHandler(() => {});
+  try {
+    assert.equal((await first(payload)).status, "ok");
+    assert.equal(
+      (await second(existingRequest("read_existing_test_channel"))).code,
+      "channel_not_owned",
+    );
+  } finally {
+    first.dispose();
+    second.dispose();
+  }
+});
+
+test("installed existing CERBERUS operation replies through the native hook without publishing directly", async (t) => {
+  reset();
+  const payload = existingRequest();
+  setNativeScope(payload);
+  mockExistingHistory(payload);
+  const dispose = await installOwnerTestHook(() => {});
+  t.after(dispose);
+  await dispatchNativeRequest(payload);
+  assert.equal(replies().length, 1);
+  assert.deepEqual(replies()[0].args.response, {
+    schema: OWNER_TEST_SCHEMA,
+    requestId: payload.requestId,
+    status: "ok",
+    result: { eventId: "1".padStart(64, "0") },
+  });
+  assert.equal(
+    calls.filter(({ command }) => command === "send_channel_message").length,
+    1,
+  );
+  assert.ok(
+    !calls.some(({ command }) => ["sign_event", "publish"].includes(command)),
+  );
+});

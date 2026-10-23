@@ -58,6 +58,71 @@ pub(super) fn summarize_from_disk<R: tauri::Runtime>(
 mod create_fields;
 use create_fields::{normalize_relay_mesh, resolve_created_avatar_url, trim_to_optional_string};
 
+#[path = "rowvia_saved_agent.rs"]
+mod rowvia_saved_agent;
+#[cfg(all(test, unix))]
+pub(crate) use rowvia_saved_agent::resume_tests::fixture_record as pending_saved_agent_fixture;
+pub(crate) use rowvia_saved_agent::saved_agent_backfill_restore_is_original;
+#[path = "rowvia_saved_agent_owner.rs"]
+mod rowvia_saved_agent_owner;
+pub use rowvia_saved_agent_owner::{
+    rowvia_approve_saved_agent_registration, rowvia_authorize_saved_agent,
+    rowvia_review_saved_agent_preparation, rowvia_save_codex_agent,
+};
+#[path = "rowvia_saved_agent_pending.rs"]
+mod rowvia_saved_agent_pending;
+pub use rowvia_saved_agent_pending::rowvia_list_saved_agent_pending;
+#[path = "rowvia_saved_agent_registration.rs"]
+pub(crate) mod rowvia_saved_agent_registration;
+pub use rowvia_saved_agent::{
+    prepare_rowvia_saved_agent, PreparedRowviaSavedAgent, RowviaSavedAgentPreparation,
+};
+
+struct MintedManagedAgentIdentity {
+    keys: Keys,
+    private_key_nsec: String,
+    pubkey: String,
+}
+
+fn mint_managed_agent_identity() -> Result<MintedManagedAgentIdentity, String> {
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let private_key_nsec = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|error| format!("failed to encode private key: {error}"))?;
+    Ok(MintedManagedAgentIdentity {
+        keys,
+        private_key_nsec,
+        pubkey,
+    })
+}
+
+fn managed_agent_auth_tag(state: &AppState, keys: &Keys) -> Result<String, String> {
+    let owner_keys = state.signing_keys()?;
+    let owner = nostr::Keys::parse(&owner_keys.secret_key().to_secret_hex())
+        .map_err(|error| format!("failed to bridge owner keys: {error}"))?;
+    let agent = nostr::PublicKey::from_hex(&keys.public_key().to_hex())
+        .map_err(|error| format!("failed to bridge agent pubkey: {error}"))?;
+    buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner, &agent, "")
+        .map_err(|error| format!("failed to compute NIP-OA auth tag: {error}"))
+}
+
+fn refuse_pending_saved_agent<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    pubkey: &str,
+) -> Result<(), String> {
+    let records = crate::managed_agents::storage::load_unhydrated_managed_agents(app)?;
+    if let Some(record) = records.iter().find(|record| record.pubkey == pubkey) {
+        if let Some(error) =
+            crate::managed_agents::storage::pending_saved_registration_refusal(record)
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "mesh-llm")]
 async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
     app: &AppHandle<R>,
@@ -79,8 +144,8 @@ async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
 /// Start `pubkey`'s pairs on `relay_urls`. Restart flows capture `admission`
 /// before they stop the pairs, so a community removed while the restart runs
 /// refuses its start; those relays are skipped quietly.
-pub(super) async fn start_local_agent_pairs_with_preflight(
-    app: &AppHandle,
+pub(super) async fn start_local_agent_pairs_with_preflight<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     relay_urls: &[String],
@@ -91,6 +156,7 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
+        refuse_pending_saved_agent(app, pubkey)?;
         load_managed_agents(app)?
             .into_iter()
             .find(|record| record.pubkey == pubkey)
@@ -117,6 +183,11 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
             .map_err(|e| e.to_string())?;
         let mut records = load_managed_agents(app)?;
         let record = find_managed_agent_mut(&mut records, pubkey)?;
+        if let Some(error) =
+            crate::managed_agents::storage::pending_saved_registration_refusal(record)
+        {
+            return Err(error);
+        }
         let personas = load_personas(app).unwrap_or_default();
         if let Some(persona_id) = record.persona_id.clone() {
             if let Some(persona) = personas.iter().find(|persona| persona.id == persona_id) {
@@ -215,6 +286,7 @@ where
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
+        refuse_pending_saved_agent(app, pubkey)?;
         let records = load_managed_agents(app)?;
         records
             .iter()
@@ -280,6 +352,10 @@ where
         .lock()
         .map_err(|e| e.to_string())?;
     let record = find_managed_agent_mut(&mut records, pubkey)?;
+    if let Some(error) = crate::managed_agents::storage::pending_saved_registration_refusal(record)
+    {
+        return Err(error);
+    }
     if record.backend != BackendKind::Local {
         return Err(format!("agent {pubkey} is no longer a local agent"));
     }
@@ -372,6 +448,7 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
             crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
         records
             .iter()
+            .filter(|record| record.pending_saved_registration.is_none())
             .map(|record| {
                 build_managed_agent_summary(
                     &app,
@@ -665,6 +742,7 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
             team_id,
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
+            pending_saved_registration: None,
             relay_url: resolved_relay_url.clone(),
             avatar_url: resolved_avatar_url.clone(),
             acp_command: linked_persona
@@ -935,6 +1013,7 @@ pub async fn start_managed_agent(
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
+        refuse_pending_saved_agent(&app, &pubkey)?;
         let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
@@ -1135,10 +1214,10 @@ fn run_managed_agent_deletion<T>(
 }
 
 #[tauri::command]
-pub async fn delete_managed_agent(
+pub async fn delete_managed_agent<R: tauri::Runtime>(
     pubkey: String,
     force_remote_delete: Option<bool>,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
@@ -1148,7 +1227,10 @@ pub async fn delete_managed_agent(
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|error| error.to_string())?;
-            let mut records = load_managed_agents(&app)?;
+            let mut records =
+                crate::managed_agents::storage::load_managed_agents_for_ordinary_operation(
+                    &app, &pubkey,
+                )?;
             let base_dir = managed_agents_base_dir(&app)?;
             recover_pending_assignment_cleanup(&base_dir, |pending_pubkey| {
                 records
